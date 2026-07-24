@@ -5,6 +5,9 @@ import tempfile
 
 import aiohttp
 import discord
+import imageio_ffmpeg
+
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 ERLC_KEY = os.environ["ERLC_SERVER_KEY"]
@@ -123,7 +126,7 @@ async def playback_worker():
                 def after(_err):
                     client.loop.call_soon_threadsafe(done.set)
 
-                source = discord.FFmpegPCMAudio(path)
+                source = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
                 voice_client.play(source, after=after)
                 await done.wait()
         except Exception as exc:
