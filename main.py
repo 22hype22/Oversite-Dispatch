@@ -106,13 +106,14 @@ async def synthesize(text):
     return path
 
 
-async def announce(text):
+async def announce(text, title="Dispatch"):
     print(f"announce: {text[:80]}", flush=True)
     if TEXT_CHANNEL_ID:
         channel = client.get_channel(TEXT_CHANNEL_ID)
         if channel is not None:
             try:
-                await channel.send(f"📻 {text}")
+                embed = discord.Embed(title=f"📻 {title}", description=text, color=0x3B82F6)
+                await channel.send(embed=embed)
             except Exception as exc:
                 print(f"text log failed: {exc}", flush=True)
     path = await synthesize(text)
@@ -162,7 +163,7 @@ async def poll_modcalls():
         if ts < boot_time or key in seen_keys:
             continue
         seen_keys.add(key)
-        await announce(build_modcall_line(caller))
+        await announce(build_modcall_line(caller), title="Incoming Call")
 
 
 async def poll_killlogs():
@@ -177,7 +178,7 @@ async def poll_killlogs():
         if ts < boot_time or key in seen_keys:
             continue
         seen_keys.add(key)
-        await announce(build_kill_line(killer, killed))
+        await announce(build_kill_line(killer, killed), title="Shots Fired")
 
 
 async def dispatch_loop():
