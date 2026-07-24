@@ -18,10 +18,15 @@ GUILD_ID = int(os.environ["DISPATCH_GUILD_ID"])
 VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
-FEEDS = [f.strip() for f in os.environ.get("DISPATCH_FEEDS", "modcalls,killlogs").split(",") if f.strip()]
+FEEDS = [f.strip() for f in os.environ.get("DISPATCH_FEEDS", "emergencycalls,modcalls,killlogs").split(",") if f.strip()]
+SONORAN_ID = os.environ.get("SONORAN_COMMUNITY_ID", "")
+SONORAN_KEY = os.environ.get("SONORAN_API_KEY", "")
+SONORAN_SERVER = int(os.environ.get("SONORAN_SERVER_ID", "1"))
 
 ERLC_BASE = "https://api.policeroleplay.community/v1"
+ERLC_V2_BASE = "https://api.policeroleplay.community/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
+SONORAN_CALLS_URL = "https://api.sonorancad.com/emergency/get_calls"
 
 TEN_CODES = {
     "assist": "10-13, unit requesting assistance",
@@ -39,6 +44,8 @@ GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 play_queue = asyncio.Queue()
 seen_keys = set()
+sonoran_seen = set()
+sonoran_seeded = False
 boot_time = time.time()
 voice_client = None
 http = None
@@ -66,9 +73,9 @@ def build_kill_line(killer, killed):
     )
 
 
-async def erlc_get(path):
+async def erlc_get(path, base=ERLC_BASE):
     try:
-        async with http.get(f"{ERLC_BASE}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
+        async with http.get(f"{base}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
             if resp.status == 429:
                 retry = float(resp.headers.get("Retry-After", "5"))
                 await asyncio.sleep(min(retry, 30))
@@ -181,14 +188,130 @@ async def poll_killlogs():
         await announce(build_kill_line(killer, killed), title="Shots Fired")
 
 
+def build_emergency_call_line(call):
+    caller = call.get("caller") or "an unknown caller"
+    location = call.get("location") or "an unknown location"
+    desc = (call.get("description") or "").strip()
+    line = f"Attention all units. Nine one one call from {caller} at {location}."
+    if desc:
+        line += f" Caller states, {desc}."
+    line += " Any available unit, please respond."
+    return line
+
+
+def build_dispatch_call_line(call):
+    title = (call.get("title") or "a call").strip()
+    address = (call.get("address") or "").strip()
+    code = (call.get("code") or "").strip()
+    desc = (call.get("description") or "").strip()
+    priority = call.get("priority")
+    line = f"Attention all units. {title}"
+    if address:
+        line += f" at {address}"
+    line += "."
+    if code:
+        line += f" {code}."
+    if desc:
+        line += f" {desc}."
+    if priority:
+        line += f" Priority {priority}."
+    line += " Units respond and advise."
+    return line
+
+
+async def poll_sonoran_calls():
+    global sonoran_seeded
+    if not SONORAN_ID or not SONORAN_KEY:
+        return
+    payload = {
+        "id": SONORAN_ID,
+        "key": SONORAN_KEY,
+        "type": "GET_CALLS",
+        "data": [{"serverId": SONORAN_SERVER}],
+    }
+    try:
+        async with http.post(SONORAN_CALLS_URL, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"sonoran error {resp.status}: {body[:200]}", flush=True)
+                return
+            data = await resp.json()
+    except Exception as exc:
+        print(f"sonoran request failed: {exc}", flush=True)
+        return
+    calls = []
+    for call in data.get("activeCalls") or []:
+        calls.append(("dispatch", call))
+    for call in data.get("emergencyCalls") or []:
+        calls.append(("emergency", call))
+    if not sonoran_seeded:
+        for _kind, call in calls:
+            cid = call.get("callId")
+            if cid is not None:
+                sonoran_seen.add(cid)
+        sonoran_seeded = True
+        print(f"sonoran seeded with {len(sonoran_seen)} existing calls", flush=True)
+        return
+    for kind, call in calls:
+        cid = call.get("callId")
+        if cid is None or cid in sonoran_seen:
+            continue
+        sonoran_seen.add(cid)
+        if kind == "emergency":
+            await announce(build_emergency_call_line(call), title="911 Call")
+        else:
+            await announce(build_dispatch_call_line(call), title="Dispatch Call")
+
+
+def build_erlc_call_line(call):
+    desc = (call.get("Description") or "").strip()
+    loc = (call.get("PositionDescriptor") or "").strip()
+    team = (call.get("Team") or "").strip()
+    number = call.get("CallNumber")
+    line = "Attention all units. Emergency call"
+    if number:
+        line += f", number {number}"
+    line += "."
+    if loc:
+        line += f" Location, {loc}."
+    if desc:
+        line += f" Caller states, {desc}."
+    if team:
+        line += f" {team} response requested."
+    line += " Any available unit, please respond and advise."
+    return line
+
+
+async def poll_erlc_emergency():
+    data = await erlc_get("/server?EmergencyCalls=true", base=ERLC_V2_BASE)
+    if not isinstance(data, dict):
+        return
+    calls = data.get("EmergencyCalls")
+    if not isinstance(calls, list):
+        return
+    for call in calls:
+        number = call.get("CallNumber")
+        started = call.get("StartedAt", 0)
+        key = ("erlccall", number)
+        if started < boot_time or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        await announce(build_erlc_call_line(call), title="911 Call")
+
+
 async def dispatch_loop():
     await client.wait_until_ready()
-    handlers = {"modcalls": poll_modcalls, "killlogs": poll_killlogs}
+    handlers = {
+        "modcalls": poll_modcalls,
+        "killlogs": poll_killlogs,
+        "emergencycalls": poll_erlc_emergency,
+    }
     while not client.is_closed():
         for feed in FEEDS:
             handler = handlers.get(feed)
             if handler is not None:
                 await handler()
+        await poll_sonoran_calls()
         await asyncio.sleep(POLL_SECONDS)
 
 
