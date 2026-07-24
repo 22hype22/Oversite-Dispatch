@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import asyncio
 import tempfile
@@ -19,14 +20,10 @@ VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 FEEDS = [f.strip() for f in os.environ.get("DISPATCH_FEEDS", "emergencycalls,modcalls,killlogs").split(",") if f.strip()]
-SONORAN_ID = os.environ.get("SONORAN_COMMUNITY_ID", "")
-SONORAN_KEY = os.environ.get("SONORAN_API_KEY", "")
-SONORAN_SERVER = int(os.environ.get("SONORAN_SERVER_ID", "1"))
 
 ERLC_BASE = "https://api.policeroleplay.community/v1"
 ERLC_V2_BASE = "https://api.policeroleplay.community/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
-SONORAN_CALLS_URL = "https://api.sonorancad.com/emergency/get_calls"
 
 TEN_CODES = {
     "assist": "10-13, unit requesting assistance",
@@ -39,13 +36,9 @@ TEN_CODES = {
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
-tree = discord.app_commands.CommandTree(client)
-GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 play_queue = asyncio.Queue()
 seen_keys = set()
-sonoran_seen = set()
-sonoran_seeded = False
 boot_time = time.time()
 voice_client = None
 http = None
@@ -54,7 +47,9 @@ http = None
 def clean_name(raw):
     if not raw:
         return "an unknown player"
-    return str(raw).split(":", 1)[0].strip() or "an unknown player"
+    name = str(raw).split(":", 1)[0].strip()
+    name = re.sub(r"\([^)]*\)", "", name).strip()
+    return name or "an unknown player"
 
 
 def build_modcall_line(caller):
@@ -71,6 +66,25 @@ def build_kill_line(killer, killed):
         f"Dispatch to all units. {TEN_CODES['shots']}, reported involving {who}. "
         f"Units in the area, respond code three and advise on scene."
     )
+
+
+def build_erlc_call_line(call):
+    desc = (call.get("Description") or "").strip()
+    loc = (call.get("PositionDescriptor") or "").strip()
+    team = (call.get("Team") or "").strip()
+    number = call.get("CallNumber")
+    line = "Attention all units. Emergency call"
+    if number:
+        line += f", number {number}"
+    line += "."
+    if loc:
+        line += f" Location, {loc}."
+    if desc:
+        line += f" Caller states, {desc}."
+    if team:
+        line += f" {team} response requested."
+    line += " Any available unit, please respond and advise."
+    return line
 
 
 async def erlc_get(path, base=ERLC_BASE):
@@ -188,100 +202,6 @@ async def poll_killlogs():
         await announce(build_kill_line(killer, killed), title="Shots Fired")
 
 
-def build_emergency_call_line(call):
-    caller = call.get("caller") or "an unknown caller"
-    location = call.get("location") or "an unknown location"
-    desc = (call.get("description") or "").strip()
-    line = f"Attention all units. Nine one one call from {caller} at {location}."
-    if desc:
-        line += f" Caller states, {desc}."
-    line += " Any available unit, please respond."
-    return line
-
-
-def build_dispatch_call_line(call):
-    title = (call.get("title") or "a call").strip()
-    address = (call.get("address") or "").strip()
-    code = (call.get("code") or "").strip()
-    desc = (call.get("description") or "").strip()
-    priority = call.get("priority")
-    line = f"Attention all units. {title}"
-    if address:
-        line += f" at {address}"
-    line += "."
-    if code:
-        line += f" {code}."
-    if desc:
-        line += f" {desc}."
-    if priority:
-        line += f" Priority {priority}."
-    line += " Units respond and advise."
-    return line
-
-
-async def poll_sonoran_calls():
-    global sonoran_seeded
-    if not SONORAN_ID or not SONORAN_KEY:
-        return
-    payload = {
-        "id": SONORAN_ID,
-        "key": SONORAN_KEY,
-        "type": "GET_CALLS",
-        "data": [{"serverId": SONORAN_SERVER}],
-    }
-    try:
-        async with http.post(SONORAN_CALLS_URL, json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                print(f"sonoran error {resp.status}: {body[:200]}", flush=True)
-                return
-            data = await resp.json()
-    except Exception as exc:
-        print(f"sonoran request failed: {exc}", flush=True)
-        return
-    calls = []
-    for call in data.get("activeCalls") or []:
-        calls.append(("dispatch", call))
-    for call in data.get("emergencyCalls") or []:
-        calls.append(("emergency", call))
-    if not sonoran_seeded:
-        for _kind, call in calls:
-            cid = call.get("callId")
-            if cid is not None:
-                sonoran_seen.add(cid)
-        sonoran_seeded = True
-        print(f"sonoran seeded with {len(sonoran_seen)} existing calls", flush=True)
-        return
-    for kind, call in calls:
-        cid = call.get("callId")
-        if cid is None or cid in sonoran_seen:
-            continue
-        sonoran_seen.add(cid)
-        if kind == "emergency":
-            await announce(build_emergency_call_line(call), title="911 Call")
-        else:
-            await announce(build_dispatch_call_line(call), title="Dispatch Call")
-
-
-def build_erlc_call_line(call):
-    desc = (call.get("Description") or "").strip()
-    loc = (call.get("PositionDescriptor") or "").strip()
-    team = (call.get("Team") or "").strip()
-    number = call.get("CallNumber")
-    line = "Attention all units. Emergency call"
-    if number:
-        line += f", number {number}"
-    line += "."
-    if loc:
-        line += f" Location, {loc}."
-    if desc:
-        line += f" Caller states, {desc}."
-    if team:
-        line += f" {team} response requested."
-    line += " Any available unit, please respond and advise."
-    return line
-
-
 async def poll_erlc_emergency():
     data = await erlc_get("/server?EmergencyCalls=true", base=ERLC_V2_BASE)
     if not isinstance(data, dict):
@@ -311,7 +231,6 @@ async def dispatch_loop():
             handler = handlers.get(feed)
             if handler is not None:
                 await handler()
-        await poll_sonoran_calls()
         await asyncio.sleep(POLL_SECONDS)
 
 
@@ -353,83 +272,12 @@ async def voice_guard():
         await asyncio.sleep(30)
 
 
-def unit_label(interaction, unit):
-    if unit and unit.strip():
-        return unit.strip()
-    return interaction.user.display_name
-
-
-@tree.command(name="backup", description="Request backup to a location", guild=GUILD_OBJ)
-@discord.app_commands.describe(location="Where backup is needed", unit="Your callsign (optional)")
-async def cmd_backup(interaction: discord.Interaction, location: str, unit: str = ""):
-    await interaction.response.send_message(f"📻 Backup request dispatched to {location}.", ephemeral=True)
-    who = unit_label(interaction, unit)
-    await announce(
-        f"Attention all units. {who} is requesting backup to {location}. "
-        f"Be advised, {TEN_CODES['backup']}. Any available unit, please respond. {TEN_CODES['acknowledge']}."
-    )
-
-
-@tree.command(name="pursuit", description="Announce a pursuit", guild=GUILD_OBJ)
-@discord.app_commands.describe(details="Vehicle / direction / details", unit="Your callsign (optional)")
-async def cmd_pursuit(interaction: discord.Interaction, details: str, unit: str = ""):
-    await interaction.response.send_message("📻 Pursuit announced.", ephemeral=True)
-    who = unit_label(interaction, unit)
-    await announce(
-        f"All units be advised. {who} is in active pursuit. {details}. "
-        f"10-80 in progress. Units respond code three and assist."
-    )
-
-
-@tree.command(name="trafficstop", description="Announce a traffic stop", guild=GUILD_OBJ)
-@discord.app_commands.describe(location="Stop location", unit="Your callsign (optional)")
-async def cmd_trafficstop(interaction: discord.Interaction, location: str, unit: str = ""):
-    await interaction.response.send_message(f"📻 Traffic stop logged at {location}.", ephemeral=True)
-    who = unit_label(interaction, unit)
-    await announce(
-        f"Dispatch, be advised. {who} is out on a traffic stop at {location}. "
-        f"10-38. Units in the area, stand by."
-    )
-
-
-@tree.command(name="shots", description="Announce shots fired", guild=GUILD_OBJ)
-@discord.app_commands.describe(location="Where shots were fired")
-async def cmd_shots(interaction: discord.Interaction, location: str):
-    await interaction.response.send_message(f"📻 Shots fired dispatched for {location}.", ephemeral=True)
-    await announce(
-        f"Attention all units. {TEN_CODES['shots']}, reported at {location}. "
-        f"All available units respond code three and advise on scene."
-    )
-
-
-@tree.command(name="code4", description="Advise scene is secure", guild=GUILD_OBJ)
-@discord.app_commands.describe(unit="Your callsign (optional)")
-async def cmd_code4(interaction: discord.Interaction, unit: str = ""):
-    await interaction.response.send_message("📻 Code four advised.", ephemeral=True)
-    who = unit_label(interaction, unit)
-    await announce(
-        f"All units, {who} is advising code four. Scene is secure. {TEN_CODES['acknowledge']}."
-    )
-
-
-@tree.command(name="dispatch", description="Read a custom dispatch message aloud", guild=GUILD_OBJ)
-@discord.app_commands.describe(message="Exactly what dispatch should say")
-async def cmd_dispatch(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message("📻 Message dispatched.", ephemeral=True)
-    await announce(f"Dispatch. {message}.")
-
-
 @client.event
 async def on_ready():
     global http
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
-    try:
-        await tree.sync(guild=GUILD_OBJ)
-        print("dispatch commands synced", flush=True)
-    except Exception as exc:
-        print(f"command sync failed: {exc}", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
