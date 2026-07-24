@@ -122,7 +122,10 @@ async def playback_worker():
     while True:
         path = await play_queue.get()
         try:
-            if voice_client is not None and voice_client.is_connected():
+            connected = await ensure_voice()
+            if connected and voice_client is not None:
+                if voice_client.is_playing():
+                    voice_client.stop()
                 done = asyncio.Event()
 
                 def after(_err):
@@ -131,6 +134,8 @@ async def playback_worker():
                 source = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
                 voice_client.play(source, after=after)
                 await done.wait()
+            else:
+                print("dropping audio — not connected to voice", flush=True)
         except Exception as exc:
             print(f"playback failed: {exc}", flush=True)
         finally:
@@ -181,21 +186,42 @@ async def dispatch_loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def connect_voice():
+async def ensure_voice():
     global voice_client
     guild = client.get_guild(GUILD_ID)
     if guild is None:
         print("dispatch guild not found — check DISPATCH_GUILD_ID", flush=True)
-        return
+        return False
     channel = guild.get_channel(VOICE_CHANNEL_ID)
     if channel is None:
         print("voice channel not found — check DISPATCH_VOICE_CHANNEL_ID", flush=True)
-        return
+        return False
+    existing = guild.voice_client
+    if existing is not None and existing.is_connected():
+        voice_client = existing
+        if existing.channel and existing.channel.id != VOICE_CHANNEL_ID:
+            await existing.move_to(channel)
+        return True
+    if existing is not None:
+        try:
+            await existing.disconnect(force=True)
+        except Exception:
+            pass
     try:
-        voice_client = await channel.connect(self_deaf=True)
+        voice_client = await channel.connect(self_deaf=True, reconnect=True)
         print(f"dispatch connected to voice channel {channel.name}", flush=True)
+        return True
     except Exception as exc:
         print(f"voice connect failed: {exc}", flush=True)
+        voice_client = None
+        return False
+
+
+async def voice_guard():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await ensure_voice()
+        await asyncio.sleep(30)
 
 
 def unit_label(interaction, unit):
@@ -275,9 +301,10 @@ async def on_ready():
         print("dispatch commands synced", flush=True)
     except Exception as exc:
         print(f"command sync failed: {exc}", flush=True)
-    await connect_voice()
+    await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
+    client.loop.create_task(voice_guard())
 
 
 client.run(TOKEN)
