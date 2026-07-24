@@ -34,6 +34,8 @@ TEN_CODES = {
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
+GUILD_OBJ = discord.Object(id=GUILD_ID)
 
 play_queue = asyncio.Queue()
 seen_keys = set()
@@ -196,12 +198,83 @@ async def connect_voice():
         print(f"voice connect failed: {exc}", flush=True)
 
 
+def unit_label(interaction, unit):
+    if unit and unit.strip():
+        return unit.strip()
+    return interaction.user.display_name
+
+
+@tree.command(name="backup", description="Request backup to a location", guild=GUILD_OBJ)
+@discord.app_commands.describe(location="Where backup is needed", unit="Your callsign (optional)")
+async def cmd_backup(interaction: discord.Interaction, location: str, unit: str = ""):
+    await interaction.response.send_message(f"📻 Backup request dispatched to {location}.", ephemeral=True)
+    who = unit_label(interaction, unit)
+    await announce(
+        f"Attention all units. {who} is requesting backup to {location}. "
+        f"Be advised, {TEN_CODES['backup']}. Any available unit, please respond. {TEN_CODES['acknowledge']}."
+    )
+
+
+@tree.command(name="pursuit", description="Announce a pursuit", guild=GUILD_OBJ)
+@discord.app_commands.describe(details="Vehicle / direction / details", unit="Your callsign (optional)")
+async def cmd_pursuit(interaction: discord.Interaction, details: str, unit: str = ""):
+    await interaction.response.send_message("📻 Pursuit announced.", ephemeral=True)
+    who = unit_label(interaction, unit)
+    await announce(
+        f"All units be advised. {who} is in active pursuit. {details}. "
+        f"10-80 in progress. Units respond code three and assist."
+    )
+
+
+@tree.command(name="trafficstop", description="Announce a traffic stop", guild=GUILD_OBJ)
+@discord.app_commands.describe(location="Stop location", unit="Your callsign (optional)")
+async def cmd_trafficstop(interaction: discord.Interaction, location: str, unit: str = ""):
+    await interaction.response.send_message(f"📻 Traffic stop logged at {location}.", ephemeral=True)
+    who = unit_label(interaction, unit)
+    await announce(
+        f"Dispatch, be advised. {who} is out on a traffic stop at {location}. "
+        f"10-38. Units in the area, stand by."
+    )
+
+
+@tree.command(name="shots", description="Announce shots fired", guild=GUILD_OBJ)
+@discord.app_commands.describe(location="Where shots were fired")
+async def cmd_shots(interaction: discord.Interaction, location: str):
+    await interaction.response.send_message(f"📻 Shots fired dispatched for {location}.", ephemeral=True)
+    await announce(
+        f"Attention all units. {TEN_CODES['shots']}, reported at {location}. "
+        f"All available units respond code three and advise on scene."
+    )
+
+
+@tree.command(name="code4", description="Advise scene is secure", guild=GUILD_OBJ)
+@discord.app_commands.describe(unit="Your callsign (optional)")
+async def cmd_code4(interaction: discord.Interaction, unit: str = ""):
+    await interaction.response.send_message("📻 Code four advised.", ephemeral=True)
+    who = unit_label(interaction, unit)
+    await announce(
+        f"All units, {who} is advising code four. Scene is secure. {TEN_CODES['acknowledge']}."
+    )
+
+
+@tree.command(name="dispatch", description="Read a custom dispatch message aloud", guild=GUILD_OBJ)
+@discord.app_commands.describe(message="Exactly what dispatch should say")
+async def cmd_dispatch(interaction: discord.Interaction, message: str):
+    await interaction.response.send_message("📻 Message dispatched.", ephemeral=True)
+    await announce(f"Dispatch. {message}.")
+
+
 @client.event
 async def on_ready():
     global http
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
+    try:
+        await tree.sync(guild=GUILD_OBJ)
+        print("dispatch commands synced", flush=True)
+    except Exception as exc:
+        print(f"command sync failed: {exc}", flush=True)
     await connect_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
