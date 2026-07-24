@@ -92,9 +92,12 @@ async def erlc_get(path, base=ERLC_BASE):
         async with http.get(f"{base}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
             if resp.status == 429:
                 retry = float(resp.headers.get("Retry-After", "5"))
+                print(f"erlc {path} -> 429 rate limited, waiting {retry}s", flush=True)
                 await asyncio.sleep(min(retry, 30))
                 return None
             if resp.status != 200:
+                body = await resp.text()
+                print(f"erlc {path} -> {resp.status}: {body[:200]}", flush=True)
                 return None
             return await resp.json()
     except Exception as exc:
@@ -177,6 +180,7 @@ async def poll_modcalls():
     data = await erlc_get("/server/modcalls")
     if not isinstance(data, list):
         return
+    print(f"modcalls feed: {len(data)} item(s)", flush=True)
     for item in data:
         ts = item.get("Timestamp", 0)
         caller = item.get("Caller")
@@ -191,6 +195,7 @@ async def poll_killlogs():
     data = await erlc_get("/server/killlogs")
     if not isinstance(data, list):
         return
+    print(f"killlogs feed: {len(data)} item(s)", flush=True)
     for item in data:
         ts = item.get("Timestamp", 0)
         killer = item.get("Killer")
@@ -208,7 +213,9 @@ async def poll_erlc_emergency():
         return
     calls = data.get("EmergencyCalls")
     if not isinstance(calls, list):
+        print(f"emergencycalls feed: no EmergencyCalls field (keys: {list(data.keys())})", flush=True)
         return
+    print(f"emergencycalls feed: {len(calls)} call(s)", flush=True)
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
@@ -226,6 +233,7 @@ async def dispatch_loop():
         "killlogs": poll_killlogs,
         "emergencycalls": poll_erlc_emergency,
     }
+    print(f"dispatch loop started, polling every {POLL_SECONDS}s: {FEEDS}", flush=True)
     while not client.is_closed():
         for feed in FEEDS:
             handler = handlers.get(feed)
@@ -269,7 +277,7 @@ async def voice_guard():
     await client.wait_until_ready()
     while not client.is_closed():
         await ensure_voice()
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
 
 
 @client.event
