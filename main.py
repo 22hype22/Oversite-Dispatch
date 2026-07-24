@@ -102,10 +102,12 @@ async def synthesize(text):
     fd, path = tempfile.mkstemp(suffix=".mp3")
     with os.fdopen(fd, "wb") as handle:
         handle.write(audio)
+    print(f"synthesized {len(audio)} bytes of audio", flush=True)
     return path
 
 
 async def announce(text):
+    print(f"announce: {text[:80]}", flush=True)
     if TEXT_CHANNEL_ID:
         channel = client.get_channel(TEXT_CHANNEL_ID)
         if channel is not None:
@@ -116,6 +118,7 @@ async def announce(text):
     path = await synthesize(text)
     if path:
         await play_queue.put(path)
+        print("audio queued for playback", flush=True)
 
 
 async def playback_worker():
@@ -133,7 +136,9 @@ async def playback_worker():
 
                 source = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
                 voice_client.play(source, after=after)
+                print("playing audio in voice channel", flush=True)
                 await done.wait()
+                print("finished playing", flush=True)
             else:
                 print("dropping audio — not connected to voice", flush=True)
         except Exception as exc:
