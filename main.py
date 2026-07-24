@@ -135,7 +135,7 @@ async def playback_worker():
                 def after(_err):
                     client.loop.call_soon_threadsafe(done.set)
 
-                source = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
+                source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
                 await done.wait()
