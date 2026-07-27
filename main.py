@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import asyncio
+import difflib
 import tempfile
 
 import aiohttp
@@ -33,6 +35,62 @@ voice_client = None
 http = None
 
 
+DISPATCH_WORDS = [
+    "suspicious", "suspect", "suspects", "robbery", "burglary", "theft", "larceny",
+    "assault", "battery", "homicide", "murder", "manslaughter", "kidnapping", "abduction",
+    "hostage", "arson", "vandalism", "trespassing", "shoplifting", "carjacking", "hijacking",
+    "shooting", "shots", "stabbing", "fight", "altercation", "disturbance", "domestic",
+    "overdose", "suicide", "accident", "collision", "crash", "pursuit", "chase", "fleeing",
+    "speeding", "reckless", "intoxicated", "drunk", "impaired", "prowler", "loitering",
+    "breaking", "entering", "armed", "unarmed", "weapon", "weapons", "firearm", "firearms",
+    "handgun", "pistol", "revolver", "rifle", "shotgun", "knife", "machete", "explosive",
+    "bomb", "threat", "threatening", "wanted", "fugitive", "warrant", "felony", "misdemeanor",
+    "narcotics", "drugs", "attempted", "progress", "pedestrian", "vehicle", "vehicles",
+    "motorcycle", "truck", "sedan", "victim", "victims", "witness", "injured", "unconscious",
+    "bleeding", "wounded", "fatality", "deceased", "backup", "ambulance", "paramedic",
+    "medical", "emergency", "priority", "officer", "deputy", "sheriff", "trooper", "hostile",
+    "aggressive", "violent", "brandishing", "concealed", "vandalizing", "burglar", "intruder",
+    "gunshots", "gunfire", "gunman", "abandoned", "highway", "intersection", "residence",
+    "apartment", "business", "parking", "northbound", "southbound", "eastbound", "westbound",
+    "detain", "arrest", "transport", "surveillance", "harassment", "menacing", "kidnapped",
+    "carjacked", "robbed", "assaulted", "stabbed", "shot", "wounded", "gun",
+    "situation", "possible", "building", "individual", "subject", "description",
+    "location", "direction", "male", "female", "hoodie", "running",
+]
+DISPATCH_SET = set(DISPATCH_WORDS)
+PROTECTED_WORDS = {
+    "the", "and", "for", "with", "was", "are", "his", "her", "him", "she", "they", "them",
+    "there", "here", "near", "front", "back", "side", "guy", "man", "men", "woman", "women",
+    "kid", "boy", "girl", "person", "people", "someone", "somebody", "outside", "inside",
+    "street", "road", "house", "store", "bank", "corner", "away", "into", "just", "that",
+    "this", "then", "some", "have", "will", "keep", "come", "went", "said", "says", "yelling",
+    "screaming", "running", "walking", "driving", "trying", "started", "help", "please",
+    "wearing", "swerving", "riding", "hearing", "hiding", "mask", "masked", "yelling",
+}
+
+
+def match_case(original, corrected):
+    if original.isupper():
+        return corrected.upper()
+    if original[:1].isupper():
+        return corrected.capitalize()
+    return corrected
+
+
+def correct_word(word):
+    lower = word.lower()
+    if len(lower) < 4 or lower in PROTECTED_WORDS or lower in DISPATCH_SET:
+        return word
+    matches = difflib.get_close_matches(lower, DISPATCH_WORDS, n=1, cutoff=0.78)
+    if matches and matches[0] != lower:
+        return match_case(word, matches[0])
+    return word
+
+
+def autocorrect(text):
+    return re.sub(r"[A-Za-z]+", lambda m: correct_word(m.group(0)), text)
+
+
 OPENERS = [
     "Attention all units",
     "All units, all units",
@@ -55,7 +113,7 @@ def pick(options, number):
 
 
 def build_call_line(call):
-    desc = (call.get("Description") or "").strip()
+    desc = autocorrect((call.get("Description") or "").strip())
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
     number = call.get("CallNumber")
