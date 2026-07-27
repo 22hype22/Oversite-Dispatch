@@ -55,7 +55,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "status-board-1"
+BUILD = "voice-fix-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -1014,7 +1014,7 @@ async def on_ready():
     else:
         print("ai responses: OFF (set ANTHROPIC_API_KEY to let dispatch answer radio traffic)", flush=True)
     if ALERT_TONES and tone_path is None:
-        tone_path = make_tone()
+        tone_path = await client.loop.run_in_executor(None, make_tone)
         print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
