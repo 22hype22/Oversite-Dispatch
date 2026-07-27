@@ -25,34 +25,12 @@ except Exception as exc:
     VOICE_RECV_AVAILABLE = False
     print(f"voice receive extension not available: {exc}", flush=True)
 
-if VOICE_RECV_AVAILABLE:
-    from discord.ext.voice_recv import rtp as _vrtp
-    _orig_update_ext = _vrtp.RTPPacket.update_ext_headers
-    _ext_dbg = [0]
-
-    def _dbg_update_ext(self, data):
-        offset = _orig_update_ext(self, data)
-        if _ext_dbg[0] < 8:
-            _ext_dbg[0] += 1
-            try:
-                pre = bytes(data[:24]).hex()
-                post = bytes(data[offset:offset + 6]).hex()
-            except Exception:
-                pre = post = "?"
-            print(f"EXTDBG extended={self.extended} rtpsize={getattr(self, '_rtpsize', None)} "
-                  f"len={len(data)} pre={pre} offset={offset} post_toc={post}", flush=True)
-        return offset
-
-    _vrtp.RTPPacket.update_ext_headers = _dbg_update_ext
-
-DISABLE_DAVE = os.environ.get("DISABLE_DAVE", "1").lower() not in ("0", "false", "no", "off")
-if DISABLE_DAVE:
-    try:
-        from discord.voice_state import VoiceConnectionState
-        VoiceConnectionState.max_dave_protocol_version = property(lambda self: 0)
-        print("DAVE end-to-end encryption disabled (advertising protocol version 0)", flush=True)
-    except Exception as exc:
-        print(f"could not disable DAVE: {exc}", flush=True)
+try:
+    import davey
+    HAVE_DAVEY = True
+except Exception:
+    davey = None
+    HAVE_DAVEY = False
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 OPUS_OK = False
@@ -328,26 +306,58 @@ if VOICE_RECV_AVAILABLE:
             super().__init__()
             self.loop = loop
             self.buffers = {}
+            self.decoders = {}
 
         def wants_opus(self):
-            return False
+            return True
+
+        def _dave_decrypt(self, user_id, opus):
+            if not HAVE_DAVEY:
+                return opus
+            vc = self.voice_client
+            conn = getattr(vc, "_connection", None) if vc is not None else None
+            sess = getattr(conn, "dave_session", None) if conn is not None else None
+            if sess is None or not getattr(sess, "ready", False):
+                return opus
+            try:
+                if sess.can_passthrough(user_id):
+                    return opus
+                return sess.decrypt(user_id, davey.MediaType.audio, opus)
+            except Exception:
+                return None
 
         def write(self, user, data):
             if user is None:
                 return
             if isinstance(data.packet, SilencePacket):
                 return
-            if data.pcm:
-                self.buffers.setdefault(user.id, bytearray()).extend(data.pcm)
+            opus = getattr(data, "opus", None)
+            if not opus:
+                return
+            opus = self._dave_decrypt(user.id, opus)
+            if not opus:
+                return
+            dec = self.decoders.get(user.id)
+            if dec is None:
+                dec = discord.opus.Decoder()
+                self.decoders[user.id] = dec
+            try:
+                pcm = dec.decode(bytes(opus), fec=False)
+            except Exception:
+                return
+            if pcm:
+                self.buffers.setdefault(user.id, bytearray()).extend(pcm)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
             pcm = self.buffers.pop(member.id, None)
+            self.decoders.pop(member.id, None)
             if pcm:
                 asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm)), self.loop)
 
         def cleanup(self):
             self.buffers.clear()
+            self.decoders.clear()
 
 
 def start_listening():
