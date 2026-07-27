@@ -295,6 +295,9 @@ DISPATCH_SYSTEM = (
     "10-8 in service, 10-7 out of service, 10-76 en route, 10-97 on scene, "
     "10-20 for location, 10-23 standing by, Code 3 for lights and sirens, Code 4 "
     "scene secure. Echo status changes back to the unit, for example 'show you 10-8'.\n"
+    "- When a unit attaches to a call, marks en route, or updates their status, "
+    "just confirm the action in a few words. Do not read back or restate the "
+    "call's details unless the unit explicitly asks you to repeat the call.\n"
     "- You cannot look up plates, warrants, names, or run records. If asked to run "
     "one, advise the unit the return is negative or to stand by, staying in character.\n"
     "- Never break character, never say you are an AI, never use markdown or emojis.\n"
@@ -365,6 +368,8 @@ FALLBACK_REPLIES = {
     "out of service": ["copy, show you 10-7, out of service"],
     "in service": ["copy, show you 10-8, in service",
                    "10-4, show you back in service"],
+    "attach": ["copy, show you attached to the call and en route, 10-76",
+               "10-4, you are attached, show you en route"],
     "en route": ["copy, show you en route, 10-76"],
     "on scene": ["copy, show you on scene, 10-97",
                  "10-4, show you 10-23 on scene"],
@@ -426,22 +431,50 @@ def wants_repeat(text):
     return any(t in low for t in triggers)
 
 
+CALLSIGN_NUMS = {
+    "zero", "oh", "o", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty",
+    "fifty", "sixty", "seventy", "eighty", "ninety",
+}
+CALLSIGN_PHON = {
+    "adam", "boy", "charlie", "david", "edward", "frank", "george", "henry", "ida",
+    "john", "king", "lincoln", "mary", "nora", "ocean", "paul", "queen", "robert",
+    "sam", "tom", "union", "victor", "william", "xray", "young", "zebra", "alpha",
+    "bravo", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo",
+    "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+    "uniform", "whiskey", "yankee", "zulu",
+}
+
+
+def is_callsign_token(tok):
+    t = tok.lower().strip(",.-'")
+    if not t:
+        return False
+    if t.isalnum() and any(c.isdigit() for c in t) and len(t) <= 6:
+        return True
+    if t.isalpha() and len(t) <= 2:
+        return True
+    return t in CALLSIGN_NUMS or t in CALLSIGN_PHON
+
+
 def extract_callsign(text):
-    low = text.lower()
-    idx = low.find("dispatch")
-    if idx < 0:
+    match = re.search(r"dispatch\w*", text.lower())
+    if match is None:
         return ""
-    rest = text[idx + len("dispatch"):].strip(" ,.-")
+    rest = text[match.end():].strip(" ,.-")
     tokens = re.split(r"\s+", rest)
     parts = []
     for tok in tokens:
         if tok.lower().strip(",.-") in REQUEST_WORDS:
             break
-        parts.append(tok)
-        if len(parts) >= 3:
+        if not is_callsign_token(tok):
+            break
+        parts.append(tok.strip(",.-"))
+        if len(parts) >= 6 or tok[-1:] in ".?!":
             break
     callsign = " ".join(parts).strip(" ,.-")
-    if not callsign or len(callsign) > 16:
+    if not callsign or len(callsign) > 24:
         return ""
     return callsign
 
