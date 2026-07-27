@@ -49,7 +49,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "attach-ack-3"
+BUILD = "attach-ack-4"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -433,9 +433,11 @@ def is_for_dispatch(text):
 
 def wants_repeat(text):
     low = text.lower()
+    if "attach" in low:
+        return False
     triggers = ("repeat", "say again", "come again", "one more time",
-                "last call", "that call", "read it back", "read back",
-                "what was the last", "what was that")
+                "read it back", "read back", "run it back", "go again",
+                "what was the last", "what was that last", "what was that call")
     return any(t in low for t in triggers)
 
 
