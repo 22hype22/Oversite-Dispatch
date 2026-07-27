@@ -55,7 +55,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "voice-fix-1"
+BUILD = "onready-fix-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -981,7 +981,6 @@ async def voice_guard():
         await asyncio.sleep(15)
 
 
-@client.event
 async def sync_commands():
     global commands_synced
     if commands_synced:
@@ -995,6 +994,7 @@ async def sync_commands():
         print(f"command sync failed: {exc}", flush=True)
 
 
+@client.event
 async def on_ready():
     global http, tone_path
     if http is None:
