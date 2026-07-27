@@ -4,11 +4,15 @@ import time
 import struct
 import asyncio
 import difflib
+import logging
 import tempfile
 
 import aiohttp
 import discord
 import imageio_ffmpeg
+
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
 
 try:
     from discord.ext import voice_recv
@@ -256,7 +260,8 @@ def _ogg_page(header_type, granule, serial, seqno, packet):
 
 def opus_frames_to_ogg(frames, serial=1):
     out = bytearray()
-    head = b"OpusHead" + struct.pack("<BBH I HB", 1, 2, 0, 48000, 0, 0)
+    channels = 2 if (frames and (frames[0][0] & 0x04)) else 1
+    head = b"OpusHead" + struct.pack("<BBHIHB", 1, channels, 0, 48000, 0, 0)
     out += _ogg_page(0x02, 0, serial, 0, head)
     vendor = b"oversite"
     tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
@@ -298,6 +303,9 @@ def wants_repeat(text):
 async def handle_utterance(member, frames):
     if len(frames) < 25:
         return
+    toc = frames[0][0] if frames[0] else 0
+    print(f"utterance: {len(frames)} frames, first={len(frames[0])}b, toc=0x{toc:02x}, "
+          f"channels={'stereo' if toc & 0x04 else 'mono'}", flush=True)
     text = await transcribe(opus_frames_to_ogg(frames))
     if not text:
         return
