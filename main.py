@@ -146,11 +146,21 @@ async def announce(text, title="Dispatch"):
         print("audio queued for playback", flush=True)
 
 
+async def wait_for_voice(timeout=20):
+    waited = 0
+    while waited < timeout:
+        if await ensure_voice() and voice_client is not None and voice_client.is_connected():
+            return True
+        await asyncio.sleep(1)
+        waited += 1
+    return False
+
+
 async def playback_worker():
     while True:
         path = await play_queue.get()
         try:
-            connected = await ensure_voice()
+            connected = await wait_for_voice()
             if connected and voice_client is not None:
                 if voice_client.is_playing():
                     voice_client.stop()
@@ -253,16 +263,16 @@ async def ensure_voice():
         print("voice channel not found — check DISPATCH_VOICE_CHANNEL_ID", flush=True)
         return False
     existing = guild.voice_client
-    if existing is not None and existing.is_connected():
-        voice_client = existing
-        if existing.channel and existing.channel.id != VOICE_CHANNEL_ID:
-            await existing.move_to(channel)
-        return True
     if existing is not None:
-        try:
-            await existing.disconnect(force=True)
-        except Exception:
-            pass
+        voice_client = existing
+        if existing.is_connected():
+            if existing.channel and existing.channel.id != VOICE_CHANNEL_ID:
+                try:
+                    await existing.move_to(channel)
+                except Exception:
+                    pass
+            return True
+        return False
     try:
         voice_client = await channel.connect(self_deaf=True, reconnect=True)
         print(f"dispatch connected to voice channel {channel.name}", flush=True)
@@ -275,9 +285,27 @@ async def ensure_voice():
 
 async def voice_guard():
     await client.wait_until_ready()
+    stuck_since = None
     while not client.is_closed():
-        await ensure_voice()
-        await asyncio.sleep(10)
+        guild = client.get_guild(GUILD_ID)
+        vc = guild.voice_client if guild is not None else None
+        if vc is not None and vc.is_connected():
+            stuck_since = None
+        elif vc is None:
+            await ensure_voice()
+            stuck_since = None
+        else:
+            if stuck_since is None:
+                stuck_since = time.time()
+            elif time.time() - stuck_since > 60:
+                print("voice stuck for 60s, forcing a fresh reconnect", flush=True)
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                await ensure_voice()
+                stuck_since = None
+        await asyncio.sleep(15)
 
 
 @client.event
