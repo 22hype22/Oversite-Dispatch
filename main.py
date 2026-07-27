@@ -62,11 +62,15 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
 STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_MODEL = os.environ.get("DISPATCH_AI_MODEL", "claude-haiku-4-5")
+AI_ENABLED = bool(ANTHROPIC_KEY)
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
 ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
+ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -275,6 +279,58 @@ async def transcribe(wav_bytes):
         return None
 
 
+DISPATCH_SYSTEM = (
+    "You are Oversite Dispatch, a professional emergency dispatcher for an "
+    "Emergency Response: Liberty County (ER:LC) roleplay server. Police officers "
+    "and sheriff deputies talk to you over the radio. Answer with exactly one "
+    "short radio transmission, the way a real dispatcher would respond.\n"
+    "Rules:\n"
+    "- One or two sentences at most. Radio brevity. No preamble and no sign-off.\n"
+    "- Always acknowledge the unit's callsign when one is given.\n"
+    "- Use standard ten-codes and plain dispatch language: 10-4 to acknowledge, "
+    "10-8 in service, 10-7 out of service, 10-76 en route, 10-97 on scene, "
+    "10-20 for location, 10-23 standing by, Code 3 for lights and sirens, Code 4 "
+    "scene secure. Echo status changes back to the unit, for example 'show you 10-8'.\n"
+    "- You cannot look up plates, warrants, names, or run records. If asked to run "
+    "one, advise the unit the return is negative or to stand by, staying in character.\n"
+    "- Never break character, never say you are an AI, never use markdown or emojis.\n"
+    "- Output only the words dispatch would speak over the radio."
+)
+
+
+async def dispatch_ai_reply(text, callsign):
+    if not AI_ENABLED:
+        return None
+    user_msg = f"Unit {callsign} says: {text}" if callsign else text
+    payload = {
+        "model": AI_MODEL,
+        "max_tokens": 200,
+        "system": DISPATCH_SYSTEM,
+        "messages": [{"role": "user", "content": user_msg}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with http.post(f"{ANTHROPIC_BASE}/messages", headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"anthropic error {resp.status}: {body[:200]}", flush=True)
+                return None
+            data = await resp.json()
+    except Exception as exc:
+        print(f"anthropic request failed: {exc}", flush=True)
+        return None
+    for block in data.get("content") or []:
+        if block.get("type") == "text":
+            reply = (block.get("text") or "").strip()
+            if reply:
+                return reply
+    return None
+
+
 REQUEST_WORDS = ("requesting", "request", "repeat", "say", "come", "can", "could",
                  "need", "asking", "asks", "please", "give", "what")
 
@@ -322,15 +378,21 @@ async def handle_utterance(member, pcm):
     print(f"heard {who}: {text}", flush=True)
     if not is_for_dispatch(text):
         return
-    if not wants_repeat(text):
-        return
     callsign = extract_callsign(text)
-    if last_call is not None:
-        ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
-        await announce(ack + build_call_line(last_call), title="Repeat")
-    else:
+    if wants_repeat(text):
+        if last_call is not None:
+            ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
+            await announce(ack + build_call_line(last_call), title="Repeat")
+        else:
+            ack = f"Unit {callsign}, " if callsign else ""
+            await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
+        return
+    reply = await dispatch_ai_reply(text, callsign)
+    if reply:
+        await announce(reply, title="Dispatch")
+    elif not AI_ENABLED:
         ack = f"Unit {callsign}, " if callsign else ""
-        await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
+        await announce(f"{ack}dispatch copies, 10-4.", title="Dispatch")
 
 
 if VOICE_RECV_AVAILABLE:
@@ -548,6 +610,10 @@ async def on_ready():
         reason = "disabled by config" if not VOICE_COMMANDS else (
             "voice-recv extension missing" if not VOICE_RECV_AVAILABLE else "libopus not loaded")
         print(f"voice commands: OFF ({reason}) — 911 dispatch still runs normally", flush=True)
+    if AI_ENABLED:
+        print(f"ai responses: ENABLED (model {AI_MODEL})", flush=True)
+    else:
+        print("ai responses: OFF (set ANTHROPIC_API_KEY to let dispatch answer radio traffic)", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
