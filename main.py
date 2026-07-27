@@ -49,6 +49,8 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
+BUILD = "attach-ack-2"
+
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -288,16 +290,22 @@ DISPATCH_SYSTEM = (
     "and sheriff deputies talk to you over the radio. Answer with exactly one "
     "short radio transmission, the way a real dispatcher would respond.\n"
     "Rules:\n"
-    "- One or two sentences at most. Radio brevity. No preamble and no sign-off.\n"
+    "- Keep every reply to ONE short sentence. Radio brevity. No preamble, no sign-off.\n"
     "- Do not include the unit's callsign in your reply; it is added automatically. "
     "Give only the dispatch response itself.\n"
+    "- You are dispatch talking TO the unit. Never speak in the first person about "
+    "the unit's status. Never say 'I am attached' or 'I'm en route'. Say 'show you "
+    "attached' or 'copy, show you en route'.\n"
     "- Use standard ten-codes and plain dispatch language: 10-4 to acknowledge, "
     "10-8 in service, 10-7 out of service, 10-76 en route, 10-97 on scene, "
     "10-20 for location, 10-23 standing by, Code 3 for lights and sirens, Code 4 "
     "scene secure. Echo status changes back to the unit, for example 'show you 10-8'.\n"
-    "- When a unit attaches to a call, marks en route, or updates their status, "
-    "just confirm the action in a few words. Do not read back or restate the "
-    "call's details unless the unit explicitly asks you to repeat the call.\n"
+    "- NEVER read back, list, or restate a call's details (location, description, "
+    "caller, call number) unless the unit literally asks you to repeat or read back "
+    "the call. When a unit attaches to a call, marks en route, or gives a status "
+    "update, ONLY acknowledge the action. For example, if a unit says they are "
+    "attaching to a call, reply exactly like 'copy, show you attached and en route' "
+    "and nothing more. Do not mention what the call is about.\n"
     "- You cannot look up plates, warrants, names, or run records. If asked to run "
     "one, advise the unit the return is negative or to stand by, staying in character.\n"
     "- Never break character, never say you are an AI, never use markdown or emojis.\n"
@@ -473,8 +481,9 @@ def extract_callsign(text):
         parts.append(tok.strip(",.-"))
         if len(parts) >= 6 or tok[-1:] in ".?!":
             break
+    has_number = any(any(c.isdigit() for c in p) or p.lower() in CALLSIGN_NUMS for p in parts)
     callsign = " ".join(parts).strip(" ,.-")
-    if not callsign or len(callsign) > 24:
+    if not callsign or len(callsign) > 24 or not has_number:
         return ""
     return callsign
 
@@ -716,6 +725,7 @@ async def on_ready():
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
+    print(f"running build: {BUILD}", flush=True)
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
     else:
