@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import asyncio
 import tempfile
@@ -19,20 +18,9 @@ GUILD_ID = int(os.environ["DISPATCH_GUILD_ID"])
 VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
-FEEDS = [f.strip() for f in os.environ.get("DISPATCH_FEEDS", "emergencycalls,modcalls,killlogs").split(",") if f.strip()]
 
-ERLC_BASE = "https://api.erlc.gg/v1"
 ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
-
-TEN_CODES = {
-    "assist": "10-13, unit requesting assistance",
-    "shots": "10-71, shots fired",
-    "acknowledge": "10-4",
-    "backup": "10-78, requesting backup",
-    "responding": "10-76, en route",
-    "clear": "10-8, in service",
-}
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -44,31 +32,7 @@ voice_client = None
 http = None
 
 
-def clean_name(raw):
-    if not raw:
-        return "an unknown player"
-    name = str(raw).split(":", 1)[0].strip()
-    name = re.sub(r"\([^)]*\)", "", name).strip()
-    return name or "an unknown player"
-
-
-def build_modcall_line(caller):
-    name = clean_name(caller)
-    return (
-        f"Attention all units. Dispatch has received a call for assistance from {name}. "
-        f"Be advised, {TEN_CODES['assist']}. Any available unit, please respond and advise. {TEN_CODES['acknowledge']}."
-    )
-
-
-def build_kill_line(killer, killed):
-    who = clean_name(killed)
-    return (
-        f"Dispatch to all units. {TEN_CODES['shots']}, reported involving {who}. "
-        f"Units in the area, respond code three and advise on scene."
-    )
-
-
-def build_erlc_call_line(call):
+def build_call_line(call):
     desc = (call.get("Description") or "").strip()
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
@@ -83,13 +47,13 @@ def build_erlc_call_line(call):
         line += f" Caller states, {desc}."
     if team:
         line += f" {team} response requested."
-    line += " Any available unit, please respond and advise."
+    line += " Any available unit, respond code three and advise."
     return line
 
 
-async def erlc_get(path, base=ERLC_BASE):
+async def erlc_get(path):
     try:
-        async with http.get(f"{base}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
+        async with http.get(f"{ERLC_V2_BASE}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
             if resp.status == 429:
                 retry = float(resp.headers.get("Retry-After", "5"))
                 print(f"erlc {path} -> 429 rate limited, waiting {retry}s", flush=True)
@@ -130,7 +94,7 @@ async def synthesize(text):
     return path
 
 
-async def announce(text, title="Dispatch"):
+async def announce(text, title="911 Call"):
     print(f"announce: {text[:80]}", flush=True)
     if TEXT_CHANNEL_ID:
         channel = client.get_channel(TEXT_CHANNEL_ID)
@@ -186,37 +150,8 @@ async def playback_worker():
             play_queue.task_done()
 
 
-async def poll_modcalls():
-    data = await erlc_get("/server/modcalls")
-    if not isinstance(data, list):
-        return
-    for item in data:
-        ts = item.get("Timestamp", 0)
-        caller = item.get("Caller")
-        key = ("modcall", caller, ts)
-        if ts < boot_time or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        await announce(build_modcall_line(caller), title="Incoming Call")
-
-
-async def poll_killlogs():
-    data = await erlc_get("/server/killlogs")
-    if not isinstance(data, list):
-        return
-    for item in data:
-        ts = item.get("Timestamp", 0)
-        killer = item.get("Killer")
-        killed = item.get("Killed")
-        key = ("kill", killer, killed, ts)
-        if ts < boot_time or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        await announce(build_kill_line(killer, killed), title="Shots Fired")
-
-
-async def poll_erlc_emergency():
-    data = await erlc_get("/server?EmergencyCalls=true", base=ERLC_V2_BASE)
+async def poll_calls():
+    data = await erlc_get("/server?EmergencyCalls=true")
     if not isinstance(data, dict):
         return
     calls = data.get("EmergencyCalls")
@@ -225,26 +160,18 @@ async def poll_erlc_emergency():
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
-        key = ("erlccall", number)
+        key = ("call", number)
         if started < boot_time or key in seen_keys:
             continue
         seen_keys.add(key)
-        await announce(build_erlc_call_line(call), title="911 Call")
+        await announce(build_call_line(call))
 
 
 async def dispatch_loop():
     await client.wait_until_ready()
-    handlers = {
-        "modcalls": poll_modcalls,
-        "killlogs": poll_killlogs,
-        "emergencycalls": poll_erlc_emergency,
-    }
-    print(f"dispatch loop started, polling every {POLL_SECONDS}s: {FEEDS}", flush=True)
+    print(f"dispatch loop started, polling emergency calls every {POLL_SECONDS}s", flush=True)
     while not client.is_closed():
-        for feed in FEEDS:
-            handler = handlers.get(feed)
-            if handler is not None:
-                await handler()
+        await poll_calls()
         await asyncio.sleep(POLL_SECONDS)
 
 
