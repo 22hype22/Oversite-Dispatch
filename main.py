@@ -3,6 +3,7 @@ import io
 import re
 import wave
 import time
+import random
 import asyncio
 import difflib
 import logging
@@ -65,6 +66,7 @@ STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL = os.environ.get("DISPATCH_AI_MODEL", "claude-haiku-4-5")
 AI_ENABLED = bool(ANTHROPIC_KEY)
+AI_CACHE_VARIANTS = int(os.environ.get("AI_CACHE_VARIANTS", "3"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -81,6 +83,7 @@ boot_time = time.time()
 voice_client = None
 http = None
 last_call = None
+response_cache = {}
 
 
 DISPATCH_WORDS = [
@@ -286,7 +289,8 @@ DISPATCH_SYSTEM = (
     "short radio transmission, the way a real dispatcher would respond.\n"
     "Rules:\n"
     "- One or two sentences at most. Radio brevity. No preamble and no sign-off.\n"
-    "- Always acknowledge the unit's callsign when one is given.\n"
+    "- Do not include the unit's callsign in your reply; it is added automatically. "
+    "Give only the dispatch response itself.\n"
     "- Use standard ten-codes and plain dispatch language: 10-4 to acknowledge, "
     "10-8 in service, 10-7 out of service, 10-76 en route, 10-97 on scene, "
     "10-20 for location, 10-23 standing by, Code 3 for lights and sirens, Code 4 "
@@ -328,6 +332,81 @@ async def dispatch_ai_reply(text, callsign):
             reply = (block.get("text") or "").strip()
             if reply:
                 return reply
+    return None
+
+
+def normalize_intent(text, callsign):
+    low = text.lower()
+    if callsign:
+        low = low.replace(callsign.lower(), " ")
+    low = low.replace("dispatch", " ")
+    low = re.sub(r"[^a-z\s]", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+    return low
+
+
+def match_cached_intent(key):
+    if not key:
+        return None
+    if key in response_cache:
+        return key
+    matches = difflib.get_close_matches(key, list(response_cache), n=1, cutoff=0.85)
+    return matches[0] if matches else None
+
+
+FALLBACK_REPLIES = {
+    "foot pursuit": ["copy your foot pursuit, units en route to assist, advise your direction of travel"],
+    "in pursuit": ["copy, you are in pursuit, all units clear the air for the pursuit",
+                   "copy your pursuit, break, all units hold traffic for the primary unit"],
+    "shots fired": ["copy shots fired, all available units respond Code 3",
+                    "copy your shots fired, units en route Code 3, use caution"],
+    "traffic stop": ["copy your traffic stop, advise if you need backup",
+                     "copy, show you out on a traffic stop, advise plate and location"],
+    "out of service": ["copy, show you 10-7, out of service"],
+    "in service": ["copy, show you 10-8, in service",
+                   "10-4, show you back in service"],
+    "en route": ["copy, show you en route, 10-76"],
+    "on scene": ["copy, show you on scene, 10-97",
+                 "10-4, show you 10-23 on scene"],
+    "scene secure": ["copy, Code 4, scene is secure"],
+    "requesting backup": ["copy, backup en route to your location, Code 3"],
+    "need backup": ["copy, backup en route to your location, Code 3"],
+    "radio check": ["copy your radio check, you are loud and clear"],
+    "show me clear": ["copy, show you clear and available"],
+    "pursuit": ["copy, all units clear the air"],
+    "copy": ["10-4"],
+}
+
+
+def fallback_reply(key):
+    if not key:
+        return None
+    for phrase, replies in FALLBACK_REPLIES.items():
+        if phrase in key:
+            return random.choice(replies)
+    matches = difflib.get_close_matches(key, list(FALLBACK_REPLIES), n=1, cutoff=0.82)
+    if matches:
+        return random.choice(FALLBACK_REPLIES[matches[0]])
+    return None
+
+
+async def dispatch_reply_body(text, callsign):
+    key = normalize_intent(text, callsign)
+    hit = match_cached_intent(key)
+    if hit and len(response_cache[hit]) >= AI_CACHE_VARIANTS:
+        print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
+        return random.choice(response_cache[hit])
+    body = await dispatch_ai_reply(text, callsign)
+    if body:
+        store = response_cache.setdefault(hit or key, [])
+        if body not in store:
+            store.append(body)
+        print(f"saved reply for '{hit or key}' ({len(store)} variant(s))", flush=True)
+        return body
+    fb = fallback_reply(key)
+    if fb:
+        print(f"using built-in fallback for '{key}'", flush=True)
+        return fb
     return None
 
 
@@ -387,11 +466,11 @@ async def handle_utterance(member, pcm):
             ack = f"Unit {callsign}, " if callsign else ""
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
         return
-    reply = await dispatch_ai_reply(text, callsign)
-    if reply:
-        await announce(reply, title="Dispatch")
-    elif not AI_ENABLED:
-        ack = f"Unit {callsign}, " if callsign else ""
+    body = await dispatch_reply_body(text, callsign)
+    ack = f"Unit {callsign}, " if callsign else ""
+    if body:
+        await announce(ack + body, title="Dispatch")
+    else:
         await announce(f"{ack}dispatch copies, 10-4.", title="Dispatch")
 
 
