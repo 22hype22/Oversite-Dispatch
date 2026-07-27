@@ -49,7 +49,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "attach-ack-2"
+BUILD = "attach-ack-3"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -488,6 +488,18 @@ def extract_callsign(text):
     return callsign
 
 
+def strip_callsign_echo(body):
+    s = body.lstrip()
+    start = len("unit ") if s.lower().startswith("unit ") else 0
+    comma = s.find(",", start)
+    if comma == -1:
+        return body
+    head = [t for t in re.split(r"\s+", s[start:comma]) if t]
+    if head and all(is_callsign_token(t) for t in head):
+        return s[comma + 1:].lstrip()
+    return body
+
+
 async def handle_utterance(member, pcm):
     if len(pcm) < 96000:
         return
@@ -509,10 +521,13 @@ async def handle_utterance(member, pcm):
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
         return
     body = await dispatch_reply_body(text, callsign)
-    ack = f"Unit {callsign}, " if callsign else ""
     if body:
-        await announce(ack + body, title="Dispatch")
+        if callsign:
+            await announce(f"Unit {callsign}, " + strip_callsign_echo(body), title="Dispatch")
+        else:
+            await announce(body, title="Dispatch")
     else:
+        ack = f"Unit {callsign}, " if callsign else ""
         await announce(f"{ack}dispatch copies, 10-4.", title="Dispatch")
 
 
