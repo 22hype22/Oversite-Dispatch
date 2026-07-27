@@ -21,8 +21,8 @@ TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 FEEDS = [f.strip() for f in os.environ.get("DISPATCH_FEEDS", "emergencycalls,modcalls,killlogs").split(",") if f.strip()]
 
-ERLC_BASE = "https://api.policeroleplay.community/v1"
-ERLC_V2_BASE = "https://api.policeroleplay.community/v2"
+ERLC_BASE = "https://api.erlc.gg/v1"
+ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
 
 TEN_CODES = {
