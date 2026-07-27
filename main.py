@@ -319,8 +319,9 @@ def wants_repeat(text):
     return False
 
 
-async def handle_utterance(member, frames):
-    frames = [f for f in frames if len(f) > 3]
+async def handle_utterance(member, packets):
+    packets.sort(key=lambda p: p[0])
+    frames = [opus for _seq, opus in packets if len(opus) > 3]
     if len(frames) < 20:
         return
     toc = frames[0][0]
@@ -355,15 +356,18 @@ if VOICE_RECV_AVAILABLE:
         def write(self, user, data):
             if user is None:
                 return
-            packet = getattr(data, "opus", None)
-            if packet:
-                self.buffers.setdefault(user.id, []).append(packet)
+            opus = getattr(data, "opus", None)
+            if not opus:
+                return
+            pkt = getattr(data, "packet", None)
+            seq = getattr(pkt, "sequence", 0) if pkt is not None else 0
+            self.buffers.setdefault(user.id, []).append((seq, opus))
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
-            frames = self.buffers.pop(member.id, None)
-            if frames:
-                asyncio.run_coroutine_threadsafe(handle_utterance(member, frames), self.loop)
+            packets = self.buffers.pop(member.id, None)
+            if packets:
+                asyncio.run_coroutine_threadsafe(handle_utterance(member, packets), self.loop)
 
         def cleanup(self):
             self.buffers.clear()
