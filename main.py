@@ -392,6 +392,10 @@ def fallback_reply(key):
 
 async def dispatch_reply_body(text, callsign):
     key = normalize_intent(text, callsign)
+    fb = fallback_reply(key)
+    if fb:
+        print(f"using built-in reply for '{key}' (no api call)", flush=True)
+        return fb
     hit = match_cached_intent(key)
     if hit and len(response_cache[hit]) >= AI_CACHE_VARIANTS:
         print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
@@ -403,10 +407,6 @@ async def dispatch_reply_body(text, callsign):
             store.append(body)
         print(f"saved reply for '{hit or key}' ({len(store)} variant(s))", flush=True)
         return body
-    fb = fallback_reply(key)
-    if fb:
-        print(f"using built-in fallback for '{key}'", flush=True)
-        return fb
     return None
 
 
