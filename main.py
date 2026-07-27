@@ -1,6 +1,8 @@
 import os
+import io
 import re
 import time
+import wave
 import asyncio
 import difflib
 import tempfile
@@ -8,6 +10,27 @@ import tempfile
 import aiohttp
 import discord
 import imageio_ffmpeg
+
+try:
+    from discord.ext import voice_recv
+    VOICE_RECV_AVAILABLE = True
+except Exception as exc:
+    voice_recv = None
+    VOICE_RECV_AVAILABLE = False
+    print(f"voice receive extension not available: {exc}", flush=True)
+
+OPUS_OK = False
+try:
+    if not discord.opus.is_loaded():
+        for _name in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
+            try:
+                discord.opus.load_opus(_name)
+                break
+            except Exception:
+                continue
+    OPUS_OK = discord.opus.is_loaded()
+except Exception:
+    OPUS_OK = False
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -21,6 +44,10 @@ VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
+VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
+STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
+
+VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
 ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
@@ -33,6 +60,7 @@ seen_keys = set()
 boot_time = time.time()
 voice_client = None
 http = None
+last_call = None
 
 
 DISPATCH_WORDS = [
@@ -204,6 +232,94 @@ async def announce(text, title="911 Call"):
         print("audio queued for playback", flush=True)
 
 
+def pcm_to_wav(pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(pcm)
+    return buf.getvalue()
+
+
+async def transcribe(wav_bytes):
+    form = aiohttp.FormData()
+    form.add_field("model_id", STT_MODEL)
+    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+    try:
+        async with http.post(f"{XI_BASE}/speech-to-text", headers={"xi-api-key": XI_KEY}, data=form) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"stt error {resp.status}: {body[:200]}", flush=True)
+                return None
+            data = await resp.json()
+            return (data.get("text") or "").strip()
+    except Exception as exc:
+        print(f"stt request failed: {exc}", flush=True)
+        return None
+
+
+def wants_repeat(text):
+    low = text.lower()
+    if "say again" in low or "come again" in low:
+        return True
+    if "repeat" in low and ("call" in low or "last" in low or "that" in low or "again" in low):
+        return True
+    return False
+
+
+async def handle_utterance(member, pcm):
+    if len(pcm) < 96000:
+        return
+    text = await transcribe(pcm_to_wav(pcm))
+    if not text:
+        return
+    who = getattr(member, "display_name", "unit")
+    print(f"heard {who}: {text}", flush=True)
+    if wants_repeat(text):
+        if last_call is not None:
+            await announce(build_call_line(last_call), title="Repeat")
+        else:
+            await announce("Dispatch. No active calls to repeat at this time.", title="Repeat")
+
+
+if VOICE_RECV_AVAILABLE:
+
+    class ListenSink(voice_recv.AudioSink):
+        def __init__(self, loop):
+            super().__init__()
+            self.loop = loop
+            self.buffers = {}
+
+        def wants_opus(self):
+            return False
+
+        def write(self, user, data):
+            if user is None:
+                return
+            self.buffers.setdefault(user.id, bytearray()).extend(data.pcm)
+
+        @voice_recv.AudioSink.listener()
+        def on_voice_member_speaking_stop(self, member):
+            buf = self.buffers.pop(member.id, None)
+            if buf:
+                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(buf)), self.loop)
+
+        def cleanup(self):
+            self.buffers.clear()
+
+
+def start_listening():
+    if not VOICE_CMD_ENABLED or voice_client is None:
+        return
+    try:
+        if isinstance(voice_client, voice_recv.VoiceRecvClient) and not voice_client.is_listening():
+            voice_client.listen(ListenSink(client.loop))
+            print("voice commands active — say 'repeat the last call' in the VC", flush=True)
+    except Exception as exc:
+        print(f"could not start listening: {exc}", flush=True)
+
+
 async def wait_for_voice(timeout=20):
     waited = 0
     while waited < timeout:
@@ -221,7 +337,8 @@ async def playback_worker():
             connected = await wait_for_voice()
             if connected and voice_client is not None:
                 if voice_client.is_playing():
-                    voice_client.stop()
+                    stopper = getattr(voice_client, "stop_playing", voice_client.stop)
+                    stopper()
                 done = asyncio.Event()
 
                 def after(_err):
@@ -246,6 +363,7 @@ async def playback_worker():
 
 
 async def poll_calls():
+    global last_call
     data = await erlc_get("/server?EmergencyCalls=true")
     if not isinstance(data, dict):
         return
@@ -259,6 +377,7 @@ async def poll_calls():
         if started < boot_time or key in seen_keys:
             continue
         seen_keys.add(key)
+        last_call = call
         await announce(build_call_line(call))
 
 
@@ -289,11 +408,16 @@ async def ensure_voice():
                     await existing.move_to(channel)
                 except Exception:
                     pass
+            start_listening()
             return True
         return False
     try:
-        voice_client = await channel.connect(self_deaf=True, reconnect=True)
+        if VOICE_CMD_ENABLED:
+            voice_client = await channel.connect(self_deaf=False, reconnect=True, cls=voice_recv.VoiceRecvClient)
+        else:
+            voice_client = await channel.connect(self_deaf=True, reconnect=True)
         print(f"dispatch connected to voice channel {channel.name}", flush=True)
+        start_listening()
         return True
     except Exception as exc:
         print(f"voice connect failed: {exc}", flush=True)
@@ -332,6 +456,12 @@ async def on_ready():
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
+    if VOICE_CMD_ENABLED:
+        print("voice commands: ENABLED", flush=True)
+    else:
+        reason = "disabled by config" if not VOICE_COMMANDS else (
+            "voice-recv extension missing" if not VOICE_RECV_AVAILABLE else "libopus not loaded")
+        print(f"voice commands: OFF ({reason}) — 911 dispatch still runs normally", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
