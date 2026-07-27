@@ -274,10 +274,29 @@ def opus_frames_to_ogg(frames, serial=1):
     return bytes(out)
 
 
-async def transcribe(ogg_bytes):
+async def ogg_to_wav(ogg_bytes):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(ogg_bytes)
+        if proc.returncode != 0 or not out:
+            print(f"ffmpeg decode failed ({proc.returncode}): {err[:200]!r}", flush=True)
+            return None
+        return out
+    except Exception as exc:
+        print(f"ffmpeg decode error: {exc}", flush=True)
+        return None
+
+
+async def transcribe(wav_bytes):
     form = aiohttp.FormData()
     form.add_field("model_id", STT_MODEL)
-    form.add_field("file", ogg_bytes, filename="audio.ogg", content_type="audio/ogg")
+    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
     try:
         async with http.post(f"{XI_BASE}/speech-to-text", headers={"xi-api-key": XI_KEY}, data=form) as resp:
             if resp.status != 200:
@@ -301,12 +320,16 @@ def wants_repeat(text):
 
 
 async def handle_utterance(member, frames):
-    if len(frames) < 25:
+    frames = [f for f in frames if len(f) > 3]
+    if len(frames) < 20:
         return
-    toc = frames[0][0] if frames[0] else 0
-    print(f"utterance: {len(frames)} frames, first={len(frames[0])}b, toc=0x{toc:02x}, "
+    toc = frames[0][0]
+    print(f"utterance: {len(frames)} speech frames, first={len(frames[0])}b, toc=0x{toc:02x}, "
           f"channels={'stereo' if toc & 0x04 else 'mono'}", flush=True)
-    text = await transcribe(opus_frames_to_ogg(frames))
+    wav = await ogg_to_wav(opus_frames_to_ogg(frames))
+    if not wav:
+        return
+    text = await transcribe(wav)
     if not text:
         return
     who = getattr(member, "display_name", "unit")
