@@ -49,7 +49,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "attach-ack-4"
+BUILD = "attach-ack-5"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -373,6 +373,10 @@ FALLBACK_REPLIES = {
                     "copy your shots fired, units en route Code 3, use caution"],
     "traffic stop": ["copy your traffic stop, advise if you need backup",
                      "copy, show you out on a traffic stop, advise plate and location"],
+    "unavailable": ["copy, show you unavailable, 10-7",
+                    "10-4, show you 10-7 and unavailable"],
+    "available": ["copy, show you available and 10-8",
+                  "10-4, show you back available and in service"],
     "out of service": ["copy, show you 10-7, out of service"],
     "in service": ["copy, show you 10-8, in service",
                    "10-4, show you back in service"],
