@@ -14,6 +14,7 @@ import imageio_ffmpeg
 
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR)
 
 try:
     from discord.ext import voice_recv
