@@ -8,6 +8,12 @@ import asyncio
 import difflib
 import logging
 import tempfile
+from datetime import datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 import aiohttp
 import discord
@@ -49,7 +55,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "region-cmd-1"
+BUILD = "status-board-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -71,6 +77,7 @@ AI_ENABLED = bool(ANTHROPIC_KEY)
 AI_CACHE_VARIANTS = int(os.environ.get("AI_CACHE_VARIANTS", "3"))
 DISPATCH_REGION = os.environ.get("DISPATCH_REGION", "the United States").strip() or "the United States"
 ALERT_TONES = os.environ.get("ALERT_TONES", "1").lower() not in ("0", "false", "no", "off")
+DISPATCH_TZ = os.environ.get("DISPATCH_TZ", "UTC").strip() or "UTC"
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -92,6 +99,8 @@ http = None
 last_call = None
 response_cache = {}
 tone_path = None
+status_board = {}
+open_calls = {}
 
 
 DISPATCH_WORDS = [
@@ -150,6 +159,16 @@ def autocorrect(text):
     return re.sub(r"[A-Za-z]+", lambda m: correct_word(m.group(0)), text)
 
 
+def local_time_str():
+    tz = None
+    if ZoneInfo is not None and DISPATCH_TZ.upper() != "UTC":
+        try:
+            tz = ZoneInfo(DISPATCH_TZ)
+        except Exception:
+            tz = None
+    return datetime.now(tz or timezone.utc).strftime("%H:%M")
+
+
 PRIORITY_WORDS = (
     "shot", "shots", "shooting", "gun", "firearm", "weapon", "armed", "stab",
     "robbery", "burglary", "hostage", "kidnap", "assault", "pursuit", "fight",
@@ -188,6 +207,8 @@ def build_call_line(call):
 
     if number:
         parts.append(f"Incident number {number}.")
+
+    parts.append(f"Time, {local_time_str()}.")
 
     return " ".join(parts)
 
@@ -343,6 +364,7 @@ def build_call_system(region):
         "- One broadcast, two or three short sentences at most.\n"
         "- State the nature of the call and the location, and repeat the location once.\n"
         "- Direct the appropriate units to respond with the correct priority code.\n"
+        "- End by stating the time exactly as given in the record.\n"
         "- Do not invent any detail that is not in the record. Do not add a call-taker "
         "name, phone number, or facts you were not given.\n"
         "- No markdown, no emojis, no preamble, no sign-off.\n"
@@ -424,7 +446,8 @@ async def compose_dispatch(call):
         f"Nature of call: {desc or 'unknown'}\n"
         f"Location: {loc or 'unknown'}\n"
         f"Units requested: {team or 'any available'}\n"
-        f"Incident number: {number}"
+        f"Incident number: {number}\n"
+        f"Time: {local_time_str()} hours"
     )
     reply = await anthropic_call(CALL_SYSTEM, record, max_tokens=220)
     return reply or build_call_line(call)
@@ -623,6 +646,86 @@ def strip_callsign_echo(body):
     return body
 
 
+STATUS_MAP = [
+    ("out of service", "10-7, out of service"),
+    ("unavailable", "unavailable"),
+    ("in service", "10-8, in service"),
+    ("back available", "10-8, available"),
+    ("available", "available"),
+    ("foot pursuit", "in a foot pursuit"),
+    ("in pursuit", "in pursuit"),
+    ("en route", "en route"),
+    ("responding", "en route"),
+    ("on scene", "on scene"),
+    ("on a traffic stop", "on a traffic stop"),
+    ("traffic stop", "on a traffic stop"),
+    ("attached", "on a call"),
+    ("show me clear", "clear"),
+    ("clearing", "clear"),
+    ("meal break", "10-7, meal break"),
+]
+
+
+def _flat(text):
+    return text.lower().replace("’", "").replace("'", "")
+
+
+def detect_status(text):
+    low = _flat(text)
+    for phrase, label in STATUS_MAP:
+        if phrase in low:
+            return label
+    return None
+
+
+def wants_status_board(text):
+    low = _flat(text)
+    triggers = ("unit status", "status board", "roll call", "status check",
+                "who is available", "whos available", "who is on", "whos on",
+                "units available", "unit check", "status of units", "all units status")
+    return any(t in low for t in triggers)
+
+
+def wants_calls_holding(text):
+    low = _flat(text)
+    triggers = ("calls holding", "call holding", "calls are holding", "any active calls",
+                "active calls", "any calls", "calls waiting", "pending calls",
+                "calls in queue", "what calls")
+    return any(t in low for t in triggers)
+
+
+def read_status_board(callsign=""):
+    now = time.time()
+    entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
+    ack = f"Unit {callsign}, " if callsign else ""
+    if not entries:
+        return f"{ack}no unit statuses on file at this time."
+    parts = [f"{ack}current unit status."]
+    for cs, st in entries[:12]:
+        parts.append(f"Unit {cs} shows {st}.")
+    return " ".join(parts)
+
+
+def read_calls_holding(callsign=""):
+    calls = list(open_calls.values())
+    ack = f"Unit {callsign}, " if callsign else ""
+    if not calls:
+        return f"{ack}no calls holding at this time, all quiet."
+    word = "call" if len(calls) == 1 else "calls"
+    parts = [f"{ack}you have {len(calls)} {word} holding."]
+    for c in calls[:6]:
+        num = c.get("CallNumber")
+        desc = autocorrect((c.get("Description") or "").strip())
+        loc = (c.get("PositionDescriptor") or "").strip()
+        seg = f"Call {num}" if num is not None else "Call"
+        if desc:
+            seg += f", {desc}"
+        if loc:
+            seg += f", at {loc}"
+        parts.append(seg + ".")
+    return " ".join(parts)
+
+
 async def handle_utterance(member, pcm):
     if len(pcm) < 96000:
         return
@@ -643,6 +746,16 @@ async def handle_utterance(member, pcm):
             ack = f"Unit {callsign}, " if callsign else ""
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
         return
+    if wants_status_board(text):
+        await announce(read_status_board(callsign), title="Unit Status")
+        return
+    if wants_calls_holding(text):
+        await announce(read_calls_holding(callsign), title="Calls Holding")
+        return
+    status = detect_status(text)
+    if status and callsign:
+        status_board[callsign] = {"status": status, "time": time.time()}
+        print(f"status board: {callsign} -> {status}", flush=True)
     body = await dispatch_reply_body(text, callsign)
     if body:
         if callsign:
@@ -779,6 +892,11 @@ async def poll_calls():
     calls = data.get("EmergencyCalls")
     if not isinstance(calls, list):
         return
+    open_calls.clear()
+    for call in calls:
+        number = call.get("CallNumber")
+        if number is not None:
+            open_calls[number] = call
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
@@ -788,6 +906,8 @@ async def poll_calls():
         seen_keys.add(key)
         last_call = call
         line = await compose_dispatch(call)
+        if len(open_calls) > 1:
+            line = f"{line} Be advised, you now have {len(open_calls)} calls holding."
         await announce(line, tone=is_priority(call))
 
 
