@@ -1,7 +1,8 @@
 import os
+import io
 import re
+import wave
 import time
-import struct
 import asyncio
 import difflib
 import logging
@@ -16,11 +17,28 @@ logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
 
 try:
     from discord.ext import voice_recv
+    from discord.ext.voice_recv.rtp import SilencePacket
     VOICE_RECV_AVAILABLE = True
 except Exception as exc:
     voice_recv = None
+    SilencePacket = ()
     VOICE_RECV_AVAILABLE = False
     print(f"voice receive extension not available: {exc}", flush=True)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+OPUS_OK = False
+for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so.0", "opus"):
+    try:
+        if not discord.opus.is_loaded():
+            discord.opus.load_opus(_cand)
+        if discord.opus.is_loaded():
+            OPUS_OK = True
+            print(f"loaded opus from {_cand}", flush=True)
+            break
+    except Exception:
+        continue
+if not OPUS_OK:
+    print("opus not loaded — voice commands will stay off", flush=True)
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -37,7 +55,7 @@ SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
 STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
 
-VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE
+VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
 ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
@@ -222,75 +240,14 @@ async def announce(text, title="911 Call"):
         print("audio queued for playback", flush=True)
 
 
-_CRC_TABLE = []
-for _n in range(256):
-    _c = _n << 24
-    for _ in range(8):
-        _c = ((_c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if _c & 0x80000000 else (_c << 1) & 0xFFFFFFFF
-    _CRC_TABLE.append(_c)
-
-
-def _ogg_crc(data):
-    crc = 0
-    for byte in data:
-        crc = ((crc << 8) & 0xFFFFFFFF) ^ _CRC_TABLE[((crc >> 24) ^ byte) & 0xFF]
-    return crc
-
-
-def _ogg_page(header_type, granule, serial, seqno, packet):
-    segtable = bytearray()
-    n = len(packet)
-    while n >= 255:
-        segtable.append(255)
-        n -= 255
-    segtable.append(n)
-    header = bytearray(b"OggS")
-    header.append(0)
-    header.append(header_type)
-    header += struct.pack("<q", granule)
-    header += struct.pack("<I", serial)
-    header += struct.pack("<I", seqno)
-    header += b"\x00\x00\x00\x00"
-    header.append(len(segtable))
-    header += segtable
-    page = bytes(header) + packet
-    crc = _ogg_crc(page)
-    return page[:22] + struct.pack("<I", crc) + page[26:]
-
-
-def opus_frames_to_ogg(frames, serial=1):
-    out = bytearray()
-    channels = 2 if (frames and (frames[0][0] & 0x04)) else 1
-    head = b"OpusHead" + struct.pack("<BBHIHB", 1, channels, 0, 48000, 0, 0)
-    out += _ogg_page(0x02, 0, serial, 0, head)
-    vendor = b"oversite"
-    tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
-    out += _ogg_page(0x00, 0, serial, 1, tags)
-    granule = 0
-    for i, frame in enumerate(frames):
-        granule += 960
-        header_type = 0x04 if i == len(frames) - 1 else 0x00
-        out += _ogg_page(header_type, granule, serial, i + 2, frame)
-    return bytes(out)
-
-
-async def ogg_to_wav(ogg_bytes):
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate(ogg_bytes)
-        if proc.returncode != 0 or not out:
-            print(f"ffmpeg decode failed ({proc.returncode}): {err[:200]!r}", flush=True)
-            return None
-        return out
-    except Exception as exc:
-        print(f"ffmpeg decode error: {exc}", flush=True)
-        return None
+def pcm_to_wav(pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(pcm)
+    return buf.getvalue()
 
 
 async def transcribe(wav_bytes):
@@ -319,18 +276,11 @@ def wants_repeat(text):
     return False
 
 
-async def handle_utterance(member, packets):
-    packets.sort(key=lambda p: p[0])
-    frames = [opus for _seq, opus in packets if len(opus) > 3]
-    if len(frames) < 20:
+async def handle_utterance(member, pcm):
+    if len(pcm) < 96000:
         return
-    toc = frames[0][0]
-    print(f"utterance: {len(frames)} speech frames, first={len(frames[0])}b, toc=0x{toc:02x}, "
-          f"channels={'stereo' if toc & 0x04 else 'mono'}", flush=True)
-    wav = await ogg_to_wav(opus_frames_to_ogg(frames))
-    if not wav:
-        return
-    text = await transcribe(wav)
+    print(f"utterance: {len(pcm)} bytes of pcm (~{len(pcm)/192000:.1f}s)", flush=True)
+    text = await transcribe(pcm_to_wav(pcm))
     if not text:
         return
     who = getattr(member, "display_name", "unit")
@@ -351,23 +301,21 @@ if VOICE_RECV_AVAILABLE:
             self.buffers = {}
 
         def wants_opus(self):
-            return True
+            return False
 
         def write(self, user, data):
             if user is None:
                 return
-            opus = getattr(data, "opus", None)
-            if not opus:
+            if isinstance(data.packet, SilencePacket):
                 return
-            pkt = getattr(data, "packet", None)
-            seq = getattr(pkt, "sequence", 0) if pkt is not None else 0
-            self.buffers.setdefault(user.id, []).append((seq, opus))
+            if data.pcm:
+                self.buffers.setdefault(user.id, bytearray()).extend(data.pcm)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
-            packets = self.buffers.pop(member.id, None)
-            if packets:
-                asyncio.run_coroutine_threadsafe(handle_utterance(member, packets), self.loop)
+            pcm = self.buffers.pop(member.id, None)
+            if pcm:
+                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm)), self.loop)
 
         def cleanup(self):
             self.buffers.clear()
@@ -524,7 +472,8 @@ async def on_ready():
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
     else:
-        reason = "disabled by config" if not VOICE_COMMANDS else "voice-recv extension missing"
+        reason = "disabled by config" if not VOICE_COMMANDS else (
+            "voice-recv extension missing" if not VOICE_RECV_AVAILABLE else "libopus not loaded")
         print(f"voice commands: OFF ({reason}) — 911 dispatch still runs normally", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
