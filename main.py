@@ -190,7 +190,6 @@ async def poll_modcalls():
     data = await erlc_get("/server/modcalls")
     if not isinstance(data, list):
         return
-    print(f"modcalls feed: {len(data)} item(s)", flush=True)
     for item in data:
         ts = item.get("Timestamp", 0)
         caller = item.get("Caller")
@@ -205,7 +204,6 @@ async def poll_killlogs():
     data = await erlc_get("/server/killlogs")
     if not isinstance(data, list):
         return
-    print(f"killlogs feed: {len(data)} item(s)", flush=True)
     for item in data:
         ts = item.get("Timestamp", 0)
         killer = item.get("Killer")
@@ -223,9 +221,7 @@ async def poll_erlc_emergency():
         return
     calls = data.get("EmergencyCalls")
     if not isinstance(calls, list):
-        print(f"emergencycalls feed: no EmergencyCalls field (keys: {list(data.keys())})", flush=True)
         return
-    print(f"emergencycalls feed: {len(calls)} call(s)", flush=True)
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
