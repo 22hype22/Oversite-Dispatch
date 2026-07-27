@@ -45,6 +45,15 @@ if VOICE_RECV_AVAILABLE:
 
     _vrtp.RTPPacket.update_ext_headers = _dbg_update_ext
 
+DISABLE_DAVE = os.environ.get("DISABLE_DAVE", "1").lower() not in ("0", "false", "no", "off")
+if DISABLE_DAVE:
+    try:
+        from discord.voice_state import VoiceConnectionState
+        VoiceConnectionState.max_dave_protocol_version = property(lambda self: 0)
+        print("DAVE end-to-end encryption disabled (advertising protocol version 0)", flush=True)
+    except Exception as exc:
+        print(f"could not disable DAVE: {exc}", flush=True)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 OPUS_OK = False
 for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so.0", "opus"):
@@ -321,24 +330,21 @@ if VOICE_RECV_AVAILABLE:
             self.buffers = {}
 
         def wants_opus(self):
-            return True
+            return False
 
         def write(self, user, data):
             if user is None:
                 return
             if isinstance(data.packet, SilencePacket):
                 return
-            opus = getattr(data, "opus", None)
-            if opus:
-                self.buffers.setdefault(user.id, []).append(opus)
+            if data.pcm:
+                self.buffers.setdefault(user.id, bytearray()).extend(data.pcm)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
-            frames = self.buffers.pop(member.id, None)
-            if frames:
-                tocs = " ".join(f"{f[0]:02x}" for f in frames[:8] if f)
-                print(f"DIAG utterance from {getattr(member,'display_name','?')}: "
-                      f"{len(frames)} frames, first_tocs=[{tocs}]", flush=True)
+            pcm = self.buffers.pop(member.id, None)
+            if pcm:
+                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm)), self.loop)
 
         def cleanup(self):
             self.buffers.clear()
