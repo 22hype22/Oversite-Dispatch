@@ -25,6 +25,26 @@ except Exception as exc:
     VOICE_RECV_AVAILABLE = False
     print(f"voice receive extension not available: {exc}", flush=True)
 
+if VOICE_RECV_AVAILABLE:
+    from discord.ext.voice_recv import rtp as _vrtp
+    _orig_update_ext = _vrtp.RTPPacket.update_ext_headers
+    _ext_dbg = [0]
+
+    def _dbg_update_ext(self, data):
+        offset = _orig_update_ext(self, data)
+        if _ext_dbg[0] < 8:
+            _ext_dbg[0] += 1
+            try:
+                pre = bytes(data[:24]).hex()
+                post = bytes(data[offset:offset + 6]).hex()
+            except Exception:
+                pre = post = "?"
+            print(f"EXTDBG extended={self.extended} rtpsize={getattr(self, '_rtpsize', None)} "
+                  f"len={len(data)} pre={pre} offset={offset} post_toc={post}", flush=True)
+        return offset
+
+    _vrtp.RTPPacket.update_ext_headers = _dbg_update_ext
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 OPUS_OK = False
 for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so.0", "opus"):
@@ -301,21 +321,24 @@ if VOICE_RECV_AVAILABLE:
             self.buffers = {}
 
         def wants_opus(self):
-            return False
+            return True
 
         def write(self, user, data):
             if user is None:
                 return
             if isinstance(data.packet, SilencePacket):
                 return
-            if data.pcm:
-                self.buffers.setdefault(user.id, bytearray()).extend(data.pcm)
+            opus = getattr(data, "opus", None)
+            if opus:
+                self.buffers.setdefault(user.id, []).append(opus)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
-            pcm = self.buffers.pop(member.id, None)
-            if pcm:
-                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm)), self.loop)
+            frames = self.buffers.pop(member.id, None)
+            if frames:
+                tocs = " ".join(f"{f[0]:02x}" for f in frames[:8] if f)
+                print(f"DIAG utterance from {getattr(member,'display_name','?')}: "
+                      f"{len(frames)} frames, first_tocs=[{tocs}]", flush=True)
 
         def cleanup(self):
             self.buffers.clear()
