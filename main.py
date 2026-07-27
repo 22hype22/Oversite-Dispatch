@@ -49,7 +49,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "attach-ack-5"
+BUILD = "realism-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -69,6 +69,8 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL = os.environ.get("DISPATCH_AI_MODEL", "claude-haiku-4-5")
 AI_ENABLED = bool(ANTHROPIC_KEY)
 AI_CACHE_VARIANTS = int(os.environ.get("AI_CACHE_VARIANTS", "3"))
+DISPATCH_REGION = os.environ.get("DISPATCH_REGION", "the United States").strip() or "the United States"
+ALERT_TONES = os.environ.get("ALERT_TONES", "1").lower() not in ("0", "false", "no", "off")
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -86,6 +88,7 @@ voice_client = None
 http = None
 last_call = None
 response_cache = {}
+tone_path = None
 
 
 DISPATCH_WORDS = [
@@ -144,25 +147,17 @@ def autocorrect(text):
     return re.sub(r"[A-Za-z]+", lambda m: correct_word(m.group(0)), text)
 
 
-OPENERS = [
-    "Attention all units",
-    "All units, all units",
-    "Dispatch to all units",
-    "County wide, all units stand by for emergency traffic",
-]
-
-CLOSERS = [
-    "Any available unit, mark en route and advise",
-    "Any available unit to respond, please advise",
-    "Units in the area, respond and advise your status",
-]
+PRIORITY_WORDS = (
+    "shot", "shots", "shooting", "gun", "firearm", "weapon", "armed", "stab",
+    "robbery", "burglary", "hostage", "kidnap", "assault", "pursuit", "fight",
+    "domestic", "fire", "explosion", "bomb", "overdose", "unconscious", "bleeding",
+    "officer down", "10-99", "wounded", "homicide", "carjack",
+)
 
 
-def pick(options, number):
-    try:
-        return options[int(number) % len(options)]
-    except (TypeError, ValueError):
-        return options[0]
+def is_priority(call):
+    blob = f"{call.get('Description') or ''} {call.get('Team') or ''}".lower()
+    return any(w in blob for w in PRIORITY_WORDS)
 
 
 def build_call_line(call):
@@ -171,31 +166,50 @@ def build_call_line(call):
     team = (call.get("Team") or "").strip()
     number = call.get("CallNumber")
 
-    parts = [f"{pick(OPENERS, number)}.", "Priority call."]
+    parts = ["Attention units."]
 
     if desc and loc:
-        parts.append(f"Caller reports, {desc}, at {loc}.")
+        parts.append(f"{desc}, at {loc}.")
+        parts.append(f"Repeating the location, {loc}.")
     elif desc:
-        parts.append(f"Caller reports, {desc}.")
+        parts.append(f"{desc}.")
     elif loc:
-        parts.append(f"Reported incident at {loc}.")
+        parts.append(f"Report of an incident at {loc}. Repeating, {loc}.")
     else:
-        parts.append("Details to follow.")
+        parts.append("Report of an incident, details to follow.")
 
     if team:
-        parts.append(f"{team} units, respond Code 3.")
+        parts.append(f"{team} units respond Code 3.")
     else:
-        parts.append("Respond Code 3.")
+        parts.append("Units respond Code 3.")
 
-    parts.append("Be advised, use caution.")
-
-    closer = pick(CLOSERS, number)
     if number:
-        parts.append(f"{closer}. This is call number {number}.")
-    else:
-        parts.append(f"{closer}.")
+        parts.append(f"Incident number {number}.")
 
     return " ".join(parts)
+
+
+def make_tone():
+    try:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        args = [
+            FFMPEG_EXE, "-y", "-f", "lavfi", "-i",
+            "sine=frequency=947:sample_rate=48000:duration=0.4",
+            "-f", "lavfi", "-i",
+            "sine=frequency=1270:sample_rate=48000:duration=0.4",
+            "-filter_complex",
+            "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.35,afade=t=out:st=0.75:d=0.05[a]",
+            "-map", "[a]", "-ac", "2", "-ar", "48000", path,
+        ]
+        import subprocess
+        result = subprocess.run(args, capture_output=True)
+        if result.returncode == 0 and os.path.getsize(path) > 0:
+            return path
+        print(f"tone generation failed: {result.stderr[:200]!r}", flush=True)
+    except Exception as exc:
+        print(f"tone generation error: {exc}", flush=True)
+    return None
 
 
 async def erlc_get(path):
@@ -241,7 +255,7 @@ async def synthesize(text):
     return path
 
 
-async def announce(text, title="911 Call"):
+async def announce(text, title="911 Call", tone=False):
     print(f"announce: {text[:80]}", flush=True)
     if TEXT_CHANNEL_ID:
         channel = client.get_channel(TEXT_CHANNEL_ID)
@@ -253,6 +267,8 @@ async def announce(text, title="911 Call"):
                 print(f"text log failed: {exc}", flush=True)
     path = await synthesize(text)
     if path:
+        if tone and ALERT_TONES and tone_path:
+            await play_queue.put(tone_path)
         await play_queue.put(path)
         print("audio queued for playback", flush=True)
 
@@ -285,10 +301,11 @@ async def transcribe(wav_bytes):
 
 
 DISPATCH_SYSTEM = (
-    "You are Oversite Dispatch, a professional emergency dispatcher for an "
-    "Emergency Response: Liberty County (ER:LC) roleplay server. Police officers "
-    "and sheriff deputies talk to you over the radio. Answer with exactly one "
-    "short radio transmission, the way a real dispatcher would respond.\n"
+    f"You are Oversite Dispatch, a professional emergency dispatcher working in "
+    f"{DISPATCH_REGION}, handling police and sheriff radio traffic. Talk exactly "
+    f"the way a real dispatcher in {DISPATCH_REGION} talks: use the real radio "
+    f"codes, signals, phonetic alphabet, and calm, clipped cadence that agencies "
+    f"there actually use. Answer with exactly one short radio transmission.\n"
     "Rules:\n"
     "- Keep every reply to ONE short sentence. Radio brevity. No preamble, no sign-off.\n"
     "- Do not include the unit's callsign in your reply; it is added automatically. "
@@ -296,10 +313,8 @@ DISPATCH_SYSTEM = (
     "- You are dispatch talking TO the unit. Never speak in the first person about "
     "the unit's status. Never say 'I am attached' or 'I'm en route'. Say 'show you "
     "attached' or 'copy, show you en route'.\n"
-    "- Use standard ten-codes and plain dispatch language: 10-4 to acknowledge, "
-    "10-8 in service, 10-7 out of service, 10-76 en route, 10-97 on scene, "
-    "10-20 for location, 10-23 standing by, Code 3 for lights and sirens, Code 4 "
-    "scene secure. Echo status changes back to the unit, for example 'show you 10-8'.\n"
+    "- Use the correct radio codes and phrasing for your region and echo status "
+    "changes back to the unit, for example 'show you 10-8' or the local equivalent.\n"
     "- NEVER read back, list, or restate a call's details (location, description, "
     "caller, call number) unless the unit literally asks you to repeat or read back "
     "the call. When a unit attaches to a call, marks en route, or gives a status "
@@ -311,6 +326,71 @@ DISPATCH_SYSTEM = (
     "- Never break character, never say you are an AI, never use markdown or emojis.\n"
     "- Output only the words dispatch would speak over the radio."
 )
+
+CALL_SYSTEM = (
+    f"You are a professional police and emergency dispatcher working in "
+    f"{DISPATCH_REGION}. You are handed a computer-aided-dispatch (CAD) record for "
+    f"a new emergency call and must broadcast it to units over the radio, exactly "
+    f"the way a real dispatcher in {DISPATCH_REGION} would, using that region's real "
+    f"radio codes, priority language, and calm cadence.\n"
+    "Rules:\n"
+    "- One broadcast, two or three short sentences at most.\n"
+    "- State the nature of the call and the location, and repeat the location once.\n"
+    "- Direct the appropriate units to respond with the correct priority code.\n"
+    "- Do not invent any detail that is not in the record. Do not add a call-taker "
+    "name, phone number, or facts you were not given.\n"
+    "- No markdown, no emojis, no preamble, no sign-off.\n"
+    "- Output only the words dispatch would speak over the air."
+)
+
+
+async def anthropic_call(system, user_msg, max_tokens=200):
+    if not AI_ENABLED:
+        return None
+    payload = {
+        "model": AI_MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user_msg}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with http.post(f"{ANTHROPIC_BASE}/messages", headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"anthropic error {resp.status}: {body[:200]}", flush=True)
+                return None
+            data = await resp.json()
+    except Exception as exc:
+        print(f"anthropic request failed: {exc}", flush=True)
+        return None
+    for block in data.get("content") or []:
+        if block.get("type") == "text":
+            reply = (block.get("text") or "").strip()
+            if reply:
+                return reply
+    return None
+
+
+async def compose_dispatch(call):
+    if not AI_ENABLED:
+        return build_call_line(call)
+    desc = autocorrect((call.get("Description") or "").strip())
+    loc = (call.get("PositionDescriptor") or "").strip()
+    team = (call.get("Team") or "").strip()
+    number = call.get("CallNumber")
+    record = (
+        f"Nature of call: {desc or 'unknown'}\n"
+        f"Location: {loc or 'unknown'}\n"
+        f"Units requested: {team or 'any available'}\n"
+        f"Incident number: {number}"
+    )
+    reply = await anthropic_call(CALL_SYSTEM, record, max_tokens=220)
+    return reply or build_call_line(call)
 
 
 async def dispatch_ai_reply(text, callsign):
@@ -633,7 +713,9 @@ async def playback_worker():
                 def after(_err):
                     client.loop.call_soon_threadsafe(done.set)
 
-                options = f'-filter:a "atempo={SPEED}"' if SPEED and SPEED != 1.0 else None
+                is_tone = path == tone_path
+                options = None if is_tone else (
+                    f'-filter:a "atempo={SPEED}"' if SPEED and SPEED != 1.0 else None)
                 source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
@@ -644,10 +726,11 @@ async def playback_worker():
         except Exception as exc:
             print(f"playback failed: {exc}", flush=True)
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            if path != tone_path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             play_queue.task_done()
 
 
@@ -667,7 +750,8 @@ async def poll_calls():
             continue
         seen_keys.add(key)
         last_call = call
-        await announce(build_call_line(call))
+        line = await compose_dispatch(call)
+        await announce(line, tone=is_priority(call))
 
 
 async def dispatch_loop():
@@ -742,11 +826,12 @@ async def voice_guard():
 
 @client.event
 async def on_ready():
-    global http
+    global http, tone_path
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
+    print(f"region: {DISPATCH_REGION}", flush=True)
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
     else:
@@ -757,6 +842,9 @@ async def on_ready():
         print(f"ai responses: ENABLED (model {AI_MODEL})", flush=True)
     else:
         print("ai responses: OFF (set ANTHROPIC_API_KEY to let dispatch answer radio traffic)", flush=True)
+    if ALERT_TONES and tone_path is None:
+        tone_path = make_tone()
+        print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
