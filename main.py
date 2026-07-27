@@ -18,6 +18,7 @@ GUILD_ID = int(os.environ["DISPATCH_GUILD_ID"])
 VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
+SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
 
 ERLC_V2_BASE = "https://api.erlc.gg/v2"
 XI_BASE = "https://api.elevenlabs.io/v1"
@@ -176,7 +177,8 @@ async def playback_worker():
                 def after(_err):
                     client.loop.call_soon_threadsafe(done.set)
 
-                source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE)
+                options = f'-filter:a "atempo={SPEED}"' if SPEED and SPEED != 1.0 else None
+                source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
                 await done.wait()
