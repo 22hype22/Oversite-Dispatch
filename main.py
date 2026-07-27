@@ -32,23 +32,66 @@ voice_client = None
 http = None
 
 
+OPENERS = [
+    "Attention all units",
+    "All units, all units",
+    "Dispatch to all units",
+    "County wide, all units stand by for emergency traffic",
+]
+
+CLOSERS = [
+    "Any available unit, mark en route and advise",
+    "Any available unit to respond, please advise",
+    "Units in the area, respond and advise your status",
+]
+
+
+def pick(options, number):
+    try:
+        return options[int(number) % len(options)]
+    except (TypeError, ValueError):
+        return options[0]
+
+
 def build_call_line(call):
     desc = (call.get("Description") or "").strip()
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
     number = call.get("CallNumber")
-    line = "Attention all units. Emergency call"
-    if number:
-        line += f", number {number}"
-    line += "."
-    if loc:
-        line += f" Location, {loc}."
-    if desc:
-        line += f" Caller states, {desc}."
+
+    parts = [f"{pick(OPENERS, number)}.", "Priority call."]
+
+    if desc and loc:
+        parts.append(f"Caller reports, {desc}, at {loc}.")
+    elif desc:
+        parts.append(f"Caller reports, {desc}.")
+    elif loc:
+        parts.append(f"Reported incident at {loc}.")
+    else:
+        parts.append("Details to follow.")
+
     if team:
-        line += f" {team} response requested."
-    line += " Any available unit, respond code three and advise."
-    return line
+        parts.append(f"{team} units, respond Code 3.")
+    else:
+        parts.append("Respond Code 3.")
+
+    parts.append("Be advised, use caution.")
+
+    repeat = []
+    if desc:
+        repeat.append(desc)
+    if loc:
+        repeat.append(f"location {loc}")
+    if repeat:
+        parts.append("Repeating, " + ", ".join(repeat) + ".")
+
+    closer = pick(CLOSERS, number)
+    if number:
+        parts.append(f"{closer}. This is call number {number}.")
+    else:
+        parts.append(f"{closer}.")
+
+    return " ".join(parts)
 
 
 async def erlc_get(path):
@@ -74,7 +117,7 @@ async def synthesize(text):
     payload = {
         "text": text,
         "model_id": XI_MODEL,
-        "voice_settings": {"stability": 0.55, "similarity_boost": 0.8, "style": 0.15},
+        "voice_settings": {"stability": 0.65, "similarity_boost": 0.85, "style": 0.0, "use_speaker_boost": True},
     }
     headers = {"xi-api-key": XI_KEY, "Content-Type": "application/json"}
     try:
