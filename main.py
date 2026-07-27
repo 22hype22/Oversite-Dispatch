@@ -275,13 +275,40 @@ async def transcribe(wav_bytes):
         return None
 
 
+REQUEST_WORDS = ("requesting", "request", "repeat", "say", "come", "can", "could",
+                 "need", "asking", "asks", "please", "give", "what")
+
+
+def is_for_dispatch(text):
+    return "dispatch" in text.lower()
+
+
 def wants_repeat(text):
     low = text.lower()
-    if "say again" in low or "come again" in low:
-        return True
-    if "repeat" in low and ("call" in low or "last" in low or "that" in low or "again" in low):
-        return True
-    return False
+    triggers = ("repeat", "say again", "come again", "one more time",
+                "last call", "that call", "read it back", "read back",
+                "what was the last", "what was that")
+    return any(t in low for t in triggers)
+
+
+def extract_callsign(text):
+    low = text.lower()
+    idx = low.find("dispatch")
+    if idx < 0:
+        return ""
+    rest = text[idx + len("dispatch"):].strip(" ,.-")
+    tokens = re.split(r"\s+", rest)
+    parts = []
+    for tok in tokens:
+        if tok.lower().strip(",.-") in REQUEST_WORDS:
+            break
+        parts.append(tok)
+        if len(parts) >= 3:
+            break
+    callsign = " ".join(parts).strip(" ,.-")
+    if not callsign or len(callsign) > 16:
+        return ""
+    return callsign
 
 
 async def handle_utterance(member, pcm):
@@ -293,11 +320,17 @@ async def handle_utterance(member, pcm):
         return
     who = getattr(member, "display_name", "unit")
     print(f"heard {who}: {text}", flush=True)
-    if wants_repeat(text):
-        if last_call is not None:
-            await announce(build_call_line(last_call), title="Repeat")
-        else:
-            await announce("Dispatch. No active calls to repeat at this time.", title="Repeat")
+    if not is_for_dispatch(text):
+        return
+    if not wants_repeat(text):
+        return
+    callsign = extract_callsign(text)
+    if last_call is not None:
+        ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
+        await announce(ack + build_call_line(last_call), title="Repeat")
+    else:
+        ack = f"Unit {callsign}, " if callsign else ""
+        await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
 
 
 if VOICE_RECV_AVAILABLE:
