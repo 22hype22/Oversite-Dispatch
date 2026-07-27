@@ -136,14 +136,6 @@ def build_call_line(call):
 
     parts.append("Be advised, use caution.")
 
-    repeat = []
-    if desc:
-        repeat.append(desc)
-    if loc:
-        repeat.append(f"location {loc}")
-    if repeat:
-        parts.append("Repeating, " + ", ".join(repeat) + ".")
-
     closer = pick(CLOSERS, number)
     if number:
         parts.append(f"{closer}. This is call number {number}.")
