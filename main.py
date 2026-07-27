@@ -49,7 +49,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "realism-1"
+BUILD = "region-cmd-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -80,10 +80,13 @@ ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+command_tree = discord.app_commands.CommandTree(client)
+DISPATCH_GUILD = discord.Object(id=GUILD_ID)
 
 play_queue = asyncio.Queue()
 seen_keys = set()
 boot_time = time.time()
+commands_synced = False
 voice_client = None
 http = None
 last_call = None
@@ -300,48 +303,82 @@ async def transcribe(wav_bytes):
         return None
 
 
-DISPATCH_SYSTEM = (
-    f"You are Oversite Dispatch, a professional emergency dispatcher working in "
-    f"{DISPATCH_REGION}, handling police and sheriff radio traffic. Talk exactly "
-    f"the way a real dispatcher in {DISPATCH_REGION} talks: use the real radio "
-    f"codes, signals, phonetic alphabet, and calm, clipped cadence that agencies "
-    f"there actually use. Answer with exactly one short radio transmission.\n"
-    "Rules:\n"
-    "- Keep every reply to ONE short sentence. Radio brevity. No preamble, no sign-off.\n"
-    "- Do not include the unit's callsign in your reply; it is added automatically. "
-    "Give only the dispatch response itself.\n"
-    "- You are dispatch talking TO the unit. Never speak in the first person about "
-    "the unit's status. Never say 'I am attached' or 'I'm en route'. Say 'show you "
-    "attached' or 'copy, show you en route'.\n"
-    "- Use the correct radio codes and phrasing for your region and echo status "
-    "changes back to the unit, for example 'show you 10-8' or the local equivalent.\n"
-    "- NEVER read back, list, or restate a call's details (location, description, "
-    "caller, call number) unless the unit literally asks you to repeat or read back "
-    "the call. When a unit attaches to a call, marks en route, or gives a status "
-    "update, ONLY acknowledge the action. For example, if a unit says they are "
-    "attaching to a call, reply exactly like 'copy, show you attached and en route' "
-    "and nothing more. Do not mention what the call is about.\n"
-    "- You cannot look up plates, warrants, names, or run records. If asked to run "
-    "one, advise the unit the return is negative or to stand by, staying in character.\n"
-    "- Never break character, never say you are an AI, never use markdown or emojis.\n"
-    "- Output only the words dispatch would speak over the radio."
-)
+def build_dispatch_system(region):
+    return (
+        f"You are Oversite Dispatch, a professional emergency dispatcher working in "
+        f"{region}, handling police and sheriff radio traffic. Talk exactly the way a "
+        f"real dispatcher in {region} talks: use the real radio codes, signals, "
+        f"phonetic alphabet, and calm, clipped cadence that agencies there actually "
+        f"use. Answer with exactly one short radio transmission.\n"
+        "Rules:\n"
+        "- Keep every reply to ONE short sentence. Radio brevity. No preamble, no sign-off.\n"
+        "- Do not include the unit's callsign in your reply; it is added automatically. "
+        "Give only the dispatch response itself.\n"
+        "- You are dispatch talking TO the unit. Never speak in the first person about "
+        "the unit's status. Never say 'I am attached' or 'I'm en route'. Say 'show you "
+        "attached' or 'copy, show you en route'.\n"
+        "- Use the correct radio codes and phrasing for your region and echo status "
+        "changes back to the unit, for example 'show you 10-8' or the local equivalent.\n"
+        "- NEVER read back, list, or restate a call's details (location, description, "
+        "caller, call number) unless the unit literally asks you to repeat or read back "
+        "the call. When a unit attaches to a call, marks en route, or gives a status "
+        "update, ONLY acknowledge the action. For example, if a unit says they are "
+        "attaching to a call, reply exactly like 'copy, show you attached and en route' "
+        "and nothing more. Do not mention what the call is about.\n"
+        "- You cannot look up plates, warrants, names, or run records. If asked to run "
+        "one, advise the unit the return is negative or to stand by, staying in character.\n"
+        "- Never break character, never say you are an AI, never use markdown or emojis.\n"
+        "- Output only the words dispatch would speak over the radio."
+    )
 
-CALL_SYSTEM = (
-    f"You are a professional police and emergency dispatcher working in "
-    f"{DISPATCH_REGION}. You are handed a computer-aided-dispatch (CAD) record for "
-    f"a new emergency call and must broadcast it to units over the radio, exactly "
-    f"the way a real dispatcher in {DISPATCH_REGION} would, using that region's real "
-    f"radio codes, priority language, and calm cadence.\n"
-    "Rules:\n"
-    "- One broadcast, two or three short sentences at most.\n"
-    "- State the nature of the call and the location, and repeat the location once.\n"
-    "- Direct the appropriate units to respond with the correct priority code.\n"
-    "- Do not invent any detail that is not in the record. Do not add a call-taker "
-    "name, phone number, or facts you were not given.\n"
-    "- No markdown, no emojis, no preamble, no sign-off.\n"
-    "- Output only the words dispatch would speak over the air."
+
+def build_call_system(region):
+    return (
+        f"You are a professional police and emergency dispatcher working in {region}. "
+        f"You are handed a computer-aided-dispatch (CAD) record for a new emergency "
+        f"call and must broadcast it to units over the radio, exactly the way a real "
+        f"dispatcher in {region} would, using that region's real radio codes, priority "
+        f"language, and calm cadence.\n"
+        "Rules:\n"
+        "- One broadcast, two or three short sentences at most.\n"
+        "- State the nature of the call and the location, and repeat the location once.\n"
+        "- Direct the appropriate units to respond with the correct priority code.\n"
+        "- Do not invent any detail that is not in the record. Do not add a call-taker "
+        "name, phone number, or facts you were not given.\n"
+        "- No markdown, no emojis, no preamble, no sign-off.\n"
+        "- Output only the words dispatch would speak over the air."
+    )
+
+
+DISPATCH_SYSTEM = build_dispatch_system(DISPATCH_REGION)
+CALL_SYSTEM = build_call_system(DISPATCH_REGION)
+
+
+def set_region(region):
+    global DISPATCH_REGION, DISPATCH_SYSTEM, CALL_SYSTEM
+    DISPATCH_REGION = region
+    DISPATCH_SYSTEM = build_dispatch_system(region)
+    CALL_SYSTEM = build_call_system(region)
+
+
+@command_tree.command(
+    name="region",
+    description="Set the real-world area dispatch talks like (state, country, or city)",
+    guild=DISPATCH_GUILD,
 )
+@discord.app_commands.describe(area="For example: Texas, Alaska, Dubai, United Kingdom")
+@discord.app_commands.default_permissions(manage_guild=True)
+async def region_command(interaction, area: str):
+    area = " ".join(area.split()).strip()
+    if not area:
+        await interaction.response.send_message(
+            "Give me an area, like Texas, Alaska, or Dubai.", ephemeral=True)
+        return
+    set_region(area)
+    print(f"region changed to {DISPATCH_REGION} by {interaction.user}", flush=True)
+    await interaction.response.send_message(
+        f"Dispatch is now running as **{DISPATCH_REGION}**. New calls and radio "
+        f"replies will use that area's codes and style.", ephemeral=True)
 
 
 async def anthropic_call(system, user_msg, max_tokens=200):
@@ -825,6 +862,19 @@ async def voice_guard():
 
 
 @client.event
+async def sync_commands():
+    global commands_synced
+    if commands_synced:
+        return
+    try:
+        await command_tree.sync()
+        await command_tree.sync(guild=DISPATCH_GUILD)
+        commands_synced = True
+        print("slash commands synced — /region ready, old commands removed", flush=True)
+    except Exception as exc:
+        print(f"command sync failed: {exc}", flush=True)
+
+
 async def on_ready():
     global http, tone_path
     if http is None:
@@ -832,6 +882,7 @@ async def on_ready():
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
     print(f"region: {DISPATCH_REGION}", flush=True)
+    await sync_commands()
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
     else:
