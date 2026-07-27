@@ -1,11 +1,13 @@
 import os
 import io
 import re
+import glob
 import time
 import wave
 import asyncio
 import difflib
 import tempfile
+import ctypes.util
 
 import aiohttp
 import discord
@@ -19,18 +21,57 @@ except Exception as exc:
     VOICE_RECV_AVAILABLE = False
     print(f"voice receive extension not available: {exc}", flush=True)
 
-OPUS_OK = False
-try:
-    if not discord.opus.is_loaded():
-        for _name in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
-            try:
-                discord.opus.load_opus(_name)
-                break
-            except Exception:
-                continue
-    OPUS_OK = discord.opus.is_loaded()
-except Exception:
-    OPUS_OK = False
+
+def _find_opus_paths():
+    paths = []
+    found = ctypes.util.find_library("opus")
+    if found:
+        paths.append(found)
+    paths += ["libopus.so.0", "libopus.so"]
+    patterns = [
+        "/nix/store/*opus*/lib/libopus.so*",
+        "/nix/store/*/lib/libopus.so*",
+        "/usr/lib/*/libopus.so*",
+        "/usr/lib/libopus.so*",
+        "/lib/*/libopus.so*",
+        "/usr/local/lib/libopus.so*",
+    ]
+    for pattern in patterns:
+        paths += sorted(glob.glob(pattern))
+    seen = set()
+    ordered = []
+    for p in paths:
+        if p and p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
+
+
+def _load_opus():
+    try:
+        if discord.opus.is_loaded():
+            return True
+    except Exception:
+        pass
+    tried = _find_opus_paths()
+    for name in tried:
+        try:
+            discord.opus.load_opus(name)
+            if discord.opus.is_loaded():
+                print(f"loaded opus from {name}", flush=True)
+                return True
+        except Exception:
+            continue
+    hits = sorted(set(glob.glob("/nix/store/**/libopus.so*", recursive=True)
+                      + glob.glob("/usr/**/libopus.so*", recursive=True)))
+    if hits:
+        print(f"opus not loaded, but found on disk: {hits[:5]}", flush=True)
+    else:
+        print("opus not loaded and no libopus.so found on disk", flush=True)
+    return False
+
+
+OPUS_OK = _load_opus()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
