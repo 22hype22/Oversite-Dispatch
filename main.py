@@ -462,6 +462,7 @@ async def voice_guard():
         vc = guild.voice_client if guild is not None else None
         if vc is not None and vc.is_connected():
             stuck_since = None
+            start_listening()
         elif vc is None:
             await ensure_voice()
             stuck_since = None
