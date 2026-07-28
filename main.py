@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "holding-times-1"
+BUILD = "polish-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -108,6 +108,7 @@ response_cache = {}
 tone_path = None
 status_board = {}
 open_calls = {}
+IGNORE = object()
 
 
 DISPATCH_WORDS = [
@@ -211,11 +212,10 @@ def build_call_line(call):
 
     if desc and loc:
         parts.append(f"{desc}, at {loc}.")
-        parts.append(f"Repeating the location, {loc}.")
     elif desc:
         parts.append(f"{desc}.")
     elif loc:
-        parts.append(f"Report of an incident at {loc}. Repeating, {loc}.")
+        parts.append(f"Report of an incident at {loc}.")
     else:
         parts.append("Report of an incident, details to follow.")
 
@@ -367,6 +367,10 @@ def build_dispatch_system(region):
         "and nothing more. Do not mention what the call is about.\n"
         "- You cannot look up plates, warrants, names, or run records. If asked to run "
         "one, advise the unit the return is negative or to stand by, staying in character.\n"
+        "- Only respond to genuine police, sheriff, or emergency radio traffic. If the "
+        "transmission is off-topic, a joke, small talk, or a personal or non-police "
+        "question (for example asking what you had for lunch), do NOT respond. In that "
+        "case reply with the single word IGNORE and nothing else.\n"
         "- Never break character, never say you are an AI, never use markdown or emojis.\n"
         "- Output only the words dispatch would speak over the radio."
     )
@@ -381,7 +385,8 @@ def build_call_system(region):
         f"language, and calm cadence.\n"
         "Rules:\n"
         "- One broadcast, two or three short sentences at most.\n"
-        "- State the nature of the call and the location, and repeat the location once.\n"
+        "- State the nature of the call and the location. Say the location only once, "
+        "do not repeat it.\n"
         "- Direct the appropriate units to respond with the correct priority code.\n"
         "- End by stating the time exactly as given in the record.\n"
         "- Do not invent any detail that is not in the record. Do not add a call-taker "
@@ -578,6 +583,8 @@ async def dispatch_reply_body(text, callsign):
         return random.choice(response_cache[hit])
     body = await dispatch_ai_reply(text, callsign)
     if body:
+        if body.strip().strip(".!").upper() == "IGNORE":
+            return IGNORE
         store = response_cache.setdefault(hit or key, [])
         if body not in store:
             store.append(body)
@@ -753,6 +760,28 @@ def has_real_words(text):
     return len(re.findall(r"\w{2,}", cleaned)) >= 1
 
 
+FILLERS = {"um", "umm", "uh", "uhh", "uhm", "erm", "hmm", "mhm", "eh"}
+
+
+def clean_transcript(text):
+    tokens = text.split()
+    out = []
+    for tok in tokens:
+        bare = tok.lower().strip(",.!?-'’")
+        if bare in FILLERS:
+            continue
+        if "-" in tok:
+            segs = [s for s in tok.split("-") if s]
+            if len(segs) > 1:
+                last = segs[-1]
+                if all(len(s) <= 3 and last.lower().startswith(s.lower()) for s in segs[:-1]):
+                    tok = last
+        if out and out[-1].lower().strip(",.!?") == tok.lower().strip(",.!?"):
+            continue
+        out.append(tok)
+    return " ".join(out) if out else text
+
+
 async def handle_utterance(member, pcm):
     if len(pcm) < MIN_UTTER_BYTES:
         return
@@ -765,6 +794,7 @@ async def handle_utterance(member, pcm):
     text = await transcribe(pcm_to_wav(pcm))
     if not text or not has_real_words(text):
         return
+    text = clean_transcript(text)
     who = getattr(member, "display_name", "unit")
     print(f"heard {who}: {text}", flush=True)
     if not is_for_dispatch(text):
@@ -789,6 +819,9 @@ async def handle_utterance(member, pcm):
         status_board[callsign] = {"status": status, "time": time.time()}
         print(f"status board: {callsign} -> {status}", flush=True)
     body = await dispatch_reply_body(text, callsign)
+    if body is IGNORE:
+        print("ignored off-topic transmission", flush=True)
+        return
     if body:
         if callsign:
             await announce(f"Unit {callsign}, " + strip_callsign_echo(body), title="Dispatch")
