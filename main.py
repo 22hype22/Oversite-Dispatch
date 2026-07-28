@@ -61,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "link-persist-1"
+BUILD = "bolo-cleared-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -103,6 +103,8 @@ PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
+CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
+BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "1800"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -129,6 +131,7 @@ open_calls = {}
 callsign_links = {}
 active_stops = {}
 nick_original = {}
+bolos = []
 seen_kills = set()
 officer_last_seen = {}
 _players_debugged = False
@@ -842,6 +845,39 @@ def wants_backup(text):
     return any(t in low for t in triggers)
 
 
+def wants_bolo_read(text):
+    low = _flat(text)
+    return any(t in low for t in ("any bolos", "active bolos", "current bolos",
+                                  "read bolos", "read the bolos", "list bolos", "what bolos"))
+
+
+def extract_bolo(text):
+    low = text.lower()
+    for marker in ("bolo for", "b.o.l.o. for", "lookout for", "look out for", "bulletin for"):
+        idx = low.find(marker)
+        if idx >= 0:
+            return autocorrect(text[idx + len(marker):].strip(" ,.-"))
+    return ""
+
+
+def add_bolo(desc, callsign):
+    bolos.append({"desc": desc, "callsign": callsign, "time": time.time()})
+    cutoff = time.time() - BOLO_EXPIRE
+    bolos[:] = [b for b in bolos if b["time"] >= cutoff][-8:]
+
+
+def read_bolos(callsign=""):
+    cutoff = time.time() - BOLO_EXPIRE
+    active = [b for b in bolos if b["time"] >= cutoff]
+    ack = f"Unit {callsign}, " if callsign else ""
+    if not active:
+        return f"{ack}no active B O L Os at this time."
+    parts = [f"{ack}current B O L Os."]
+    for i, b in enumerate(active[-6:], 1):
+        parts.append(f"{i}. {b['desc']}.")
+    return " ".join(parts)
+
+
 def read_status_board(callsign=""):
     now = time.time()
     entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
@@ -1482,6 +1518,15 @@ async def handle_utterance(member, pcm):
     if wants_backup(text):
         await assign_backup(member, callsign)
         return
+    if wants_bolo_read(text):
+        await announce(read_bolos(callsign), title="BOLO")
+        return
+    bolo_desc = extract_bolo(text)
+    if bolo_desc:
+        add_bolo(bolo_desc, callsign)
+        who = f", per Unit {callsign}" if callsign else ""
+        await announce(f"All units, be on the lookout for {bolo_desc}{who}.", title="BOLO")
+        return
     status = detect_status(text)
     clearing = wants_clear_stop(text)
     if clearing and member.id in active_stops:
@@ -1642,11 +1687,16 @@ async def poll_calls():
     if calls and not _call_debugged:
         _call_debugged = True
         print(f"call API sample: {calls[0]}", flush=True)
+    prev_open = set(open_calls.keys())
     open_calls.clear()
     for call in calls:
         number = call.get("CallNumber")
         if number is not None:
             open_calls[number] = call
+    if CALL_CLEARED:
+        for num in prev_open:
+            if num not in open_calls and ("call", num) in seen_keys:
+                await announce(f"Be advised, call number {num} has cleared.", title="Call Cleared")
     pending = []
     for call in calls:
         number = call.get("CallNumber")
