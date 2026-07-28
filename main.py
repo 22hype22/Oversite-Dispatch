@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "polish-1"
+BUILD = "say-again-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -371,6 +371,10 @@ def build_dispatch_system(region):
         "transmission is off-topic, a joke, small talk, or a personal or non-police "
         "question (for example asking what you had for lunch), do NOT respond. In that "
         "case reply with the single word IGNORE and nothing else.\n"
+        "- If it IS radio traffic for dispatch but you cannot make out what the unit is "
+        "saying or asking because it is garbled or cut off, do NOT guess a response. "
+        "Ask them to repeat, for example '10-9, say again' or 'you are unreadable, say "
+        "again'.\n"
         "- Never break character, never say you are an AI, never use markdown or emojis.\n"
         "- Output only the words dispatch would speak over the radio."
     )
@@ -818,6 +822,10 @@ async def handle_utterance(member, pcm):
     if status and callsign:
         status_board[callsign] = {"status": status, "time": time.time()}
         print(f"status board: {callsign} -> {status}", flush=True)
+    if not status and not normalize_intent(text, callsign):
+        ack = f"Unit {callsign}, " if callsign else ""
+        await announce(f"{ack}you are unreadable, say again.", title="Say Again")
+        return
     body = await dispatch_reply_body(text, callsign)
     if body is IGNORE:
         print("ignored off-topic transmission", flush=True)
