@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "listen-filter-1"
+BUILD = "holding-times-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -166,14 +166,26 @@ def autocorrect(text):
     return re.sub(r"[A-Za-z]+", lambda m: correct_word(m.group(0)), text)
 
 
-def local_time_str():
-    tz = None
+def _tz():
     if ZoneInfo is not None and DISPATCH_TZ.upper() != "UTC":
         try:
-            tz = ZoneInfo(DISPATCH_TZ)
+            return ZoneInfo(DISPATCH_TZ)
         except Exception:
-            tz = None
-    return datetime.now(tz or timezone.utc).strftime("%H:%M")
+            return None
+    return None
+
+
+def local_time_str():
+    return datetime.now(_tz() or timezone.utc).strftime("%H:%M")
+
+
+def stamp_time(epoch):
+    if not epoch:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), _tz() or timezone.utc).strftime("%H:%M")
+    except Exception:
+        return ""
 
 
 PRIORITY_WORDS = (
@@ -729,6 +741,9 @@ def read_calls_holding(callsign=""):
             seg += f", {desc}"
         if loc:
             seg += f", at {loc}"
+        ts = stamp_time(c.get("StartedAt"))
+        if ts:
+            seg += f", received {ts}"
         parts.append(seg + ".")
     return " ".join(parts)
 
