@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "police-calls-1"
+BUILD = "nearest-unit-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -118,6 +118,7 @@ callsign_links = {}
 active_stops = {}
 nick_original = {}
 _players_debugged = False
+_call_debugged = False
 IGNORE = object()
 
 
@@ -219,7 +220,7 @@ def is_police_call(call):
     return any(t in team for t in CALL_TEAMS)
 
 
-def build_call_line(call):
+def build_call_line(call, nearest=""):
     desc = autocorrect((call.get("Description") or "").strip())
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
@@ -236,7 +237,9 @@ def build_call_line(call):
     else:
         parts.append("Report of an incident, details to follow.")
 
-    if team:
+    if nearest:
+        parts.append(f"Unit {nearest}, you are the closest unit, respond Code 3.")
+    elif team:
         parts.append(f"{team} units respond Code 3.")
     else:
         parts.append("Units respond Code 3.")
@@ -409,6 +412,8 @@ def build_call_system(region):
         "- State the nature of the call and the location. Say the location only once, "
         "do not repeat it.\n"
         "- Direct the appropriate units to respond with the correct priority code.\n"
+        "- If a closest available unit is provided, assign that exact unit by callsign "
+        "to respond, for example 'Unit 1-Sam-32, you are closest, respond Code 3'.\n"
         "- End by stating the time exactly as given in the record.\n"
         "- Do not invent any detail that is not in the record. Do not add a call-taker "
         "name, phone number, or facts you were not given.\n"
@@ -520,9 +525,9 @@ async def anthropic_call(system, user_msg, max_tokens=200):
     return None
 
 
-async def compose_dispatch(call):
+async def compose_dispatch(call, nearest=None):
     if not AI_ENABLED:
-        return build_call_line(call)
+        return build_call_line(call, nearest or "")
     desc = autocorrect((call.get("Description") or "").strip())
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
@@ -534,8 +539,10 @@ async def compose_dispatch(call):
         f"Incident number: {number}\n"
         f"Time: {local_time_str()} hours"
     )
+    if nearest:
+        record += f"\nClosest available unit: {nearest}"
     reply = await anthropic_call(CALL_SYSTEM, record, max_tokens=220)
-    return reply or build_call_line(call)
+    return reply or build_call_line(call, nearest or "")
 
 
 async def dispatch_ai_reply(text, callsign):
@@ -884,6 +891,45 @@ async def player_positions():
     elif data is not None:
         print(f"players API returned unexpected shape: {str(data)[:200]}", flush=True)
     return out
+
+
+def extract_call_pos(call):
+    pos = call.get("Position") if isinstance(call.get("Position"), dict) else None
+    if pos is not None:
+        x = _num(pos, "X", "LocationX")
+        z = _num(pos, "Z", "LocationZ")
+        if x is not None and z is not None:
+            return (x, z)
+    x = _num(call, "X", "LocationX")
+    z = _num(call, "Z", "LocationZ")
+    if x is not None and z is not None:
+        return (x, z)
+    return None
+
+
+async def duty_units():
+    data = await erlc_get("/server?Players=true")
+    out = []
+    if isinstance(data, dict) and isinstance(data.get("Players"), list):
+        for p in data["Players"]:
+            cs = str(p.get("Callsign") or "").strip()
+            team = str(p.get("Team") or "").lower()
+            pos = extract_player_pos(p)
+            if cs and pos and any(t in team for t in CALL_TEAMS):
+                out.append((cs, pos))
+    return out
+
+
+def pick_nearest(call, units):
+    cpos = extract_call_pos(call)
+    if cpos is None or not units:
+        return None
+    best, best_d = None, None
+    for cs, pos in units:
+        d = ((pos[0] - cpos[0]) ** 2 + (pos[1] - cpos[1]) ** 2) ** 0.5
+        if best_d is None or d < best_d:
+            best, best_d = cs, d
+    return best
 
 
 async def move_member(member, channel_id):
@@ -1276,7 +1322,7 @@ async def playback_worker():
 
 
 async def poll_calls():
-    global last_call
+    global last_call, _call_debugged
     data = await erlc_get("/server?EmergencyCalls=true")
     if not isinstance(data, dict):
         return
@@ -1284,11 +1330,15 @@ async def poll_calls():
     if not isinstance(calls, list):
         return
     calls = [c for c in calls if is_police_call(c)]
+    if calls and not _call_debugged:
+        _call_debugged = True
+        print(f"call API sample: {calls[0]}", flush=True)
     open_calls.clear()
     for call in calls:
         number = call.get("CallNumber")
         if number is not None:
             open_calls[number] = call
+    pending = []
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
@@ -1296,8 +1346,12 @@ async def poll_calls():
         if started < boot_time or key in seen_keys:
             continue
         seen_keys.add(key)
+        pending.append(call)
+    units = await duty_units() if pending else []
+    for call in pending:
         last_call = call
-        line = await compose_dispatch(call)
+        nearest = pick_nearest(call, units)
+        line = await compose_dispatch(call, nearest)
         if len(open_calls) > 1:
             line = f"{line} Be advised, you now have {len(open_calls)} calls holding."
         await announce(line, tone=is_priority(call))
