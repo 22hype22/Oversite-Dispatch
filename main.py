@@ -61,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "bolo-cleared-1"
+BUILD = "callsign-match-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -764,6 +764,66 @@ def extract_callsign(text):
     if not callsign or len(callsign) > 24 or not has_number:
         return ""
     return callsign
+
+
+_NUM_ONES = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3",
+             "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+_NUM_TEEN = {"ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+             "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19"}
+_NUM_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+             "seventy": 70, "eighty": 80, "ninety": 90}
+_PHON = {"adam": "a", "boy": "b", "charlie": "c", "david": "d", "edward": "e", "frank": "f",
+         "george": "g", "henry": "h", "ida": "i", "john": "j", "king": "k", "lincoln": "l",
+         "mary": "m", "nora": "n", "ocean": "o", "paul": "p", "queen": "q", "robert": "r",
+         "sam": "s", "tom": "t", "union": "u", "victor": "v", "william": "w", "xray": "x",
+         "young": "y", "zebra": "z", "alpha": "a", "bravo": "b", "delta": "d", "echo": "e",
+         "foxtrot": "f", "golf": "g", "hotel": "h", "india": "i", "juliet": "j", "kilo": "k",
+         "lima": "l", "mike": "m", "november": "n", "oscar": "o", "papa": "p", "quebec": "q",
+         "romeo": "r", "sierra": "s", "tango": "t", "uniform": "u", "whiskey": "w",
+         "yankee": "y", "zulu": "z"}
+
+
+def spoken_compact(text):
+    tokens = [t for t in re.split(r"[\s-]+", text.lower()) if t]
+    out = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].strip(",.")
+        if t in _NUM_TENS:
+            val = _NUM_TENS[t]
+            if i + 1 < len(tokens):
+                nxt = tokens[i + 1].strip(",.")
+                if nxt in _NUM_ONES and nxt not in ("zero", "oh", "o"):
+                    val += int(_NUM_ONES[nxt])
+                    i += 1
+            out.append(str(val))
+        elif t in _NUM_TEEN:
+            out.append(_NUM_TEEN[t])
+        elif t in _NUM_ONES:
+            out.append(_NUM_ONES[t])
+        elif t in _PHON:
+            out.append(_PHON[t])
+        elif t.isalnum():
+            out.append(t)
+        i += 1
+    return "".join(out)
+
+
+def resolve_callsign(spoken):
+    if not spoken:
+        return spoken
+    active = list({v[0] for v in officer_last_seen.values() if v[0]})
+    if not active:
+        return spoken
+    target = spoken_compact(spoken)
+    if not target:
+        return spoken
+    best, best_r = spoken, 0.0
+    for cs in active:
+        r = difflib.SequenceMatcher(None, target, norm_callsign(cs)).ratio()
+        if r > best_r:
+            best_r, best = r, cs
+    return best if best_r >= 0.5 else spoken
 
 
 def strip_callsign_echo(body):
@@ -1500,7 +1560,7 @@ async def handle_utterance(member, pcm):
         print(f"heard {who}: {text}", flush=True)
     if not is_for_dispatch(text):
         return
-    callsign = extract_callsign(text)
+    callsign = resolve_callsign(extract_callsign(text))
     if wants_repeat(text):
         if last_call is not None:
             ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
