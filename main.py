@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "officer-down-1"
+BUILD = "officer-down-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -95,7 +95,7 @@ STATUS_CHECK_GRACE = int(os.environ.get("STATUS_CHECK_GRACE", "120"))
 STATUS_CHECK_MOVE = float(os.environ.get("STATUS_CHECK_MOVE", "8"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
 OFFICER_DOWN = os.environ.get("OFFICER_DOWN", "1").lower() not in ("0", "false", "no", "off")
-OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "10"))
+OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "4"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 
