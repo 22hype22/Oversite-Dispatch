@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import json
 import wave
 import time
 import random
@@ -60,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "backup-pursuit-2"
+BUILD = "link-persist-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -101,6 +102,7 @@ PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
 PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
+LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -503,6 +505,7 @@ async def link_command(interaction, callsign: str, roblox: str = ""):
         await safe_respond(interaction, "Give me your callsign, like 1S-32.")
         return
     callsign_links[interaction.user.id] = {"callsign": callsign, "roblox": roblox}
+    save_links()
     print(f"{interaction.user} linked callsign {callsign} roblox '{roblox}'", flush=True)
     extra = f", matching in-game name **{roblox}**" if roblox else " (matching by your Discord name)"
     await safe_respond(interaction,
@@ -881,6 +884,31 @@ def norm_callsign(cs):
 def clean_name(name):
     cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", str(name or "")).strip()
     return cleaned or str(name or "").strip()
+
+
+def save_links():
+    try:
+        with open(LINK_FILE, "w") as handle:
+            json.dump({str(k): v for k, v in callsign_links.items()}, handle)
+    except Exception as exc:
+        print(f"could not save callsign links: {exc}", flush=True)
+
+
+def load_links():
+    try:
+        if not os.path.exists(LINK_FILE):
+            return
+        with open(LINK_FILE) as handle:
+            data = json.load(handle)
+        for k, v in data.items():
+            try:
+                if isinstance(v, dict):
+                    callsign_links[int(k)] = v
+            except (TypeError, ValueError):
+                continue
+        print(f"loaded {len(callsign_links)} saved callsign link(s)", flush=True)
+    except Exception as exc:
+        print(f"could not load callsign links: {exc}", flush=True)
 
 
 def _num(d, *keys):
@@ -1739,6 +1767,7 @@ async def on_ready():
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
     print(f"region: {DISPATCH_REGION}", flush=True)
+    load_links()
     await sync_commands()
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
