@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-4"
+BUILD = "traffic-stop-5"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -87,7 +87,7 @@ MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
 SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
 TRAFFIC_STOP_RETURN = os.environ.get("TRAFFIC_STOP_RETURN", "1").lower() not in ("0", "false", "no", "off")
 FLEE_DISTANCE = float(os.environ.get("FLEE_DISTANCE", "45"))
-STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "3"))
+STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "2"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
@@ -418,6 +418,13 @@ def set_region(region):
     CALL_SYSTEM = build_call_system(region)
 
 
+async def safe_respond(interaction, text):
+    try:
+        await interaction.response.send_message(text, ephemeral=True)
+    except Exception as exc:
+        print(f"interaction response failed: {exc}", flush=True)
+
+
 @command_tree.command(
     name="region",
     description="Set the real-world area dispatch talks like (state, country, or city)",
@@ -428,14 +435,13 @@ def set_region(region):
 async def region_command(interaction, area: str):
     area = " ".join(area.split()).strip()
     if not area:
-        await interaction.response.send_message(
-            "Give me an area, like Texas, Alaska, or Dubai.", ephemeral=True)
+        await safe_respond(interaction, "Give me an area, like Texas, Alaska, or Dubai.")
         return
     set_region(area)
     print(f"region changed to {DISPATCH_REGION} by {interaction.user}", flush=True)
-    await interaction.response.send_message(
+    await safe_respond(interaction,
         f"Dispatch is now running as **{DISPATCH_REGION}**. New calls and radio "
-        f"replies will use that area's codes and style.", ephemeral=True)
+        f"replies will use that area's codes and style.")
 
 
 @command_tree.command(
@@ -450,14 +456,14 @@ async def link_command(interaction, callsign: str, roblox: str = ""):
     callsign = " ".join(callsign.split()).strip()
     roblox = roblox.strip()
     if not callsign:
-        await interaction.response.send_message("Give me your callsign, like 1S-32.", ephemeral=True)
+        await safe_respond(interaction, "Give me your callsign, like 1S-32.")
         return
     callsign_links[interaction.user.id] = {"callsign": callsign, "roblox": roblox}
     print(f"{interaction.user} linked callsign {callsign} roblox '{roblox}'", flush=True)
     extra = f", matching in-game name **{roblox}**" if roblox else " (matching by your Discord name)"
-    await interaction.response.send_message(
+    await safe_respond(interaction,
         f"Linked. Callsign **{callsign}**{extra}. When you call a traffic stop, dispatch "
-        f"will pull you back automatically if the subject flees.", ephemeral=True)
+        f"will pull you back automatically if the subject flees.")
 
 
 @command_tree.command(
@@ -469,7 +475,7 @@ async def clear_command(interaction):
     active_stops.pop(interaction.user.id, None)
     moved = await move_member(interaction.user, VOICE_CHANNEL_ID)
     note = " and returned you to the main channel" if moved else ""
-    await interaction.response.send_message(f"10-4, showing you clear{note}.", ephemeral=True)
+    await safe_respond(interaction, f"10-4, showing you clear{note}.")
 
 
 async def anthropic_call(system, user_msg, max_tokens=200):
@@ -900,7 +906,7 @@ async def start_traffic_stop(member):
               f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
         return
     pos = positions[key][0]
-    active_stops[member.id] = {"key": key, "member": member, "last": pos, "since": time.time(), "callsign": radio_cs}
+    active_stops[member.id] = {"key": key, "member": member, "origin": pos, "since": time.time(), "callsign": radio_cs}
     print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
 
 
@@ -932,14 +938,15 @@ async def stop_watch_loop():
                 pos, street = entry
                 if pos is None:
                     continue
-                last = stop.get("last")
-                stop["last"] = pos
-                if last is not None:
-                    dist = ((pos[0] - last[0]) ** 2 + (pos[1] - last[1]) ** 2) ** 0.5
-                    if dist >= 1:
-                        print(f"stop {stop['callsign']}: moved {dist:.1f} (flee at {FLEE_DISTANCE})", flush=True)
-                    if dist >= FLEE_DISTANCE:
-                        await end_stop_pursuit(uid, stop, street)
+                origin = stop.get("origin")
+                if origin is None:
+                    stop["origin"] = pos
+                    continue
+                dist = ((pos[0] - origin[0]) ** 2 + (pos[1] - origin[1]) ** 2) ** 0.5
+                if dist >= 5:
+                    print(f"stop {stop['callsign']}: {dist:.0f} from stop point (flee at {FLEE_DISTANCE})", flush=True)
+                if dist >= FLEE_DISTANCE:
+                    await end_stop_pursuit(uid, stop, street)
         await asyncio.sleep(STOP_POLL_SECONDS)
 
 
