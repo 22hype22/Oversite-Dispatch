@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "down-details-2"
+BUILD = "down-details-3"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -1201,10 +1201,10 @@ async def officer_down_loop():
                         if info:
                             cs, street, postal = info
                             veh, plate = "", ""
-                            for s in active_stops.values():
-                                if s.get("key") == keyid and s.get("vehicle"):
+                            for suid in [u for u, s in active_stops.items() if s.get("key") == keyid]:
+                                s = active_stops.pop(suid)
+                                if s.get("vehicle"):
                                     veh, plate = s["vehicle"], s.get("plate", "")
-                                    break
                             parts = [f"All units, officer down, Unit {cs}."]
                             where_bits = []
                             if postal:
@@ -1274,9 +1274,13 @@ async def stop_watch_loop():
                     continue
                 dist = ((pos[0] - last[0]) ** 2 + (pos[1] - last[1]) ** 2) ** 0.5
                 speed = dist / dt
+                if speed >= 500:
+                    active_stops.pop(uid, None)
+                    print(f"stop {stop['callsign']}: teleport/respawn, ending stop (no pursuit)", flush=True)
+                    continue
                 if speed >= 3:
                     print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
-                if FLEE_SPEED <= speed < 500:
+                if speed >= FLEE_SPEED:
                     await end_stop_pursuit(uid, stop, street)
                     continue
                 if not stop.get("veh_done") and (now - stop["since"]) >= 8:
