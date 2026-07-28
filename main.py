@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-6"
+BUILD = "flee-speed-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -86,7 +86,7 @@ DISPATCH_TZ = os.environ.get("DISPATCH_TZ", "UTC").strip() or "UTC"
 MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
 SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
 TRAFFIC_STOP_RETURN = os.environ.get("TRAFFIC_STOP_RETURN", "1").lower() not in ("0", "false", "no", "off")
-FLEE_DISTANCE = float(os.environ.get("FLEE_DISTANCE", "45"))
+FLEE_SPEED = float(os.environ.get("FLEE_SPEED", "35"))
 STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "2"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
 
@@ -911,7 +911,9 @@ async def start_traffic_stop(member, spoken_callsign=""):
               f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
         return
     pos = positions[key][0]
-    active_stops[member.id] = {"key": key, "member": member, "origin": pos, "since": time.time(), "callsign": radio_cs}
+    now = time.time()
+    active_stops[member.id] = {"key": key, "member": member, "last": pos, "last_time": now,
+                               "since": now, "callsign": radio_cs}
     print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
 
 
@@ -943,14 +945,20 @@ async def stop_watch_loop():
                 pos, street = entry
                 if pos is None:
                     continue
-                origin = stop.get("origin")
-                if origin is None:
-                    stop["origin"] = pos
+                last = stop.get("last")
+                last_time = stop.get("last_time")
+                stop["last"] = pos
+                stop["last_time"] = now
+                if last is None or last_time is None:
                     continue
-                dist = ((pos[0] - origin[0]) ** 2 + (pos[1] - origin[1]) ** 2) ** 0.5
-                if dist >= 5:
-                    print(f"stop {stop['callsign']}: {dist:.0f} from stop point (flee at {FLEE_DISTANCE})", flush=True)
-                if dist >= FLEE_DISTANCE:
+                dt = now - last_time
+                if dt <= 0:
+                    continue
+                dist = ((pos[0] - last[0]) ** 2 + (pos[1] - last[1]) ** 2) ** 0.5
+                speed = dist / dt
+                if speed >= 3:
+                    print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
+                if FLEE_SPEED <= speed < 500:
                     await end_stop_pursuit(uid, stop, street)
         await asyncio.sleep(STOP_POLL_SECONDS)
 
@@ -1289,7 +1297,7 @@ async def on_ready():
         tone_path = await client.loop.run_in_executor(None, make_tone)
         print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
     if TRAFFIC_STOP_RETURN:
-        print(f"traffic-stop auto-return: ON (flee distance {FLEE_DISTANCE}, needs Move Members perm + /link)", flush=True)
+        print(f"traffic-stop auto-return: ON (flee speed {FLEE_SPEED}/sec, needs Move Members perm + /link)", flush=True)
     else:
         print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_RETURN=1 to enable)", flush=True)
     await ensure_voice()
