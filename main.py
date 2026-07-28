@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-1"
+BUILD = "traffic-stop-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -85,7 +85,7 @@ ALERT_TONES = os.environ.get("ALERT_TONES", "1").lower() not in ("0", "false", "
 DISPATCH_TZ = os.environ.get("DISPATCH_TZ", "UTC").strip() or "UTC"
 MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
 SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
-TRAFFIC_STOP_VC_ID = int(os.environ.get("TRAFFIC_STOP_VC_ID", "0"))
+TRAFFIC_STOP_RETURN = os.environ.get("TRAFFIC_STOP_RETURN", "1").lower() not in ("0", "false", "no", "off")
 FLEE_DISTANCE = float(os.environ.get("FLEE_DISTANCE", "45"))
 STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "3"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
@@ -835,6 +835,8 @@ async def player_positions():
 async def move_member(member, channel_id):
     if not channel_id or member is None or member.voice is None:
         return False
+    if member.voice.channel is not None and member.voice.channel.id == channel_id:
+        return True
     channel = member.guild.get_channel(channel_id)
     if channel is None:
         return False
@@ -847,9 +849,8 @@ async def move_member(member, channel_id):
 
 
 async def start_traffic_stop(member):
-    if not TRAFFIC_STOP_VC_ID:
+    if not TRAFFIC_STOP_RETURN:
         return
-    await move_member(member, TRAFFIC_STOP_VC_ID)
     cs = callsign_links.get(member.id)
     if not cs:
         print(f"{getattr(member, 'display_name', '?')} on a stop but no linked callsign — auto-return off (use /link)", flush=True)
@@ -1232,10 +1233,10 @@ async def on_ready():
     if ALERT_TONES and tone_path is None:
         tone_path = await client.loop.run_in_executor(None, make_tone)
         print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
-    if TRAFFIC_STOP_VC_ID:
+    if TRAFFIC_STOP_RETURN:
         print(f"traffic-stop auto-return: ON (flee distance {FLEE_DISTANCE}, needs Move Members perm + /link)", flush=True)
     else:
-        print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_VC_ID to enable)", flush=True)
+        print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_RETURN=1 to enable)", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
