@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "say-again-1"
+BUILD = "traffic-stop-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -85,6 +85,10 @@ ALERT_TONES = os.environ.get("ALERT_TONES", "1").lower() not in ("0", "false", "
 DISPATCH_TZ = os.environ.get("DISPATCH_TZ", "UTC").strip() or "UTC"
 MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
 SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
+TRAFFIC_STOP_VC_ID = int(os.environ.get("TRAFFIC_STOP_VC_ID", "0"))
+FLEE_DISTANCE = float(os.environ.get("FLEE_DISTANCE", "45"))
+STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "3"))
+STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -108,6 +112,8 @@ response_cache = {}
 tone_path = None
 status_board = {}
 open_calls = {}
+callsign_links = {}
+active_stops = {}
 IGNORE = object()
 
 
@@ -429,6 +435,35 @@ async def region_command(interaction, area: str):
     await interaction.response.send_message(
         f"Dispatch is now running as **{DISPATCH_REGION}**. New calls and radio "
         f"replies will use that area's codes and style.", ephemeral=True)
+
+
+@command_tree.command(
+    name="link",
+    description="Link your Discord to your in-game callsign for traffic-stop tracking",
+    guild=DISPATCH_GUILD,
+)
+@discord.app_commands.describe(callsign="Your exact in-game callsign, e.g. 1S-32")
+async def link_command(interaction, callsign: str):
+    callsign = " ".join(callsign.split()).strip()
+    if not callsign:
+        await interaction.response.send_message("Give me your callsign, like 1S-32.", ephemeral=True)
+        return
+    callsign_links[interaction.user.id] = callsign
+    await interaction.response.send_message(
+        f"You are linked to callsign **{callsign}**. When you call a traffic stop, "
+        f"dispatch will pull you back automatically if the subject flees.", ephemeral=True)
+
+
+@command_tree.command(
+    name="clear",
+    description="Clear from your traffic stop and return to the main channel",
+    guild=DISPATCH_GUILD,
+)
+async def clear_command(interaction):
+    active_stops.pop(interaction.user.id, None)
+    moved = await move_member(interaction.user, VOICE_CHANNEL_ID)
+    note = " and returned you to the main channel" if moved else ""
+    await interaction.response.send_message(f"10-4, showing you clear{note}.", ephemeral=True)
 
 
 async def anthropic_call(system, user_msg, max_tokens=200):
@@ -759,6 +794,112 @@ def read_calls_holding(callsign=""):
     return " ".join(parts)
 
 
+def norm_callsign(cs):
+    return re.sub(r"[^a-z0-9]", "", str(cs or "").lower())
+
+
+def extract_player_pos(player):
+    loc = player.get("Location") if isinstance(player.get("Location"), dict) else None
+    for kx, kz in (("X", "Z"), ("LocationX", "LocationZ")):
+        src = loc if loc is not None else player
+        x = src.get(kx)
+        z = src.get(kz)
+        if x is not None and z is not None:
+            try:
+                return (float(x), float(z))
+            except (TypeError, ValueError):
+                return None
+    x = player.get("LocationX")
+    z = player.get("LocationZ")
+    if x is not None and z is not None:
+        try:
+            return (float(x), float(z))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def player_positions():
+    data = await erlc_get("/server?Players=true")
+    out = {}
+    if isinstance(data, dict):
+        players = data.get("Players")
+        if isinstance(players, list):
+            for p in players:
+                cs = norm_callsign(p.get("Callsign"))
+                if cs:
+                    out[cs] = (extract_player_pos(p), (p.get("StreetName") or "").strip())
+    return out
+
+
+async def move_member(member, channel_id):
+    if not channel_id or member is None or member.voice is None:
+        return False
+    channel = member.guild.get_channel(channel_id)
+    if channel is None:
+        return False
+    try:
+        await member.move_to(channel)
+        return True
+    except Exception as exc:
+        print(f"could not move {getattr(member, 'display_name', '?')}: {exc}", flush=True)
+        return False
+
+
+async def start_traffic_stop(member):
+    if not TRAFFIC_STOP_VC_ID:
+        return
+    await move_member(member, TRAFFIC_STOP_VC_ID)
+    cs = callsign_links.get(member.id)
+    if not cs:
+        print(f"{getattr(member, 'display_name', '?')} on a stop but no linked callsign — auto-return off (use /link)", flush=True)
+        return
+    key = norm_callsign(cs)
+    positions = await player_positions()
+    pos = positions.get(key, (None, ""))[0]
+    active_stops[member.id] = {"callsign": cs, "member": member, "last": pos, "since": time.time()}
+    print(f"traffic stop started for {cs} at {pos}", flush=True)
+
+
+async def end_stop_pursuit(uid, stop, street):
+    active_stops.pop(uid, None)
+    await move_member(stop["member"], VOICE_CHANNEL_ID)
+    cs = stop["callsign"]
+    where = f" near {street}" if street else ""
+    await announce(
+        f"All units, Unit {cs} is in pursuit, subject fleeing a traffic stop{where}. "
+        f"Clear the air.", title="Pursuit", tone=True)
+    print(f"pursuit triggered for {cs}", flush=True)
+
+
+async def stop_watch_loop():
+    await client.wait_until_ready()
+    print("traffic-stop watch active", flush=True)
+    while not client.is_closed():
+        if active_stops:
+            positions = await player_positions()
+            now = time.time()
+            for uid, stop in list(active_stops.items()):
+                if now - stop["since"] > STOP_MAX_SECONDS:
+                    active_stops.pop(uid, None)
+                    continue
+                entry = positions.get(norm_callsign(stop["callsign"]))
+                if entry is None:
+                    continue
+                pos, street = entry
+                if pos is None:
+                    continue
+                last = stop.get("last")
+                stop["last"] = pos
+                if last is not None:
+                    dist = ((pos[0] - last[0]) ** 2 + (pos[1] - last[1]) ** 2) ** 0.5
+                    if dist >= 1:
+                        print(f"stop {stop['callsign']}: moved {dist:.1f} (flee at {FLEE_DISTANCE})", flush=True)
+                    if dist >= FLEE_DISTANCE:
+                        await end_stop_pursuit(uid, stop, street)
+        await asyncio.sleep(STOP_POLL_SECONDS)
+
+
 def has_real_words(text):
     cleaned = re.sub(r"\[[^\]]*\]", " ", text)
     return len(re.findall(r"\w{2,}", cleaned)) >= 1
@@ -822,6 +963,8 @@ async def handle_utterance(member, pcm):
     if status and callsign:
         status_board[callsign] = {"status": status, "time": time.time()}
         print(f"status board: {callsign} -> {status}", flush=True)
+        if "traffic stop" in status:
+            await start_traffic_stop(member)
     if not status and not normalize_intent(text, callsign):
         ack = f"Unit {callsign}, " if callsign else ""
         await announce(f"{ack}you are unreadable, say again.", title="Say Again")
@@ -1089,10 +1232,15 @@ async def on_ready():
     if ALERT_TONES and tone_path is None:
         tone_path = await client.loop.run_in_executor(None, make_tone)
         print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
+    if TRAFFIC_STOP_VC_ID:
+        print(f"traffic-stop auto-return: ON (flee distance {FLEE_DISTANCE}, needs Move Members perm + /link)", flush=True)
+    else:
+        print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_VC_ID to enable)", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
     client.loop.create_task(voice_guard())
+    client.loop.create_task(stop_watch_loop())
 
 
 client.run(TOKEN)
