@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "nearest-unit-1"
+BUILD = "duty-nick-4"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -89,6 +89,10 @@ TRAFFIC_STOP_RETURN = os.environ.get("TRAFFIC_STOP_RETURN", "1").lower() not in 
 FLEE_SPEED = float(os.environ.get("FLEE_SPEED", "35"))
 STOP_POLL_SECONDS = float(os.environ.get("STOP_POLL_SECONDS", "1"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
+STATUS_CHECKS = os.environ.get("STATUS_CHECKS", "1").lower() not in ("0", "false", "no", "off")
+STATUS_CHECK_SECONDS = int(os.environ.get("STATUS_CHECK_SECONDS", "420"))
+STATUS_CHECK_GRACE = int(os.environ.get("STATUS_CHECK_GRACE", "120"))
+STATUS_CHECK_MOVE = float(os.environ.get("STATUS_CHECK_MOVE", "8"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 
@@ -291,6 +295,21 @@ async def erlc_get(path):
     except Exception as exc:
         print(f"erlc fetch failed for {path}: {exc}", flush=True)
         return None
+
+
+async def erlc_command(command):
+    try:
+        async with http.post(f"{ERLC_V2_BASE}/server/command",
+                             headers={"Server-Key": ERLC_KEY},
+                             json={"command": command}) as resp:
+            if resp.status in (200, 201, 204):
+                return True
+            body = await resp.text()
+            print(f"erlc command '{command[:40]}' -> {resp.status}: {body[:200]}", flush=True)
+            return False
+    except Exception as exc:
+        print(f"erlc command failed: {exc}", flush=True)
+        return False
 
 
 async def synthesize(text):
@@ -882,8 +901,8 @@ async def player_positions():
                 _players_debugged = True
                 print(f"players API sample: {players[0]}", flush=True)
             for p in players:
-                info = (extract_player_pos(p), extract_street(p))
                 name = str(p.get("Player") or "").split(":")[0]
+                info = (extract_player_pos(p), extract_street(p), name)
                 for ident in (name, p.get("Callsign")):
                     k = norm_callsign(ident)
                     if k:
@@ -1016,11 +1035,7 @@ async def get_ingame_callsign(member):
     return None
 
 
-async def apply_duty_nick(member):
-    cs = await get_ingame_callsign(member)
-    if not cs:
-        print(f"nick: {member.display_name} joined RTO but no in-game callsign found", flush=True)
-        return
+async def set_duty_nick(member, cs):
     base = re.sub(r"^\[[^\]]*\]\s*", "", member.display_name).strip()
     new_nick = f"[{cs}] {base}"[:32]
     try:
@@ -1032,6 +1047,14 @@ async def apply_duty_nick(member):
         print(f"nick: cannot rename {member.display_name} (server owner, or their role is above the bot)", flush=True)
     except Exception as exc:
         print(f"nick: failed for {member.display_name}: {exc}", flush=True)
+
+
+async def apply_duty_nick(member):
+    cs = await get_ingame_callsign(member)
+    if not cs:
+        print(f"nick: {member.display_name} joined voice but no in-game callsign found", flush=True)
+        return
+    await set_duty_nick(member, cs)
 
 
 async def revert_duty_nick(member):
@@ -1048,23 +1071,38 @@ async def revert_duty_nick(member):
 async def nick_watch_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        if CALLSIGN_NICK and nick_original:
-            data = await erlc_get("/server?Players=true")
-            players = data.get("Players") if isinstance(data, dict) else None
-            if isinstance(players, list):
-                on_duty = set()
-                for p in players:
-                    uname = norm_callsign(str(p.get("Player") or "").split(":")[0])
-                    if uname and str(p.get("Callsign") or "").strip():
-                        on_duty.add(uname)
-                guild = client.get_guild(GUILD_ID)
-                for uid in list(nick_original.keys()):
-                    member = guild.get_member(uid) if guild is not None else None
-                    if member is None:
-                        nick_original.pop(uid, None)
-                        continue
-                    if not (duty_idents(member) & on_duty):
-                        await revert_duty_nick(member)
+        if CALLSIGN_NICK:
+            guild = client.get_guild(GUILD_ID)
+            voice_members = []
+            if guild is not None:
+                for vc in guild.voice_channels:
+                    for m in vc.members:
+                        if not m.bot:
+                            voice_members.append(m)
+            if voice_members or nick_original:
+                data = await erlc_get("/server?Players=true")
+                players = data.get("Players") if isinstance(data, dict) else None
+                if isinstance(players, list):
+                    on_duty = {}
+                    for p in players:
+                        uname = norm_callsign(str(p.get("Player") or "").split(":")[0])
+                        cs = str(p.get("Callsign") or "").strip()
+                        if uname and cs:
+                            on_duty[uname] = cs
+                    duty_keys = set(on_duty)
+                    for m in voice_members:
+                        if m.id in nick_original:
+                            continue
+                        match = duty_idents(m) & duty_keys
+                        if match:
+                            await set_duty_nick(m, on_duty[next(iter(match))])
+                    for uid in list(nick_original.keys()):
+                        member = guild.get_member(uid) if guild is not None else None
+                        if member is None:
+                            nick_original.pop(uid, None)
+                            continue
+                        if not (duty_idents(member) & duty_keys):
+                            await revert_duty_nick(member)
         await asyncio.sleep(20)
 
 
@@ -1093,7 +1131,7 @@ async def stop_watch_loop():
                 entry = positions.get(stop["key"])
                 if entry is None:
                     continue
-                pos, street = entry
+                pos, street, pname = entry
                 if pos is None:
                     continue
                 last = stop.get("last")
@@ -1111,7 +1149,46 @@ async def stop_watch_loop():
                     print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
                 if FLEE_SPEED <= speed < 500:
                     await end_stop_pursuit(uid, stop, street)
+                    continue
+                if STATUS_CHECKS:
+                    await maybe_status_check(uid, stop, pos, street, pname, now)
         await asyncio.sleep(STOP_POLL_SECONDS)
+
+
+async def maybe_status_check(uid, stop, pos, street, pname, now):
+    stop.setdefault("check_at", stop["since"] + STATUS_CHECK_SECONDS)
+    if not stop.get("checked"):
+        if now < stop["check_at"]:
+            return
+        if not pname:
+            stop["check_at"] = now + 60
+            return
+        msg = (f"Dispatch to {stop['callsign']}, status check. Drive a short distance "
+               f"to advise Code 4, or clear when 10-4.")
+        if not await erlc_command(f":pm {pname} {msg}"):
+            stop["check_at"] = now + 60
+            return
+        stop["checked"] = True
+        stop["check_pos"] = pos
+        stop["check_deadline"] = now + STATUS_CHECK_GRACE
+        print(f"status check sent to {stop['callsign']} ({pname})", flush=True)
+        return
+    cpos = stop.get("check_pos")
+    moved = cpos is not None and (((pos[0] - cpos[0]) ** 2 + (pos[1] - cpos[1]) ** 2) ** 0.5) >= STATUS_CHECK_MOVE
+    if moved:
+        stop["checked"] = False
+        stop["check_at"] = now + STATUS_CHECK_SECONDS
+        stop.pop("check_pos", None)
+        stop.pop("check_deadline", None)
+        print(f"status check acknowledged by {stop['callsign']}", flush=True)
+    elif now >= stop.get("check_deadline", now):
+        active_stops.pop(uid, None)
+        where = f", last known location {street}" if street else ""
+        await announce(
+            f"All units, be advised, Unit {stop['callsign']} is not responding to a "
+            f"status check{where}. Any available unit, check their welfare.",
+            title="Welfare Check", tone=True)
+        print(f"status check FAILED for {stop['callsign']} — welfare broadcast", flush=True)
 
 
 def has_real_words(text):
@@ -1476,6 +1553,8 @@ async def on_ready():
         print(f"traffic-stop auto-return: ON (flee speed {FLEE_SPEED}/sec, needs Move Members perm + /link)", flush=True)
     else:
         print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_RETURN=1 to enable)", flush=True)
+    if STATUS_CHECKS:
+        print(f"status checks: ON (after {STATUS_CHECK_SECONDS}s on a stop; in-game PM needs command permission)", flush=True)
     if CALLSIGN_NICK:
         print("on-duty callsign nicknames: ON (needs Manage Nicknames perm; cannot rename the server owner)", flush=True)
     await ensure_voice()
