@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "down-details-3"
+BUILD = "backup-pursuit-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -97,6 +97,8 @@ CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false
 OFFICER_DOWN = os.environ.get("OFFICER_DOWN", "1").lower() not in ("0", "false", "no", "off")
 OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "4"))
 SUSPECT_RADIUS = float(os.environ.get("SUSPECT_RADIUS", "60"))
+PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
+PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 
@@ -828,6 +830,15 @@ def wants_clear_stop(text):
     return any(t in low for t in triggers)
 
 
+def wants_backup(text):
+    low = _flat(text)
+    triggers = ("start me another unit", "start another unit", "another unit",
+                "additional unit", "send backup", "send me backup", "need backup",
+                "requesting backup", "request backup", "need another unit",
+                "get me another unit", "second unit", "start me a unit")
+    return any(t in low for t in triggers)
+
+
 def read_status_board(callsign=""):
     now = time.time()
     entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
@@ -1049,6 +1060,41 @@ async def start_traffic_stop(member, spoken_callsign=""):
     print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
 
 
+async def assign_backup(member, spoken_callsign):
+    data = await erlc_get("/server?Players=true")
+    players = data.get("Players") if isinstance(data, dict) else None
+    officers = []
+    if isinstance(players, list):
+        for p in players:
+            team = str(p.get("Team") or "").lower()
+            pos = extract_player_pos(p)
+            if pos and any(t in team for t in CALL_TEAMS):
+                pname = str(p.get("Player") or "").split(":")[0]
+                cs = str(p.get("Callsign") or "").strip() or pname
+                officers.append((norm_callsign(pname), cs, pos, extract_street(p), extract_postal(p)))
+    idents = duty_idents(member)
+    req = next((o for o in officers if o[0] in idents), None)
+    req_cs = spoken_callsign or (req[1] if req else clean_name(getattr(member, "display_name", "unit")))
+    others = [o for o in officers if not req or o[0] != req[0]]
+    if not others:
+        await announce(f"Unit {req_cs}, be advised, no other units are online at this time.", title="Backup")
+        return
+    if req is None:
+        await announce(f"Unit {req_cs}, units are on, but I cannot locate your position, advise your location.",
+                       title="Backup")
+        return
+    nearest = min(others, key=lambda o: (o[2][0] - req[2][0]) ** 2 + (o[2][1] - req[2][1]) ** 2)
+    where_bits = []
+    if req[4]:
+        where_bits.append(f"postal {req[4]}")
+    if req[3]:
+        where_bits.append(req[3])
+    loc = ", ".join(where_bits)
+    loc_str = f" at {loc}" if loc else ""
+    await announce(f"Unit {nearest[1]}, respond to assist Unit {req_cs}{loc_str}, Code 3.", title="Backup")
+    print(f"backup: {nearest[1]} assigned to {req_cs}", flush=True)
+
+
 async def clear_traffic_stop(member, callsign=""):
     active_stops.pop(member.id, None)
     await move_member(member, VOICE_CHANNEL_ID)
@@ -1236,7 +1282,8 @@ async def officer_down_loop():
 
 
 async def end_stop_pursuit(uid, stop, street):
-    active_stops.pop(uid, None)
+    stop["pursuit"] = True
+    stop["slow_since"] = None
     await move_member(stop["member"], VOICE_CHANNEL_ID)
     cs = stop["callsign"]
     where = f" near {street}" if street else ""
@@ -1276,7 +1323,20 @@ async def stop_watch_loop():
                 speed = dist / dt
                 if speed >= 500:
                     active_stops.pop(uid, None)
-                    print(f"stop {stop['callsign']}: teleport/respawn, ending stop (no pursuit)", flush=True)
+                    print(f"stop {stop['callsign']}: teleport/respawn, ending (no pursuit)", flush=True)
+                    continue
+                if stop.get("pursuit"):
+                    if speed >= PURSUIT_END_SPEED:
+                        stop["slow_since"] = None
+                    else:
+                        if stop.get("slow_since") is None:
+                            stop["slow_since"] = now
+                        elif now - stop["slow_since"] >= PURSUIT_END_SECONDS:
+                            active_stops.pop(uid, None)
+                            await announce(
+                                f"All units, the pursuit involving Unit {stop['callsign']} "
+                                f"is terminated. Resume normal traffic.", title="Pursuit Over")
+                            print(f"pursuit ended for {stop['callsign']}", flush=True)
                     continue
                 if speed >= 3:
                     print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
@@ -1390,6 +1450,9 @@ async def handle_utterance(member, pcm):
         return
     if wants_calls_holding(text):
         await announce(read_calls_holding(callsign), title="Calls Holding")
+        return
+    if wants_backup(text):
+        await assign_backup(member, callsign)
         return
     status = detect_status(text)
     clearing = wants_clear_stop(text)
