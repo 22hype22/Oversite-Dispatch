@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-5"
+BUILD = "traffic-stop-6"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -812,6 +812,11 @@ def norm_callsign(cs):
     return re.sub(r"[^a-z0-9]", "", str(cs or "").lower())
 
 
+def clean_name(name):
+    cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", str(name or "")).strip()
+    return cleaned or str(name or "").strip()
+
+
 def _num(d, *keys):
     for k in keys:
         v = d.get(k)
@@ -879,7 +884,7 @@ async def move_member(member, channel_id):
         return False
 
 
-async def start_traffic_stop(member):
+async def start_traffic_stop(member, spoken_callsign=""):
     who = getattr(member, "display_name", "?")
     if not TRAFFIC_STOP_RETURN:
         return
@@ -900,7 +905,7 @@ async def start_traffic_stop(member):
         if nk and nk in positions:
             key = nk
             break
-    radio_cs = link.get("callsign") or who
+    radio_cs = link.get("callsign") or spoken_callsign or clean_name(who)
     if key is None:
         print(f"traffic stop: could not match {who} to an in-game player. "
               f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
@@ -1015,7 +1020,7 @@ async def handle_utterance(member, pcm):
             status_board[callsign] = {"status": status, "time": time.time()}
             print(f"status board: {callsign} -> {status}", flush=True)
         if "traffic stop" in status:
-            await start_traffic_stop(member)
+            await start_traffic_stop(member, callsign)
     if not status and not normalize_intent(text, callsign):
         ack = f"Unit {callsign}, " if callsign else ""
         await announce(f"{ack}you are unreadable, say again.", title="Say Again")
