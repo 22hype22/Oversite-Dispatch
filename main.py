@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "duty-nick-5"
+BUILD = "officer-down-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -94,6 +94,8 @@ STATUS_CHECK_SECONDS = int(os.environ.get("STATUS_CHECK_SECONDS", "420"))
 STATUS_CHECK_GRACE = int(os.environ.get("STATUS_CHECK_GRACE", "120"))
 STATUS_CHECK_MOVE = float(os.environ.get("STATUS_CHECK_MOVE", "8"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
+OFFICER_DOWN = os.environ.get("OFFICER_DOWN", "1").lower() not in ("0", "false", "no", "off")
+OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "10"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 
@@ -122,8 +124,11 @@ open_calls = {}
 callsign_links = {}
 active_stops = {}
 nick_original = {}
+seen_kills = set()
+officer_last_seen = {}
 _players_debugged = False
 _call_debugged = False
+_kill_debugged = False
 IGNORE = object()
 
 
@@ -1116,6 +1121,59 @@ async def nick_watch_loop():
         await asyncio.sleep(20)
 
 
+def _kill_time(entry):
+    ts = entry.get("Timestamp")
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return 0
+    return ts / 1000 if ts > 1e12 else ts
+
+
+async def officer_down_loop():
+    global _kill_debugged
+    await client.wait_until_ready()
+    if OFFICER_DOWN:
+        print("officer-down watch active", flush=True)
+    while not client.is_closed():
+        if OFFICER_DOWN:
+            data = await erlc_get("/server?Players=true&KillLogs=true")
+            if isinstance(data, dict):
+                kills = data.get("KillLogs")
+                if isinstance(kills, list):
+                    if kills and not _kill_debugged:
+                        _kill_debugged = True
+                        print(f"killlog sample: {kills[0]}", flush=True)
+                    for k in kills:
+                        name = str(k.get("Killed") or "").split(":")[0]
+                        keyid = norm_callsign(name)
+                        ts = _kill_time(k)
+                        seen_key = (keyid, ts)
+                        if not keyid or ts < boot_time or seen_key in seen_kills:
+                            continue
+                        seen_kills.add(seen_key)
+                        info = officer_last_seen.get(keyid)
+                        if info:
+                            cs, street = info
+                            where = f", last known location {street}" if street else ""
+                            await announce(
+                                f"All units, be advised, Unit {cs} is down{where}. "
+                                f"Any available unit, respond Code 3.",
+                                title="Officer Down", tone=True)
+                            print(f"officer down: {cs}", flush=True)
+                players = data.get("Players")
+                if isinstance(players, list):
+                    officer_last_seen.clear()
+                    for p in players:
+                        cs = str(p.get("Callsign") or "").strip()
+                        team = str(p.get("Team") or "").lower()
+                        if cs and any(t in team for t in CALL_TEAMS):
+                            uname = norm_callsign(str(p.get("Player") or "").split(":")[0])
+                            if uname:
+                                officer_last_seen[uname] = (cs, extract_street(p))
+        await asyncio.sleep(OFFICER_DOWN_POLL)
+
+
 async def end_stop_pursuit(uid, stop, street):
     active_stops.pop(uid, None)
     await move_member(stop["member"], VOICE_CHANNEL_ID)
@@ -1566,6 +1624,8 @@ async def on_ready():
         print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_RETURN=1 to enable)", flush=True)
     if STATUS_CHECKS:
         print(f"status checks: ON (after {STATUS_CHECK_SECONDS}s on a stop; in-game PM needs command permission)", flush=True)
+    if OFFICER_DOWN:
+        print("officer-down detection: ON (auto-alerts when an on-duty unit is killed in game)", flush=True)
     if CALLSIGN_NICK:
         print("on-duty callsign nicknames: ON (needs Manage Nicknames perm; cannot rename the server owner)", flush=True)
     await ensure_voice()
@@ -1574,6 +1634,7 @@ async def on_ready():
     client.loop.create_task(voice_guard())
     client.loop.create_task(stop_watch_loop())
     client.loop.create_task(nick_watch_loop())
+    client.loop.create_task(officer_down_loop())
 
 
 client.run(TOKEN)
