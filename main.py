@@ -11,6 +11,11 @@ import tempfile
 from datetime import datetime, timezone
 
 try:
+    import audioop
+except Exception:
+    audioop = None
+
+try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
@@ -55,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "onready-fix-1"
+BUILD = "listen-filter-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -78,6 +83,8 @@ AI_CACHE_VARIANTS = int(os.environ.get("AI_CACHE_VARIANTS", "3"))
 DISPATCH_REGION = os.environ.get("DISPATCH_REGION", "the United States").strip() or "the United States"
 ALERT_TONES = os.environ.get("ALERT_TONES", "1").lower() not in ("0", "false", "no", "off")
 DISPATCH_TZ = os.environ.get("DISPATCH_TZ", "UTC").strip() or "UTC"
+MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
+SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -726,12 +733,22 @@ def read_calls_holding(callsign=""):
     return " ".join(parts)
 
 
+def has_real_words(text):
+    cleaned = re.sub(r"\[[^\]]*\]", " ", text)
+    return len(re.findall(r"\w{2,}", cleaned)) >= 1
+
+
 async def handle_utterance(member, pcm):
-    if len(pcm) < 96000:
+    if len(pcm) < MIN_UTTER_BYTES:
         return
-    print(f"utterance: {len(pcm)} bytes of pcm (~{len(pcm)/192000:.1f}s)", flush=True)
+    if audioop is not None:
+        try:
+            if audioop.rms(pcm, 2) < SILENCE_RMS:
+                return
+        except Exception:
+            pass
     text = await transcribe(pcm_to_wav(pcm))
-    if not text:
+    if not text or not has_real_words(text):
         return
     who = getattr(member, "display_name", "unit")
     print(f"heard {who}: {text}", flush=True)
