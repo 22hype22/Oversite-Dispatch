@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-2"
+BUILD = "traffic-stop-3"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -114,6 +114,7 @@ status_board = {}
 open_calls = {}
 callsign_links = {}
 active_stops = {}
+_players_debugged = False
 IGNORE = object()
 
 
@@ -449,6 +450,7 @@ async def link_command(interaction, callsign: str):
         await interaction.response.send_message("Give me your callsign, like 1S-32.", ephemeral=True)
         return
     callsign_links[interaction.user.id] = callsign
+    print(f"{interaction.user} linked to callsign {callsign}", flush=True)
     await interaction.response.send_message(
         f"You are linked to callsign **{callsign}**. When you call a traffic stop, "
         f"dispatch will pull you back automatically if the subject flees.", ephemeral=True)
@@ -724,6 +726,8 @@ STATUS_MAP = [
     ("on scene", "on scene"),
     ("on a traffic stop", "on a traffic stop"),
     ("traffic stop", "on a traffic stop"),
+    ("vehicle stop", "on a traffic stop"),
+    ("on a stop", "on a traffic stop"),
     ("attached", "on a call"),
     ("show me clear", "clear"),
     ("clearing", "clear"),
@@ -820,15 +824,21 @@ def extract_player_pos(player):
 
 
 async def player_positions():
+    global _players_debugged
     data = await erlc_get("/server?Players=true")
     out = {}
     if isinstance(data, dict):
         players = data.get("Players")
         if isinstance(players, list):
+            if players and not _players_debugged:
+                _players_debugged = True
+                print(f"players API sample: {players[0]}", flush=True)
             for p in players:
                 cs = norm_callsign(p.get("Callsign"))
                 if cs:
                     out[cs] = (extract_player_pos(p), (p.get("StreetName") or "").strip())
+    elif data is not None:
+        print(f"players API returned unexpected shape: {str(data)[:200]}", flush=True)
     return out
 
 
@@ -849,15 +859,22 @@ async def move_member(member, channel_id):
 
 
 async def start_traffic_stop(member):
+    who = getattr(member, "display_name", "?")
     if not TRAFFIC_STOP_RETURN:
         return
     cs = callsign_links.get(member.id)
     if not cs:
-        print(f"{getattr(member, 'display_name', '?')} on a stop but no linked callsign — auto-return off (use /link)", flush=True)
+        print(f"{who} called a traffic stop but hasn't run /link — can't track them", flush=True)
         return
     key = norm_callsign(cs)
     positions = await player_positions()
-    pos = positions.get(key, (None, ""))[0]
+    print(f"traffic stop: {who} as {cs} — API returned {len(positions)} players with callsigns", flush=True)
+    entry = positions.get(key)
+    if entry is None:
+        print(f"traffic stop: callsign '{cs}' not found in API. available: {sorted(positions.keys())}", flush=True)
+    elif entry[0] is None:
+        print(f"traffic stop: '{cs}' found but API gave no position (check field names)", flush=True)
+    pos = entry[0] if entry else None
     active_stops[member.id] = {"callsign": cs, "member": member, "last": pos, "since": time.time()}
     print(f"traffic stop started for {cs} at {pos}", flush=True)
 
@@ -961,9 +978,10 @@ async def handle_utterance(member, pcm):
         await announce(read_calls_holding(callsign), title="Calls Holding")
         return
     status = detect_status(text)
-    if status and callsign:
-        status_board[callsign] = {"status": status, "time": time.time()}
-        print(f"status board: {callsign} -> {status}", flush=True)
+    if status:
+        if callsign:
+            status_board[callsign] = {"status": status, "time": time.time()}
+            print(f"status board: {callsign} -> {status}", flush=True)
         if "traffic stop" in status:
             await start_traffic_stop(member)
     if not status and not normalize_intent(text, callsign):
