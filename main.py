@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "duty-nick-4"
+BUILD = "duty-nick-5"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -95,6 +95,7 @@ STATUS_CHECK_GRACE = int(os.environ.get("STATUS_CHECK_GRACE", "120"))
 STATUS_CHECK_MOVE = float(os.environ.get("STATUS_CHECK_MOVE", "8"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
+LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -662,11 +663,13 @@ async def dispatch_reply_body(text, callsign):
     key = normalize_intent(text, callsign)
     fb = fallback_reply(key)
     if fb:
-        print(f"using built-in reply for '{key}' (no api call)", flush=True)
+        if LOG_HEARD:
+            print(f"using built-in reply for '{key}' (no api call)", flush=True)
         return fb
     hit = match_cached_intent(key)
     if hit and len(response_cache[hit]) >= AI_CACHE_VARIANTS:
-        print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
+        if LOG_HEARD:
+            print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
         return random.choice(response_cache[hit])
     body = await dispatch_ai_reply(text, callsign)
     if body:
@@ -675,7 +678,8 @@ async def dispatch_reply_body(text, callsign):
         store = response_cache.setdefault(hit or key, [])
         if body not in store:
             store.append(body)
-        print(f"saved reply for '{hit or key}' ({len(store)} variant(s))", flush=True)
+        if LOG_HEARD:
+            print(f"saved reply for '{hit or key}' ({len(store)} variant(s))", flush=True)
         return body
     return None
 
@@ -1031,7 +1035,13 @@ async def get_ingame_callsign(member):
     for p in players:
         uname = norm_callsign(str(p.get("Player") or "").split(":")[0])
         if uname and uname in wanted:
-            return str(p.get("Callsign") or "").strip() or None
+            cs = str(p.get("Callsign") or "").strip()
+            if not cs:
+                print(f"nick: matched {member.display_name} in game but no callsign is set on their character", flush=True)
+            return cs or None
+    ingame = [str(p.get("Player") or "").split(":")[0] for p in players]
+    print(f"nick: {member.display_name} not found among in-game players {ingame} "
+          f"(tried {sorted(wanted)}); if their Roblox name differs, run /link", flush=True)
     return None
 
 
@@ -1232,7 +1242,8 @@ async def handle_utterance(member, pcm):
         return
     text = clean_transcript(text)
     who = getattr(member, "display_name", "unit")
-    print(f"heard {who}: {text}", flush=True)
+    if LOG_HEARD:
+        print(f"heard {who}: {text}", flush=True)
     if not is_for_dispatch(text):
         return
     callsign = extract_callsign(text)
