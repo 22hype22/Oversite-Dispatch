@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "duty-nick-3"
+BUILD = "police-calls-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -90,6 +90,7 @@ FLEE_SPEED = float(os.environ.get("FLEE_SPEED", "35"))
 STOP_POLL_SECONDS = float(os.environ.get("STOP_POLL_SECONDS", "1"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
+CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -209,6 +210,13 @@ PRIORITY_WORDS = (
 def is_priority(call):
     blob = f"{call.get('Description') or ''} {call.get('Team') or ''}".lower()
     return any(w in blob for w in PRIORITY_WORDS)
+
+
+def is_police_call(call):
+    team = str(call.get("Team") or "").strip().lower()
+    if not team:
+        return True
+    return any(t in team for t in CALL_TEAMS)
 
 
 def build_call_line(call):
@@ -1275,6 +1283,7 @@ async def poll_calls():
     calls = data.get("EmergencyCalls")
     if not isinstance(calls, list):
         return
+    calls = [c for c in calls if is_police_call(c)]
     open_calls.clear()
     for call in calls:
         number = call.get("CallNumber")
