@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "traffic-stop-3"
+BUILD = "traffic-stop-4"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -440,20 +440,24 @@ async def region_command(interaction, area: str):
 
 @command_tree.command(
     name="link",
-    description="Link your Discord to your in-game callsign for traffic-stop tracking",
+    description="Set your radio callsign (and Roblox name if it differs from your Discord name)",
     guild=DISPATCH_GUILD,
 )
-@discord.app_commands.describe(callsign="Your exact in-game callsign, e.g. 1S-32")
-async def link_command(interaction, callsign: str):
+@discord.app_commands.describe(
+    callsign="Your radio callsign, e.g. 1S-32",
+    roblox="Your Roblox username — only needed if it is different from your Discord name")
+async def link_command(interaction, callsign: str, roblox: str = ""):
     callsign = " ".join(callsign.split()).strip()
+    roblox = roblox.strip()
     if not callsign:
         await interaction.response.send_message("Give me your callsign, like 1S-32.", ephemeral=True)
         return
-    callsign_links[interaction.user.id] = callsign
-    print(f"{interaction.user} linked to callsign {callsign}", flush=True)
+    callsign_links[interaction.user.id] = {"callsign": callsign, "roblox": roblox}
+    print(f"{interaction.user} linked callsign {callsign} roblox '{roblox}'", flush=True)
+    extra = f", matching in-game name **{roblox}**" if roblox else " (matching by your Discord name)"
     await interaction.response.send_message(
-        f"You are linked to callsign **{callsign}**. When you call a traffic stop, "
-        f"dispatch will pull you back automatically if the subject flees.", ephemeral=True)
+        f"Linked. Callsign **{callsign}**{extra}. When you call a traffic stop, dispatch "
+        f"will pull you back automatically if the subject flees.", ephemeral=True)
 
 
 @command_tree.command(
@@ -802,25 +806,33 @@ def norm_callsign(cs):
     return re.sub(r"[^a-z0-9]", "", str(cs or "").lower())
 
 
-def extract_player_pos(player):
-    loc = player.get("Location") if isinstance(player.get("Location"), dict) else None
-    for kx, kz in (("X", "Z"), ("LocationX", "LocationZ")):
-        src = loc if loc is not None else player
-        x = src.get(kx)
-        z = src.get(kz)
-        if x is not None and z is not None:
+def _num(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
             try:
-                return (float(x), float(z))
+                return float(v)
             except (TypeError, ValueError):
                 return None
-    x = player.get("LocationX")
-    z = player.get("LocationZ")
-    if x is not None and z is not None:
-        try:
-            return (float(x), float(z))
-        except (TypeError, ValueError):
-            return None
     return None
+
+
+def extract_player_pos(player):
+    loc = player.get("Location") if isinstance(player.get("Location"), dict) else {}
+    x = _num(loc, "LocationX", "X")
+    z = _num(loc, "LocationZ", "Z")
+    if x is None:
+        x = _num(player, "LocationX", "X")
+    if z is None:
+        z = _num(player, "LocationZ", "Z")
+    if x is None or z is None:
+        return None
+    return (x, z)
+
+
+def extract_street(player):
+    loc = player.get("Location") if isinstance(player.get("Location"), dict) else {}
+    return (loc.get("StreetName") or player.get("StreetName") or "").strip()
 
 
 async def player_positions():
@@ -834,9 +846,12 @@ async def player_positions():
                 _players_debugged = True
                 print(f"players API sample: {players[0]}", flush=True)
             for p in players:
-                cs = norm_callsign(p.get("Callsign"))
-                if cs:
-                    out[cs] = (extract_player_pos(p), (p.get("StreetName") or "").strip())
+                info = (extract_player_pos(p), extract_street(p))
+                name = str(p.get("Player") or "").split(":")[0]
+                for ident in (name, p.get("Callsign")):
+                    k = norm_callsign(ident)
+                    if k:
+                        out[k] = info
     elif data is not None:
         print(f"players API returned unexpected shape: {str(data)[:200]}", flush=True)
     return out
@@ -862,21 +877,31 @@ async def start_traffic_stop(member):
     who = getattr(member, "display_name", "?")
     if not TRAFFIC_STOP_RETURN:
         return
-    cs = callsign_links.get(member.id)
-    if not cs:
-        print(f"{who} called a traffic stop but hasn't run /link — can't track them", flush=True)
-        return
-    key = norm_callsign(cs)
+    link = callsign_links.get(member.id) or {}
+    idents = []
+    if link.get("roblox"):
+        idents.append(link["roblox"])
+    for attr in ("name", "global_name", "display_name"):
+        v = getattr(member, attr, None)
+        if v:
+            idents.append(v)
+    if link.get("callsign"):
+        idents.append(link["callsign"])
     positions = await player_positions()
-    print(f"traffic stop: {who} as {cs} — API returned {len(positions)} players with callsigns", flush=True)
-    entry = positions.get(key)
-    if entry is None:
-        print(f"traffic stop: callsign '{cs}' not found in API. available: {sorted(positions.keys())}", flush=True)
-    elif entry[0] is None:
-        print(f"traffic stop: '{cs}' found but API gave no position (check field names)", flush=True)
-    pos = entry[0] if entry else None
-    active_stops[member.id] = {"callsign": cs, "member": member, "last": pos, "since": time.time()}
-    print(f"traffic stop started for {cs} at {pos}", flush=True)
+    key = None
+    for ident in idents:
+        nk = norm_callsign(ident)
+        if nk and nk in positions:
+            key = nk
+            break
+    radio_cs = link.get("callsign") or who
+    if key is None:
+        print(f"traffic stop: could not match {who} to an in-game player. "
+              f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
+        return
+    pos = positions[key][0]
+    active_stops[member.id] = {"key": key, "member": member, "last": pos, "since": time.time(), "callsign": radio_cs}
+    print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
 
 
 async def end_stop_pursuit(uid, stop, street):
@@ -901,7 +926,7 @@ async def stop_watch_loop():
                 if now - stop["since"] > STOP_MAX_SECONDS:
                     active_stops.pop(uid, None)
                     continue
-                entry = positions.get(norm_callsign(stop["callsign"]))
+                entry = positions.get(stop["key"])
                 if entry is None:
                     continue
                 pos, street = entry
