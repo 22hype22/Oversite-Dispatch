@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "duty-nick-2"
+BUILD = "duty-nick-3"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -1381,12 +1381,10 @@ async def sync_commands():
 async def on_voice_state_update(member, before, after):
     if not CALLSIGN_NICK or member.bot:
         return
-    before_rto = before.channel is not None and before.channel.id == VOICE_CHANNEL_ID
-    after_rto = after.channel is not None and after.channel.id == VOICE_CHANNEL_ID
-    if after_rto and not before_rto:
+    joined = after.channel is not None and (
+        before.channel is None or before.channel.id != after.channel.id)
+    if joined and member.id not in nick_original:
         await apply_duty_nick(member)
-    elif before_rto and not after_rto:
-        await revert_duty_nick(member)
 
 
 @client.event
