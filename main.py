@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "down-details-1"
+BUILD = "down-details-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -910,7 +910,7 @@ async def suspect_vehicle_near(officer_pos):
     global _veh_debugged
     data = await erlc_get("/server?Players=true&Vehicles=true")
     if not isinstance(data, dict) or officer_pos is None:
-        return ""
+        return "", ""
     players = data.get("Players") or []
     vehicles = data.get("Vehicles") or []
     if vehicles and not _veh_debugged:
@@ -928,14 +928,15 @@ async def suspect_vehicle_near(officer_pos):
         if best_d is None or d < best_d:
             best_d, nearest_name = d, str(p.get("Player") or "").split(":")[0]
     if not nearest_name or best_d is None or best_d > SUSPECT_RADIUS:
-        return ""
+        return "", ""
     nk = norm_callsign(nearest_name)
     for v in vehicles:
         if norm_callsign(str(v.get("Owner") or "")) == nk:
             texture = str(v.get("Texture") or "").strip()
             name = str(v.get("Name") or "").strip()
-            return " ".join(x for x in (texture, name) if x)
-    return ""
+            plate = str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or "").strip()
+            return " ".join(x for x in (texture, name) if x), plate
+    return "", ""
 
 
 async def player_positions():
@@ -1199,20 +1200,27 @@ async def officer_down_loop():
                         info = officer_last_seen.get(keyid)
                         if info:
                             cs, street, postal = info
-                            loc = street
-                            if postal:
-                                loc = f"{street}, postal {postal}" if street else f"postal {postal}"
-                            where = f", last known location {loc}" if loc else ""
-                            veh = ""
+                            veh, plate = "", ""
                             for s in active_stops.values():
                                 if s.get("key") == keyid and s.get("vehicle"):
-                                    veh = s["vehicle"]
+                                    veh, plate = s["vehicle"], s.get("plate", "")
                                     break
-                            extra = f" Suspect vehicle last described as a {veh}." if veh else ""
-                            await announce(
-                                f"All units, be advised, Unit {cs} is down{where}.{extra} "
-                                f"Any available unit, respond Code 3.",
-                                title="Officer Down", tone=True)
+                            parts = [f"All units, officer down, Unit {cs}."]
+                            where_bits = []
+                            if postal:
+                                where_bits.append(f"nearest postal {postal}")
+                            if street:
+                                where_bits.append(street)
+                            if where_bits:
+                                joined = ", ".join(where_bits)
+                                parts.append(joined[:1].upper() + joined[1:] + ".")
+                            if veh:
+                                line = f"Last known at a traffic stop with a {veh}"
+                                if plate:
+                                    line += f", license plate {plate}"
+                                parts.append(line + ".")
+                            parts.append("Any available unit, respond Code 3.")
+                            await announce(" ".join(parts), title="Officer Down", tone=True)
                             print(f"officer down: {cs}", flush=True)
                 players = data.get("Players")
                 if isinstance(players, list):
@@ -1273,9 +1281,10 @@ async def stop_watch_loop():
                     continue
                 if not stop.get("veh_done") and (now - stop["since"]) >= 8:
                     stop["veh_done"] = True
-                    desc = await suspect_vehicle_near(pos)
+                    desc, plate = await suspect_vehicle_near(pos)
                     if desc:
                         stop["vehicle"] = desc
+                        stop["plate"] = plate
                         print(f"stop {stop['callsign']}: suspect vehicle noted", flush=True)
                 if STATUS_CHECKS:
                     await maybe_status_check(uid, stop, pos, street, pname, now)
