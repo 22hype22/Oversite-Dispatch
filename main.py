@@ -61,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "callsign-match-1"
+BUILD = "roster-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -888,6 +888,30 @@ def wants_calls_holding(text):
     return any(t in low for t in triggers)
 
 
+def wants_roster(text):
+    low = _flat(text)
+    triggers = ("roster", "how many units", "units on patrol", "units on duty",
+                "on patrol", "current units", "how many on duty", "how many are on",
+                "units in service", "whos on patrol", "who is on patrol")
+    return any(t in low for t in triggers)
+
+
+async def read_roster(callsign=""):
+    data = await erlc_get("/server?Players=true")
+    units = []
+    if isinstance(data, dict) and isinstance(data.get("Players"), list):
+        for p in data["Players"]:
+            team = str(p.get("Team") or "").lower()
+            if any(t in team for t in CALL_TEAMS):
+                pname = str(p.get("Player") or "").split(":")[0]
+                units.append(str(p.get("Callsign") or "").strip() or pname)
+    ack = f"Unit {callsign}, " if callsign else ""
+    if not units:
+        return f"{ack}no units are currently on patrol."
+    word = "unit" if len(units) == 1 else "units"
+    return f"{ack}current roster, {len(units)} {word} on patrol. {', '.join(units[:12])}."
+
+
 def wants_clear_stop(text):
     low = _flat(text)
     triggers = ("clear", "concluded", "conclude", "done", "finished", "complete",
@@ -1568,6 +1592,9 @@ async def handle_utterance(member, pcm):
         else:
             ack = f"Unit {callsign}, " if callsign else ""
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
+        return
+    if wants_roster(text):
+        await announce(await read_roster(callsign), title="Roster")
         return
     if wants_status_board(text):
         await announce(read_status_board(callsign), title="Unit Status")
