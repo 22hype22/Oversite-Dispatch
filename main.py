@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "flee-speed-2"
+BUILD = "clear-stop-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -773,6 +773,14 @@ def wants_calls_holding(text):
     return any(t in low for t in triggers)
 
 
+def wants_clear_stop(text):
+    low = _flat(text)
+    triggers = ("clear", "concluded", "conclude", "done", "finished", "complete",
+                "wrapping up", "wrap up", "resuming patrol", "back in service",
+                "in service", "available", "10-8", "ten eight")
+    return any(t in low for t in triggers)
+
+
 def read_status_board(callsign=""):
     now = time.time()
     entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
@@ -917,6 +925,14 @@ async def start_traffic_stop(member, spoken_callsign=""):
     print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
 
 
+async def clear_traffic_stop(member, callsign=""):
+    active_stops.pop(member.id, None)
+    await move_member(member, VOICE_CHANNEL_ID)
+    print(f"traffic stop cleared for {getattr(member, 'display_name', '?')}", flush=True)
+    ack = f"Unit {callsign}, " if callsign else ""
+    await announce(f"{ack}10-4, showing you clear of the traffic stop.", title="Clear")
+
+
 async def end_stop_pursuit(uid, stop, street):
     active_stops.pop(uid, None)
     await move_member(stop["member"], VOICE_CHANNEL_ID)
@@ -1023,11 +1039,17 @@ async def handle_utterance(member, pcm):
         await announce(read_calls_holding(callsign), title="Calls Holding")
         return
     status = detect_status(text)
+    clearing = wants_clear_stop(text)
+    if clearing and member.id in active_stops:
+        await clear_traffic_stop(member, callsign)
+        if callsign:
+            status_board[callsign] = {"status": "10-8, in service", "time": time.time()}
+        return
     if status:
         if callsign:
             status_board[callsign] = {"status": status, "time": time.time()}
             print(f"status board: {callsign} -> {status}", flush=True)
-        if "traffic stop" in status:
+        if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
     if not status and not normalize_intent(text, callsign):
         ack = f"Unit {callsign}, " if callsign else ""
