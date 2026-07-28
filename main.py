@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "officer-down-2"
+BUILD = "down-details-1"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -96,6 +96,7 @@ STATUS_CHECK_MOVE = float(os.environ.get("STATUS_CHECK_MOVE", "8"))
 CALLSIGN_NICK = os.environ.get("CALLSIGN_NICK", "0").lower() not in ("0", "false", "no", "off")
 OFFICER_DOWN = os.environ.get("OFFICER_DOWN", "1").lower() not in ("0", "false", "no", "off")
 OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "4"))
+SUSPECT_RADIUS = float(os.environ.get("SUSPECT_RADIUS", "60"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 
@@ -129,6 +130,7 @@ officer_last_seen = {}
 _players_debugged = False
 _call_debugged = False
 _kill_debugged = False
+_veh_debugged = False
 IGNORE = object()
 
 
@@ -899,6 +901,43 @@ def extract_street(player):
     return (loc.get("StreetName") or player.get("StreetName") or "").strip()
 
 
+def extract_postal(player):
+    loc = player.get("Location") if isinstance(player.get("Location"), dict) else {}
+    return str(loc.get("PostalCode") or player.get("PostalCode") or "").strip()
+
+
+async def suspect_vehicle_near(officer_pos):
+    global _veh_debugged
+    data = await erlc_get("/server?Players=true&Vehicles=true")
+    if not isinstance(data, dict) or officer_pos is None:
+        return ""
+    players = data.get("Players") or []
+    vehicles = data.get("Vehicles") or []
+    if vehicles and not _veh_debugged:
+        _veh_debugged = True
+        print(f"vehicle sample: {vehicles[0]}", flush=True)
+    nearest_name, best_d = None, None
+    for p in players:
+        team = str(p.get("Team") or "").lower()
+        if any(t in team for t in CALL_TEAMS):
+            continue
+        pos = extract_player_pos(p)
+        if pos is None:
+            continue
+        d = ((pos[0] - officer_pos[0]) ** 2 + (pos[1] - officer_pos[1]) ** 2) ** 0.5
+        if best_d is None or d < best_d:
+            best_d, nearest_name = d, str(p.get("Player") or "").split(":")[0]
+    if not nearest_name or best_d is None or best_d > SUSPECT_RADIUS:
+        return ""
+    nk = norm_callsign(nearest_name)
+    for v in vehicles:
+        if norm_callsign(str(v.get("Owner") or "")) == nk:
+            texture = str(v.get("Texture") or "").strip()
+            name = str(v.get("Name") or "").strip()
+            return " ".join(x for x in (texture, name) if x)
+    return ""
+
+
 async def player_positions():
     global _players_debugged
     data = await erlc_get("/server?Players=true")
@@ -1113,6 +1152,11 @@ async def nick_watch_loop():
                             await set_duty_nick(m, on_duty[next(iter(match))])
                     for uid in list(nick_original.keys()):
                         member = guild.get_member(uid) if guild is not None else None
+                        if member is None and guild is not None:
+                            try:
+                                member = await guild.fetch_member(uid)
+                            except Exception:
+                                member = None
                         if member is None:
                             nick_original.pop(uid, None)
                             continue
@@ -1154,10 +1198,19 @@ async def officer_down_loop():
                         seen_kills.add(seen_key)
                         info = officer_last_seen.get(keyid)
                         if info:
-                            cs, street = info
-                            where = f", last known location {street}" if street else ""
+                            cs, street, postal = info
+                            loc = street
+                            if postal:
+                                loc = f"{street}, postal {postal}" if street else f"postal {postal}"
+                            where = f", last known location {loc}" if loc else ""
+                            veh = ""
+                            for s in active_stops.values():
+                                if s.get("key") == keyid and s.get("vehicle"):
+                                    veh = s["vehicle"]
+                                    break
+                            extra = f" Suspect vehicle last described as a {veh}." if veh else ""
                             await announce(
-                                f"All units, be advised, Unit {cs} is down{where}. "
+                                f"All units, be advised, Unit {cs} is down{where}.{extra} "
                                 f"Any available unit, respond Code 3.",
                                 title="Officer Down", tone=True)
                             print(f"officer down: {cs}", flush=True)
@@ -1170,7 +1223,7 @@ async def officer_down_loop():
                         if cs and any(t in team for t in CALL_TEAMS):
                             uname = norm_callsign(str(p.get("Player") or "").split(":")[0])
                             if uname:
-                                officer_last_seen[uname] = (cs, extract_street(p))
+                                officer_last_seen[uname] = (cs, extract_street(p), extract_postal(p))
         await asyncio.sleep(OFFICER_DOWN_POLL)
 
 
@@ -1218,6 +1271,12 @@ async def stop_watch_loop():
                 if FLEE_SPEED <= speed < 500:
                     await end_stop_pursuit(uid, stop, street)
                     continue
+                if not stop.get("veh_done") and (now - stop["since"]) >= 8:
+                    stop["veh_done"] = True
+                    desc = await suspect_vehicle_near(pos)
+                    if desc:
+                        stop["vehicle"] = desc
+                        print(f"stop {stop['callsign']}: suspect vehicle noted", flush=True)
                 if STATUS_CHECKS:
                     await maybe_status_check(uid, stop, pos, street, pname, now)
         await asyncio.sleep(STOP_POLL_SECONDS)
