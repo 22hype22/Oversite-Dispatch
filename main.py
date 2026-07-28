@@ -60,7 +60,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "flee-speed-1"
+BUILD = "flee-speed-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -87,7 +87,7 @@ MIN_UTTER_BYTES = int(os.environ.get("MIN_UTTERANCE_BYTES", "115200"))
 SILENCE_RMS = int(os.environ.get("SILENCE_RMS", "350"))
 TRAFFIC_STOP_RETURN = os.environ.get("TRAFFIC_STOP_RETURN", "1").lower() not in ("0", "false", "no", "off")
 FLEE_SPEED = float(os.environ.get("FLEE_SPEED", "35"))
-STOP_POLL_SECONDS = int(os.environ.get("STOP_POLL_SECONDS", "2"))
+STOP_POLL_SECONDS = float(os.environ.get("STOP_POLL_SECONDS", "1"))
 STOP_MAX_SECONDS = int(os.environ.get("STOP_MAX_SECONDS", "1800"))
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
@@ -266,9 +266,9 @@ async def erlc_get(path):
     try:
         async with http.get(f"{ERLC_V2_BASE}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
             if resp.status == 429:
-                retry = float(resp.headers.get("Retry-After", "5"))
+                retry = float(resp.headers.get("Retry-After", "3"))
                 print(f"erlc {path} -> 429 rate limited, waiting {retry}s", flush=True)
-                await asyncio.sleep(min(retry, 30))
+                await asyncio.sleep(min(retry, 10))
                 return None
             if resp.status != 200:
                 body = await resp.text()
@@ -1196,7 +1196,7 @@ async def dispatch_loop():
     print(f"dispatch loop started, polling emergency calls every {POLL_SECONDS}s", flush=True)
     while not client.is_closed():
         await poll_calls()
-        await asyncio.sleep(POLL_SECONDS)
+        await asyncio.sleep(max(POLL_SECONDS, 15) if active_stops else POLL_SECONDS)
 
 
 async def ensure_voice():
