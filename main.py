@@ -66,12 +66,16 @@ BUILD = "roster-1"
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 TOKEN = os.environ["DISCORD_TOKEN"]
-ERLC_KEY = os.environ["ERLC_SERVER_KEY"]
+ERLC_KEY = os.environ.get("ERLC_SERVER_KEY", "")
+BOT_ORDER_ID = os.environ.get("BOT_ORDER_ID", "")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 XI_KEY = os.environ["ELEVENLABS_API_KEY"]
 VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWW03F9")
 XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
-GUILD_ID = int(os.environ["DISPATCH_GUILD_ID"])
-VOICE_CHANNEL_ID = int(os.environ["DISPATCH_VOICE_CHANNEL_ID"])
+GUILD_ID = int(os.environ.get("DISPATCH_GUILD_ID", "0") or "0")
+VOICE_CHANNEL_ID = int(os.environ.get("DISPATCH_VOICE_CHANNEL_ID", "0") or "0")
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
@@ -294,7 +298,43 @@ def make_tone():
     return None
 
 
+async def fetch_bot_secret(key):
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_get_bot_secret"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID, "_key": key}
+    try:
+        async with http.post(url, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                return None
+            val = await resp.json()
+            return val.strip() if isinstance(val, str) and val.strip() else None
+    except Exception as exc:
+        print(f"config fetch failed for {key}: {exc}", flush=True)
+        return None
+
+
+async def refresh_runtime_config():
+    global ERLC_KEY, VOICE_CHANNEL_ID
+    key = await fetch_bot_secret("ERLC_SERVER_KEY")
+    if key:
+        ERLC_KEY = key
+    vc = await fetch_bot_secret("DISPATCH_VOICE_CHANNEL_ID")
+    if vc:
+        try:
+            VOICE_CHANNEL_ID = int(vc)
+        except ValueError:
+            pass
+
+
 async def erlc_get(path):
+    if not ERLC_KEY:
+        return None
     try:
         async with http.get(f"{ERLC_V2_BASE}{path}", headers={"Server-Key": ERLC_KEY}) as resp:
             if resp.status == 429:
@@ -1803,6 +1843,14 @@ async def poll_calls():
         await announce(line, tone=is_priority(call))
 
 
+async def config_refresh_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(60)
+        await refresh_runtime_config()
+        await ensure_voice()
+
+
 async def dispatch_loop():
     await client.wait_until_ready()
     print(f"dispatch loop started, polling emergency calls every {POLL_SECONDS}s", flush=True)
@@ -1813,13 +1861,13 @@ async def dispatch_loop():
 
 async def ensure_voice():
     global voice_client
-    guild = client.get_guild(GUILD_ID)
+    guild = client.get_guild(GUILD_ID) if GUILD_ID else (client.guilds[0] if client.guilds else None)
     if guild is None:
-        print("dispatch guild not found — check DISPATCH_GUILD_ID", flush=True)
+        print("no server yet — add the dispatch bot to your Discord server", flush=True)
         return False
-    channel = guild.get_channel(VOICE_CHANNEL_ID)
+    channel = guild.get_channel(VOICE_CHANNEL_ID) if VOICE_CHANNEL_ID else None
     if channel is None:
-        print("voice channel not found — check DISPATCH_VOICE_CHANNEL_ID", flush=True)
+        print("no voice channel set yet — pick one on the dashboard", flush=True)
         return False
     existing = guild.voice_client
     if existing is not None:
@@ -1901,6 +1949,7 @@ async def on_ready():
     global http, tone_path
     if http is None:
         http = aiohttp.ClientSession()
+    await refresh_runtime_config()
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
     print(f"region: {DISPATCH_REGION}", flush=True)
@@ -1936,6 +1985,7 @@ async def on_ready():
     client.loop.create_task(stop_watch_loop())
     client.loop.create_task(nick_watch_loop())
     client.loop.create_task(officer_down_loop())
+    client.loop.create_task(config_refresh_loop())
 
 
 client.run(TOKEN)
