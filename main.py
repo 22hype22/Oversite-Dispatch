@@ -1932,6 +1932,30 @@ async def config_refresh_loop():
         await ensure_voice()
 
 
+async def voice_channel_watch_loop():
+    """Near-instant channel switching. Polls only the cheap tokenless voice
+    RPC every few seconds and moves the bot the moment the dashboard value
+    changes — so picking a channel takes effect in seconds, not up to a
+    minute. Acts only on an actual change, so it never causes reconnect churn.
+    """
+    global VOICE_CHANNEL_ID
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(3)
+        vc = await fetch_dispatch_voice_channel()
+        if not vc:
+            continue
+        try:
+            new_id = int(vc)
+        except ValueError:
+            continue
+        if new_id and new_id != VOICE_CHANNEL_ID:
+            print(f"dashboard changed voice channel {VOICE_CHANNEL_ID} -> {new_id}, switching",
+                  flush=True)
+            VOICE_CHANNEL_ID = new_id
+            await ensure_voice()
+
+
 async def dispatch_loop():
     await client.wait_until_ready()
     print(f"dispatch loop started, polling emergency calls every {POLL_SECONDS}s", flush=True)
@@ -2076,6 +2100,7 @@ async def on_ready():
     client.loop.create_task(nick_watch_loop())
     client.loop.create_task(officer_down_loop())
     client.loop.create_task(config_refresh_loop())
+    client.loop.create_task(voice_channel_watch_loop())
 
 
 client.run(TOKEN)
