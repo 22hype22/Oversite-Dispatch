@@ -325,11 +325,13 @@ async def refresh_runtime_config():
     if key:
         ERLC_KEY = key
     vc = await fetch_bot_secret("DISPATCH_VOICE_CHANNEL_ID")
+    print(f"config refresh: ERLC_KEY={'set' if ERLC_KEY else 'MISSING'} "
+          f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}", flush=True)
     if vc:
         try:
             VOICE_CHANNEL_ID = int(vc)
         except ValueError:
-            pass
+            print(f"could not parse voice channel id: {vc!r}", flush=True)
 
 
 async def erlc_get(path):
