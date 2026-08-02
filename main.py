@@ -1348,6 +1348,11 @@ async def player_positions():
                         out[k] = info
     elif data is not None:
         print(f"players API returned unexpected shape: {str(data)[:200]}", flush=True)
+    if not out:
+        # Nothing to match against — surface why: no key, API failure, wrong
+        # data shape, or genuinely nobody in-game.
+        print(f"player_positions EMPTY: ERLC_KEY={'set' if ERLC_KEY else 'MISSING'} "
+              f"raw={str(data)[:220]!r}", flush=True)
     return out
 
 
@@ -1430,7 +1435,9 @@ async def start_traffic_stop(member, spoken_callsign=""):
     radio_cs = link.get("callsign") or spoken_callsign or clean_name(who)
     if key is None:
         print(f"traffic stop: could not match {who} to an in-game player. "
-              f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
+              f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)} "
+              f"(ERLC_KEY={'set' if ERLC_KEY else 'MISSING'}, "
+              f"players_returned={len(positions)})", flush=True)
         return
     entry = positions[key]
     pos = entry[0]
