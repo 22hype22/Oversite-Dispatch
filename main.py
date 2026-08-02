@@ -1237,6 +1237,49 @@ def clean_name(name):
     return cleaned or str(name or "").strip()
 
 
+def name_match_keys(member):
+    """Ordered normalized identifiers to try against in-game player names.
+
+    People decorate their Discord name with tags — "(Don't Ping) 22HYPE22",
+    "D 22HYPE22", "[PD] 22Hype22" — so a whole-string match misses. We also
+    match each individual word (>=3 chars), longest first, so the distinctive
+    username still resolves to the in-game player. Link data and whole-string
+    matches are tried before word tokens to avoid a short common word (e.g.
+    "ping") winning over the real name.
+    """
+    link = callsign_links.get(member.id) or {}
+    raw = []
+    if link.get("roblox"):
+        raw.append(str(link["roblox"]))
+    if link.get("callsign"):
+        raw.append(str(link["callsign"]))
+    for attr in ("name", "global_name", "display_name"):
+        v = getattr(member, attr, None)
+        if v:
+            raw.append(str(v))
+
+    out, seen = [], set()
+
+    def add(s):
+        nk = norm_callsign(s)
+        if nk and nk not in seen:
+            seen.add(nk)
+            out.append(nk)
+
+    tokens = []
+    for r in raw:
+        add(r)               # whole string
+        add(clean_name(r))   # with (…) / […] tags stripped
+        for tok in re.split(r"[^A-Za-z0-9]+", r):
+            if len(tok) >= 3:
+                tokens.append(tok)
+    # Word tokens after the whole-string candidates, longest (most distinctive)
+    # first.
+    for tok in sorted(set(tokens), key=len, reverse=True):
+        add(tok)
+    return out
+
+
 def save_links():
     try:
         with open(LINK_FILE, "w") as handle:
@@ -1416,26 +1459,13 @@ async def start_traffic_stop(member, spoken_callsign=""):
     if not TRAFFIC_STOP_RETURN:
         return
     link = callsign_links.get(member.id) or {}
-    idents = []
-    if link.get("roblox"):
-        idents.append(link["roblox"])
-    for attr in ("name", "global_name", "display_name"):
-        v = getattr(member, attr, None)
-        if v:
-            idents.append(v)
-    if link.get("callsign"):
-        idents.append(link["callsign"])
     positions = await player_positions()
-    key = None
-    for ident in idents:
-        nk = norm_callsign(ident)
-        if nk and nk in positions:
-            key = nk
-            break
+    candidates = name_match_keys(member)
+    key = next((c for c in candidates if c in positions), None)
     radio_cs = link.get("callsign") or spoken_callsign or clean_name(who)
     if key is None:
         print(f"traffic stop: could not match {who} to an in-game player. "
-              f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)} "
+              f"tried {candidates}, available {sorted(positions)} "
               f"(ERLC_KEY={'set' if ERLC_KEY else 'MISSING'}, "
               f"players_returned={len(positions)})", flush=True)
         return
@@ -1576,15 +1606,8 @@ async def maybe_label_stop_for_member(member, postal=""):
 
 
 def duty_idents(member):
-    link = callsign_links.get(member.id) or {}
-    idents = []
-    if link.get("roblox"):
-        idents.append(link["roblox"])
-    for attr in ("name", "global_name", "display_name"):
-        v = getattr(member, attr, None)
-        if v:
-            idents.append(v)
-    return {norm_callsign(i) for i in idents if i}
+    # Includes word-token candidates so tagged Discord names still match.
+    return set(name_match_keys(member))
 
 
 async def get_ingame_callsign(member):
