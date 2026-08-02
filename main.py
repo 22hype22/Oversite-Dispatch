@@ -636,6 +636,12 @@ def build_dispatch_system(region):
         "update, ONLY acknowledge the action. For example, if a unit says they are "
         "attaching to a call, reply exactly like 'copy, show you attached and en route' "
         "and nothing more. Do not mention what the call is about.\n"
+        "- A traffic stop or self-initiated stop is DIFFERENT from attaching to a call: "
+        "when a unit calls one out and states their OWN location and/or a vehicle "
+        "description, briefly acknowledge it back, for example 'copy, show you out with "
+        "the black SUV on Highway 55, advise if you need backup'. NEVER ask a unit to "
+        "advise a plate, location, or description they have already given. Only ask for "
+        "a plate or location when the unit gave none at all.\n"
         "- You CAN run plates, names, and people when a unit asks for a records check. "
         "There is no real database, so you invent a realistic return and read it back like "
         "a real dispatcher would, staying fully in character — never say you cannot run it, "
@@ -905,18 +911,46 @@ def fallback_reply(key):
     return None
 
 
+# Strong signals that a unit already gave a location and/or a vehicle
+# description in their transmission, so dispatch shouldn't ask for it again.
+_STOP_LOCATION_RE = re.compile(
+    r"\b(highway|hwy|freeway|interstate|route|boulevard|blvd|avenue|ave|"
+    r"street|road|lane|parkway|pkwy|drive|court|exit|intersection|block|"
+    r"postal|mile\s*marker|north\s*bound|south\s*bound|east\s*bound|west\s*bound)\b",
+    re.I)
+_STOP_VEHICLE_RE = re.compile(
+    r"\b(black|white|red|blue|silver|gray|grey|green|yellow|orange|brown|tan|"
+    r"gold|maroon|purple|suv|sedan|truck|pickup|van|coupe|hatchback|motorcycle|"
+    r"jeep|convertible|plate|license)\b",
+    re.I)
+
+
+def has_stop_details(text):
+    t = str(text or "")
+    return bool(_STOP_LOCATION_RE.search(t) or _STOP_VEHICLE_RE.search(t))
+
+
 async def dispatch_reply_body(text, callsign):
     key = normalize_intent(text, callsign)
-    fb = fallback_reply(key)
-    if fb:
-        if LOG_HEARD:
-            print(f"using built-in reply for '{key}' (no api call)", flush=True)
-        return fb
-    hit = match_cached_intent(key)
-    if hit and len(response_cache[hit]) >= AI_CACHE_VARIANTS:
-        if LOG_HEARD:
-            print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
-        return random.choice(response_cache[hit])
+    # A traffic stop where the unit already stated a location and/or vehicle:
+    # don't fire the canned "advise plate and location" — let the AI reply
+    # acknowledge what they said instead of re-asking for it.
+    detailed_stop = bool(key) and "traffic stop" in key and has_stop_details(text)
+
+    if not detailed_stop:
+        fb = fallback_reply(key)
+        if fb:
+            if LOG_HEARD:
+                print(f"using built-in reply for '{key}' (no api call)", flush=True)
+            return fb
+        hit = match_cached_intent(key)
+        if hit and len(response_cache[hit]) >= AI_CACHE_VARIANTS:
+            if LOG_HEARD:
+                print(f"reusing saved reply for '{hit}' (no api call)", flush=True)
+            return random.choice(response_cache[hit])
+    else:
+        hit = None
+
     body = await dispatch_ai_reply(text, callsign)
     if body:
         if body.strip().strip(".!").upper() == "IGNORE":
@@ -927,6 +961,9 @@ async def dispatch_reply_body(text, callsign):
         if LOG_HEARD:
             print(f"saved reply for '{hit or key}' ({len(store)} variant(s))", flush=True)
         return body
+    # AI unavailable but the unit gave details — acknowledge without re-asking.
+    if detailed_stop:
+        return "copy, show you out on the traffic stop, advise if you need backup"
     return None
 
 
