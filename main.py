@@ -1875,14 +1875,23 @@ async def dispatch_loop():
 
 async def ensure_voice():
     global voice_client
-    guild = client.get_guild(GUILD_ID) if GUILD_ID else (client.guilds[0] if client.guilds else None)
-    if guild is None:
+    if not client.guilds:
         print("no server yet — add the dispatch bot to your Discord server", flush=True)
         return False
-    channel = guild.get_channel(VOICE_CHANNEL_ID) if VOICE_CHANNEL_ID else None
-    if channel is None:
+    if not VOICE_CHANNEL_ID:
         print("no voice channel set yet — pick one on the dashboard", flush=True)
         return False
+    # Find the channel across every server the bot is in, so the dashboard's
+    # channel pick works regardless of which guild it belongs to (and even if
+    # a single guild's cache is cold). Fall back to the configured guild.
+    channel = client.get_channel(VOICE_CHANNEL_ID)
+    if channel is None:
+        guild = client.get_guild(GUILD_ID) if GUILD_ID else client.guilds[0]
+        channel = guild.get_channel(VOICE_CHANNEL_ID) if guild else None
+    if channel is None:
+        print(f"voice channel {VOICE_CHANNEL_ID} not found in any server yet", flush=True)
+        return False
+    guild = channel.guild
     existing = guild.voice_client
     if existing is not None:
         voice_client = existing
