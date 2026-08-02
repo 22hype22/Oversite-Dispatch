@@ -354,6 +354,8 @@ async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
     _key_fingerprint("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
     _key_fingerprint("SUPABASE_URL", SUPABASE_URL)
+    _key_fingerprint("WORKER_TOKEN", WORKER_TOKEN)
+    _key_fingerprint("BOT_ORDER_ID", BOT_ORDER_ID)
     key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
