@@ -109,6 +109,11 @@ LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no",
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "1800"))
+# When an officer calls a traffic stop while sitting in a "Traffic Stop"-style
+# voice channel, prepend the nearest postal code to that channel's name, then
+# restore the original name once the stop ends / everyone leaves. Needs the
+# Manage Channels permission.
+TS_CHANNEL_LABELS = os.environ.get("TS_CHANNEL_LABELS", "1").lower() not in ("0", "false", "no", "off")
 
 VOICE_CMD_ENABLED = VOICE_COMMANDS and VOICE_RECV_AVAILABLE and OPUS_OK
 
@@ -135,6 +140,8 @@ open_calls = {}
 callsign_links = {}
 active_stops = {}
 nick_original = {}
+# channel_id -> original name, for voice channels currently postal-labelled
+stop_channel_original = {}
 bolos = []
 seen_kills = set()
 officer_last_seen = {}
@@ -1231,7 +1238,7 @@ async def player_positions():
                 print(f"players API sample: {players[0]}", flush=True)
             for p in players:
                 name = str(p.get("Player") or "").split(":")[0]
-                info = (extract_player_pos(p), extract_street(p), name)
+                info = (extract_player_pos(p), extract_street(p), name, extract_postal(p))
                 for ident in (name, p.get("Callsign")):
                     k = norm_callsign(ident)
                     if k:
@@ -1322,11 +1329,15 @@ async def start_traffic_stop(member, spoken_callsign=""):
         print(f"traffic stop: could not match {who} to an in-game player. "
               f"tried {[norm_callsign(i) for i in idents]}, available {sorted(positions)}", flush=True)
         return
-    pos = positions[key][0]
+    entry = positions[key]
+    pos = entry[0]
+    postal = entry[3] if len(entry) > 3 else ""
     now = time.time()
     active_stops[member.id] = {"key": key, "member": member, "last": pos, "last_time": now,
-                               "since": now, "callsign": radio_cs}
+                               "since": now, "callsign": radio_cs, "postal": postal}
     print(f"traffic stop started: {who} matched '{key}' at {pos}", flush=True)
+    # If they're already sitting in a Traffic Stop-style VC, label it now.
+    await maybe_label_stop_for_member(member, postal)
 
 
 async def assign_backup(member, spoken_callsign):
@@ -1366,10 +1377,92 @@ async def assign_backup(member, spoken_callsign):
 
 async def clear_traffic_stop(member, callsign=""):
     active_stops.pop(member.id, None)
+    prev = member.voice.channel if getattr(member, "voice", None) else None
     await move_member(member, VOICE_CHANNEL_ID)
+    # Moving the officer out fires on_voice_state_update which restores the
+    # label when the channel empties; restore here too in case they were the
+    # last one and the move already left it empty.
+    if prev is not None and prev.id in stop_channel_original and not channel_humans(prev):
+        await restore_stop_channel(prev)
     print(f"traffic stop cleared for {getattr(member, 'display_name', '?')}", flush=True)
     ack = f"Unit {callsign}, " if callsign else ""
     await announce(f"{ack}10-4, showing you clear of the traffic stop.", title="Clear")
+
+
+# ── Traffic-stop voice-channel postal labels ────────────────────────────────
+# Match channels that look like a traffic-stop VC: "Traffic Stop 1", "TS 2",
+# "T/S", "Vehicle Stop", etc. Emoji and separators (・ | - _ .) are ignored.
+_TS_NAME_RE = re.compile(r"\btraffic\b|\bvehicle stop\b|\bts\b|\bt s\b|\btstop\b")
+
+
+def is_traffic_stop_channel(name):
+    if not name:
+        return False
+    n = str(name).lower()
+    n = re.sub(r"[・|_\-–—.:/]+", " ", n)         # separators (incl. /) -> spaces
+    n = re.sub(r"[^\w ]+", " ", n)               # drop emoji/symbols
+    n = re.sub(r"\s+", " ", n).strip()
+    return bool(_TS_NAME_RE.search(n))
+
+
+def channel_humans(channel):
+    return [m for m in getattr(channel, "members", []) if not getattr(m, "bot", False)]
+
+
+async def officer_postal(member):
+    positions = await player_positions()
+    for ident in duty_idents(member):
+        entry = positions.get(ident)
+        if entry and len(entry) > 3 and entry[3]:
+            return entry[3]
+    return ""
+
+
+async def label_stop_channel(channel, postal):
+    if channel is None or not postal or not TS_CHANNEL_LABELS:
+        return
+    if channel.id in stop_channel_original:
+        return  # already labelled — don't stack a second postal
+    original = channel.name
+    new_name = f"[{postal}] {original}"[:100]
+    stop_channel_original[channel.id] = original
+    try:
+        await channel.edit(name=new_name, reason="Traffic stop — nearest postal")
+        print(f"stop channel labelled: '{original}' -> '{new_name}'", flush=True)
+    except discord.Forbidden:
+        stop_channel_original.pop(channel.id, None)
+        print("cannot rename stop channel — bot is missing the Manage Channels permission",
+              flush=True)
+    except Exception as exc:
+        stop_channel_original.pop(channel.id, None)
+        print(f"stop channel rename failed: {exc}", flush=True)
+
+
+async def restore_stop_channel(channel):
+    if channel is None:
+        return
+    original = stop_channel_original.pop(channel.id, None)
+    if original is None:
+        return
+    try:
+        await channel.edit(name=original, reason="Traffic stop ended")
+        print(f"stop channel restored -> '{original}'", flush=True)
+    except Exception as exc:
+        stop_channel_original[channel.id] = original  # keep for a later retry
+        print(f"stop channel restore failed: {exc}", flush=True)
+
+
+async def maybe_label_stop_for_member(member, postal=""):
+    if not TS_CHANNEL_LABELS:
+        return
+    vs = getattr(member, "voice", None)
+    ch = vs.channel if vs else None
+    if ch is None or not is_traffic_stop_channel(ch.name):
+        return
+    if not postal:
+        postal = await officer_postal(member)
+    if postal:
+        await label_stop_channel(ch, postal)
 
 
 def duty_idents(member):
@@ -1576,7 +1669,7 @@ async def stop_watch_loop():
                 entry = positions.get(stop["key"])
                 if entry is None:
                     continue
-                pos, street, pname = entry
+                pos, street, pname = entry[0], entry[1], entry[2]
                 if pos is None:
                     continue
                 last = stop.get("last")
@@ -2051,12 +2144,25 @@ async def sync_commands():
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    if not CALLSIGN_NICK or member.bot:
+    if member.bot:
         return
     joined = after.channel is not None and (
         before.channel is None or before.channel.id != after.channel.id)
-    if joined and member.id not in nick_original:
+    left = before.channel is not None and (
+        after.channel is None or after.channel.id != before.channel.id)
+
+    if CALLSIGN_NICK and joined and member.id not in nick_original:
         await apply_duty_nick(member)
+
+    if TS_CHANNEL_LABELS:
+        # Officer who has an active stop joins a Traffic Stop VC → label it.
+        if joined and member.id in active_stops and is_traffic_stop_channel(after.channel.name):
+            postal = active_stops[member.id].get("postal") or await officer_postal(member)
+            if postal:
+                await label_stop_channel(after.channel, postal)
+        # Last person leaves a labelled VC → restore its original name.
+        if left and before.channel.id in stop_channel_original and not channel_humans(before.channel):
+            await restore_stop_channel(before.channel)
 
 
 @client.event
@@ -2093,6 +2199,8 @@ async def on_ready():
         print("officer-down detection: ON (auto-alerts when an on-duty unit is killed in game)", flush=True)
     if CALLSIGN_NICK:
         print("on-duty callsign nicknames: ON (needs Manage Nicknames perm; cannot rename the server owner)", flush=True)
+    if TS_CHANNEL_LABELS:
+        print("traffic-stop VC labels: ON (prepends nearest postal to Traffic Stop channels; needs Manage Channels perm)", flush=True)
     await ensure_voice()
     client.loop.create_task(playback_worker())
     client.loop.create_task(dispatch_loop())
