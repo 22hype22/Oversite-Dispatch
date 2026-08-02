@@ -1477,18 +1477,32 @@ def pick_nearest(call, units):
 
 
 async def move_member(member, channel_id):
-    if not channel_id or member is None or member.voice is None:
+    who = getattr(member, "display_name", "?") if member is not None else "?"
+    if not channel_id:
+        print(f"move skipped: no dispatch voice channel set (VOICE_CHANNEL_ID=0) — "
+              f"pick one on the dashboard; can't pull {who} back", flush=True)
+        return False
+    if member is None:
+        return False
+    if member.voice is None:
+        print(f"move skipped: {who} isn't connected to a Discord voice channel — "
+              f"Discord can only move someone who's already in voice, so there's "
+              f"nothing to drag back", flush=True)
         return False
     if member.voice.channel is not None and member.voice.channel.id == channel_id:
         return True
     channel = member.guild.get_channel(channel_id)
     if channel is None:
+        print(f"move skipped: dispatch voice channel {channel_id} not found in this "
+              f"server — is the bot in the right guild and the channel still there?", flush=True)
         return False
     try:
         await member.move_to(channel)
+        print(f"pulled {who} back to the dispatch voice channel", flush=True)
         return True
     except Exception as exc:
-        print(f"could not move {getattr(member, 'display_name', '?')}: {exc}", flush=True)
+        print(f"could not move {who}: {exc} — does the bot have the "
+              f"Move Members permission on the dispatch voice channel?", flush=True)
         return False
 
 
