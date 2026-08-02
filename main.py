@@ -142,6 +142,65 @@ active_stops = {}
 nick_original = {}
 # channel_id -> original name, for voice channels currently postal-labelled
 stop_channel_original = {}
+# Discord limits channel NAME edits to 2 per 10 minutes PER channel. A single
+# stop already spends both (one to label, one to restore), so a second stop in
+# the SAME VC within 10 min can't be renamed — discord.py silently blocks for
+# minutes waiting the limit out, which looks like "it just didn't work". We
+# track our own budget and skip (non-blocking) when it's used up, and we defer
+# the restore by a grace period so a quick follow-up stop in the same channel
+# cancels it and reuses the existing label instead of churning renames.
+_rename_history = {}          # channel_id -> [unix timestamps of our renames]
+_pending_restores = {}        # channel_id -> asyncio.Task (deferred restore)
+RENAME_LIMIT = 2
+RENAME_WINDOW = 600.0         # Discord's 2-per-10-min name-edit window
+RESTORE_GRACE = 90.0          # wait this long after a stop clears before reverting
+
+
+def _rename_budget_left(channel_id):
+    now = time.time()
+    hist = [t for t in _rename_history.get(channel_id, []) if now - t < RENAME_WINDOW]
+    _rename_history[channel_id] = hist
+    return RENAME_LIMIT - len(hist)
+
+
+def _record_rename(channel_id):
+    _rename_history.setdefault(channel_id, []).append(time.time())
+
+
+def _seconds_until_budget(channel_id):
+    now = time.time()
+    hist = sorted(t for t in _rename_history.get(channel_id, []) if now - t < RENAME_WINDOW)
+    if len(hist) < RENAME_LIMIT:
+        return 0.0
+    return max(0.0, RENAME_WINDOW - (now - hist[0]) + 1.0)
+
+
+def _cancel_pending_restore(channel_id):
+    task = _pending_restores.pop(channel_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def schedule_restore(channel, delay=RESTORE_GRACE):
+    # Revert a labelled channel's name after `delay` seconds, unless a new stop
+    # in the same channel cancels it first (see label_stop_channel). Guarantees
+    # the name always changes back once the stop concludes, without racing the
+    # rename limit.
+    if channel is None or channel.id not in stop_channel_original:
+        return
+    _cancel_pending_restore(channel.id)
+
+    async def _run():
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        _pending_restores.pop(channel.id, None)
+        # Only revert if it's still labelled and nobody's using it.
+        if channel.id in stop_channel_original and not channel_humans(channel):
+            await restore_stop_channel(channel)
+
+    _pending_restores[channel.id] = client.loop.create_task(_run())
 # last-applied dashboard profile, so we only push actual changes
 _last_presence = None
 _last_bio = None
@@ -1575,7 +1634,7 @@ async def clear_traffic_stop(member, callsign=""):
     # label when the channel empties; restore here too in case they were the
     # last one and the move already left it empty.
     if prev is not None and prev.id in stop_channel_original and not channel_humans(prev):
-        await restore_stop_channel(prev)
+        schedule_restore(prev)
     print(f"traffic stop cleared for {getattr(member, 'display_name', '?')}", flush=True)
     ack = f"Unit {callsign}, " if callsign else ""
     await announce(f"{ack}10-4, showing you clear of the traffic stop.", title="Clear")
@@ -1613,13 +1672,24 @@ async def officer_postal(member):
 async def label_stop_channel(channel, postal):
     if channel is None or not postal or not TS_CHANNEL_LABELS:
         return
+    # A follow-up stop in this channel: cancel any pending revert so we reuse the
+    # existing label instead of spending a restore + a relabel (which would blow
+    # the 2-renames-per-10-min budget).
+    _cancel_pending_restore(channel.id)
     if channel.id in stop_channel_original:
-        return  # already labelled — don't stack a second postal
+        return  # already labelled — reuse it, don't stack a second postal
+    if _rename_budget_left(channel.id) <= 0:
+        wait = int(_seconds_until_budget(channel.id))
+        print(f"stop channel label skipped: Discord's 2-renames-per-10-min limit for "
+              f"'{channel.name}' is used up (back-to-back stops in the same VC); it can "
+              f"label again in ~{wait}s", flush=True)
+        return
     original = channel.name
     new_name = f"[{postal}] {original}"[:100]
     stop_channel_original[channel.id] = original
     try:
         await channel.edit(name=new_name, reason="Traffic stop — nearest postal")
+        _record_rename(channel.id)
         print(f"stop channel labelled: '{original}' -> '{new_name}'", flush=True)
     except discord.Forbidden:
         stop_channel_original.pop(channel.id, None)
@@ -1631,13 +1701,23 @@ async def label_stop_channel(channel, postal):
 
 
 async def restore_stop_channel(channel):
-    if channel is None:
+    if channel is None or channel.id not in stop_channel_original:
+        return
+    # If we'd exceed Discord's name-edit limit, don't call edit() — it would
+    # block for minutes. Defer until the window frees up; the name still reverts,
+    # just a little later.
+    if _rename_budget_left(channel.id) <= 0:
+        wait = _seconds_until_budget(channel.id)
+        print(f"stop channel restore deferred ~{int(wait)}s: rename budget for "
+              f"'{channel.name}' is used up", flush=True)
+        schedule_restore(channel, delay=wait)
         return
     original = stop_channel_original.pop(channel.id, None)
     if original is None:
         return
     try:
         await channel.edit(name=original, reason="Traffic stop ended")
+        _record_rename(channel.id)
         print(f"stop channel restored -> '{original}'", flush=True)
     except Exception as exc:
         stop_channel_original[channel.id] = original  # keep for a later retry
@@ -2345,9 +2425,10 @@ async def on_voice_state_update(member, before, after):
             postal = active_stops[member.id].get("postal") or await officer_postal(member)
             if postal:
                 await label_stop_channel(after.channel, postal)
-        # Last person leaves a labelled VC → restore its original name.
+        # Last person leaves a labelled VC → revert its name (after the grace
+        # window, so a quick re-stop in the same VC reuses the label).
         if left and before.channel.id in stop_channel_original and not channel_humans(before.channel):
-            await restore_stop_channel(before.channel)
+            schedule_restore(before.channel)
 
 
 @client.event
