@@ -496,6 +496,7 @@ async def identity_watch_loop():
 
 async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
+    _key_fingerprint("WORKER_TOKEN", WORKER_TOKEN)
     key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
