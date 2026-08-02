@@ -298,8 +298,17 @@ def make_tone():
     return None
 
 
-async def fetch_bot_secret(key):
+async def fetch_bot_secret(key, diag=False):
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        if diag:
+            print(
+                f"secret[{key}]: prerequisites missing "
+                f"SUPABASE_URL={'y' if SUPABASE_URL else 'n'} "
+                f"ANON_KEY={'y' if SUPABASE_ANON_KEY else 'n'} "
+                f"WORKER_TOKEN={'y' if WORKER_TOKEN else 'n'} "
+                f"BOT_ORDER_ID={BOT_ORDER_ID!r}",
+                flush=True,
+            )
         return None
     url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_get_bot_secret"
     headers = {
@@ -310,9 +319,19 @@ async def fetch_bot_secret(key):
     body = {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID, "_key": key}
     try:
         async with http.post(url, headers=headers, json=body) as resp:
+            raw = await resp.text()
+            if diag:
+                print(
+                    f"secret[{key}]: bot_id={BOT_ORDER_ID!r} "
+                    f"HTTP {resp.status} body={raw[:200]!r}",
+                    flush=True,
+                )
             if resp.status != 200:
                 return None
-            val = await resp.json()
+            try:
+                val = json.loads(raw)
+            except Exception:
+                val = raw
             return val.strip() if isinstance(val, str) and val.strip() else None
     except Exception as exc:
         print(f"config fetch failed for {key}: {exc}", flush=True)
@@ -321,11 +340,11 @@ async def fetch_bot_secret(key):
 
 async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
-    key = await fetch_bot_secret("ERLC_SERVER_KEY")
+    key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
-    vc = await fetch_bot_secret("DISPATCH_VOICE_CHANNEL_ID")
-    print(f"config refresh: ERLC_KEY={'set' if ERLC_KEY else 'MISSING'} "
+    vc = await fetch_bot_secret("DISPATCH_VOICE_CHANNEL_ID", diag=True)
+    print(f"config refresh: ERLC_secret={'read' if key else 'None'} "
           f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}", flush=True)
     if vc:
         try:
