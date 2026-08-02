@@ -496,7 +496,7 @@ async def identity_watch_loop():
 
 async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
-    key = await fetch_bot_secret("ERLC_SERVER_KEY")
+    key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
     vc = await fetch_dispatch_voice_channel(diag=True)
