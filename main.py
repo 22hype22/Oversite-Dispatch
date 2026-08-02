@@ -142,6 +142,9 @@ active_stops = {}
 nick_original = {}
 # channel_id -> original name, for voice channels currently postal-labelled
 stop_channel_original = {}
+# last-applied dashboard profile, so we only push actual changes
+_last_presence = None
+_last_bio = None
 bolos = []
 seen_kills = set()
 officer_last_seen = {}
@@ -389,6 +392,106 @@ async def fetch_dispatch_voice_channel(diag=False):
     except Exception as exc:
         print(f"voice-channel read failed: {exc}", flush=True)
         return None
+
+
+async def fetch_dispatch_presence():
+    """Read the dashboard-chosen status, status message and About Me (all
+    public profile fields) using only the anon key — same tokenless pattern as
+    the voice channel. Returns a dict or None."""
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and BOT_ORDER_ID and http):
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_get_dispatch_presence"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with http.post(url, headers=headers, json={"_bot_id": BOT_ORDER_ID}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return data if isinstance(data, dict) else None
+    except Exception as exc:
+        print(f"presence read failed: {exc}", flush=True)
+        return None
+
+
+_STATUS_MAP = {
+    "online": discord.Status.online,
+    "idle": discord.Status.idle,
+    "dnd": discord.Status.dnd,
+    "do_not_disturb": discord.Status.dnd,
+    "invisible": discord.Status.invisible,
+    "offline": discord.Status.invisible,
+}
+_ACTIVITY_MAP = {
+    "playing": discord.ActivityType.playing,
+    "watching": discord.ActivityType.watching,
+    "listening": discord.ActivityType.listening,
+    "competing": discord.ActivityType.competing,
+    "streaming": discord.ActivityType.streaming,
+}
+
+
+async def apply_presence(presence, act_type, act_text):
+    status = _STATUS_MAP.get(str(presence or "online").lower().replace(" ", "_"),
+                             discord.Status.online)
+    text = str(act_text or "").strip()
+    activity = None
+    if text:
+        at = str(act_type or "playing").lower()
+        if at == "custom":
+            activity = discord.CustomActivity(name=text)
+        else:
+            activity = discord.Activity(type=_ACTIVITY_MAP.get(at, discord.ActivityType.playing),
+                                        name=text)
+    await client.change_presence(status=status, activity=activity)
+
+
+async def apply_about_me(bio):
+    """Set the bot's About Me = the application description via the current
+    Discord endpoint (PATCH /applications/@me), authorised with the bot's own
+    token. Discord genuinely supports this now — no manual portal step."""
+    if not http:
+        return
+    headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+    body = {"description": str(bio or "")[:400]}
+    try:
+        async with http.patch("https://discord.com/api/v10/applications/@me",
+                              headers=headers, json=body) as resp:
+            if resp.status in (200, 201):
+                print("about me (application description) updated", flush=True)
+            else:
+                txt = await resp.text()
+                print(f"about-me update failed: HTTP {resp.status} {txt[:140]}", flush=True)
+    except Exception as exc:
+        print(f"about-me update error: {exc}", flush=True)
+
+
+async def identity_watch_loop():
+    """Live-sync the dashboard's status / status message / About Me onto the
+    bot. Applies each only when it actually changes, so we never spam the
+    gateway or the /applications/@me endpoint."""
+    global _last_presence, _last_bio
+    await client.wait_until_ready()
+    print("identity watcher: ON (syncs status & About Me from the dashboard)", flush=True)
+    while not client.is_closed():
+        try:
+            data = await fetch_dispatch_presence()
+            if data:
+                pres = (data.get("presence"), data.get("activity_type"), data.get("activity_text"))
+                if pres != _last_presence:
+                    _last_presence = pres
+                    await apply_presence(*pres)
+                    print(f"status applied: {pres}", flush=True)
+                bio = data.get("bio")
+                if bio != _last_bio:
+                    _last_bio = bio
+                    await apply_about_me(bio)
+        except Exception as exc:
+            print(f"identity watcher error (continuing): {exc}", flush=True)
+        await asyncio.sleep(15)
 
 
 async def refresh_runtime_config():
@@ -2210,6 +2313,7 @@ async def on_ready():
     client.loop.create_task(officer_down_loop())
     client.loop.create_task(config_refresh_loop())
     client.loop.create_task(voice_channel_watch_loop())
+    client.loop.create_task(identity_watch_loop())
 
 
 client.run(TOKEN)
