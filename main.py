@@ -338,8 +338,22 @@ async def fetch_bot_secret(key, diag=False):
         return None
 
 
+def _key_fingerprint(name, val):
+    raw = os.environ.get(name, "")
+    stripped = raw.strip()
+    print(
+        f"env[{name}]: len={len(raw)} stripped_len={len(stripped)} "
+        f"first6={stripped[:6]!r} last6={stripped[-6:]!r} "
+        f"has_ws={'YES' if raw != stripped or ' ' in raw else 'no'} "
+        f"startswith_eyJ={'yes' if stripped.startswith('eyJ') else 'NO'}",
+        flush=True,
+    )
+
+
 async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
+    _key_fingerprint("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
+    _key_fingerprint("SUPABASE_URL", SUPABASE_URL)
     key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
