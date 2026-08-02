@@ -350,17 +350,47 @@ def _key_fingerprint(name, val):
     )
 
 
+async def fetch_dispatch_voice_channel(diag=False):
+    """Read the dashboard-chosen voice channel using only the anon key.
+
+    The voice channel id is not sensitive, so it goes through a dedicated
+    tokenless RPC (runtime_get_dispatch_voice_channel) instead of the
+    worker-token-gated secret path. This makes the dashboard picker drive the
+    bot on every dispatch bot with no per-bot worker token to configure.
+    """
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and BOT_ORDER_ID and http):
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_get_dispatch_voice_channel"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {"_bot_id": BOT_ORDER_ID}
+    try:
+        async with http.post(url, headers=headers, json=body) as resp:
+            raw = await resp.text()
+            if diag:
+                print(f"voice-channel read: HTTP {resp.status} body={raw[:120]!r}", flush=True)
+            if resp.status != 200:
+                return None
+            try:
+                val = json.loads(raw)
+            except Exception:
+                val = raw
+            return val.strip() if isinstance(val, str) and val.strip() else None
+    except Exception as exc:
+        print(f"voice-channel read failed: {exc}", flush=True)
+        return None
+
+
 async def refresh_runtime_config():
     global ERLC_KEY, VOICE_CHANNEL_ID
-    _key_fingerprint("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY)
-    _key_fingerprint("SUPABASE_URL", SUPABASE_URL)
-    _key_fingerprint("WORKER_TOKEN", WORKER_TOKEN)
-    _key_fingerprint("BOT_ORDER_ID", BOT_ORDER_ID)
-    key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
+    key = await fetch_bot_secret("ERLC_SERVER_KEY")
     if key:
         ERLC_KEY = key
-    vc = await fetch_bot_secret("DISPATCH_VOICE_CHANNEL_ID", diag=True)
-    print(f"config refresh: ERLC_secret={'read' if key else 'None'} "
+    vc = await fetch_dispatch_voice_channel(diag=True)
+    print(f"config refresh: ERLC_secret={'read' if key else 'env/none'} "
           f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}", flush=True)
     if vc:
         try:
