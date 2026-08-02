@@ -1940,20 +1940,21 @@ async def voice_channel_watch_loop():
     """
     global VOICE_CHANNEL_ID
     await client.wait_until_ready()
+    print("fast voice watcher: ON (checks dashboard every 3s)", flush=True)
     while not client.is_closed():
         await asyncio.sleep(3)
-        vc = await fetch_dispatch_voice_channel()
-        if not vc:
-            continue
         try:
+            vc = await fetch_dispatch_voice_channel()
+            if not vc:
+                continue
             new_id = int(vc)
-        except ValueError:
-            continue
-        if new_id and new_id != VOICE_CHANNEL_ID:
-            print(f"dashboard changed voice channel {VOICE_CHANNEL_ID} -> {new_id}, switching",
-                  flush=True)
-            VOICE_CHANNEL_ID = new_id
-            await ensure_voice()
+            if new_id and new_id != VOICE_CHANNEL_ID:
+                print(f"dashboard changed voice channel {VOICE_CHANNEL_ID} -> {new_id}, switching",
+                      flush=True)
+                VOICE_CHANNEL_ID = new_id
+                await ensure_voice()
+        except Exception as exc:
+            print(f"voice watcher error (continuing): {exc}", flush=True)
 
 
 async def dispatch_loop():
