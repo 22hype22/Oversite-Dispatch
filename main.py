@@ -408,35 +408,50 @@ async def fetch_bot_secret(key, diag=False):
 
 
 async def load_region_from_dashboard(diag=False):
-    """Pull the dashboard-chosen region (DISPATCH_REGION secret) and apply it.
+    """Pull the dashboard-chosen region and apply it.
 
-    Makes the dashboard the source of truth: an owner picks a state/country on
-    the site and the bot adopts it on startup (and on the periodic refresh),
-    with no redeploy.
-    """
-    val = await fetch_bot_secret("DISPATCH_REGION", diag=diag)
-    if val:
-        prev = DISPATCH_REGION
-        set_region(val)
-        if DISPATCH_REGION != prev:
-            print(f"region loaded from dashboard: {DISPATCH_REGION}", flush=True)
-
-
-async def persist_region(region):
-    """Best-effort write so a /region change shows up on the dashboard too.
-
-    Uses a worker-token RPC; if that RPC isn't deployed yet this simply no-ops,
-    so the in-session change still works.
+    The dashboard is the source of truth: an owner picks a state/country on the
+    site and the bot adopts it on startup and on each periodic refresh, with no
+    redeploy. Region lives in bot_config via the dispatch-region edge function.
     """
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
         return
-    url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_set_dispatch_region"
+    url = f"{SUPABASE_URL}/functions/v1/dispatch-region"
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
         "Content-Type": "application/json",
     }
-    body = {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID, "_region": region}
+    body = {"botId": BOT_ORDER_ID, "workerToken": WORKER_TOKEN}
+    try:
+        async with http.post(url, headers=headers, json=body) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                if diag:
+                    print(f"region load HTTP {resp.status} body={raw[:200]!r}", flush=True)
+                return
+            data = json.loads(raw)
+            val = data.get("region") if isinstance(data, dict) else None
+            if val:
+                prev = DISPATCH_REGION
+                set_region(val)
+                if DISPATCH_REGION != prev:
+                    print(f"region loaded from dashboard: {DISPATCH_REGION}", flush=True)
+    except Exception as exc:
+        print(f"load_region failed (non-fatal): {exc}", flush=True)
+
+
+async def persist_region(region):
+    """Write a /region change back so the dashboard reflects it too (two-way sync)."""
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        return
+    url = f"{SUPABASE_URL}/functions/v1/dispatch-region"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {"botId": BOT_ORDER_ID, "workerToken": WORKER_TOKEN, "region": region}
     try:
         async with http.post(url, headers=headers, json=body) as resp:
             await resp.text()
