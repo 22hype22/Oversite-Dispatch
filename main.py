@@ -407,43 +407,6 @@ async def fetch_bot_secret(key, diag=False):
         return None
 
 
-async def load_region_from_dashboard(diag=False):
-    """Pull the dashboard-chosen region (DISPATCH_REGION secret) and apply it.
-
-    Makes the dashboard the source of truth: an owner picks a state/country on
-    the site and the bot adopts it on startup (and on the periodic refresh),
-    with no redeploy.
-    """
-    val = await fetch_bot_secret("DISPATCH_REGION", diag=diag)
-    if val:
-        prev = DISPATCH_REGION
-        set_region(val)
-        if DISPATCH_REGION != prev:
-            print(f"region loaded from dashboard: {DISPATCH_REGION}", flush=True)
-
-
-async def persist_region(region):
-    """Best-effort write so a /region change shows up on the dashboard too.
-
-    Uses a worker-token RPC; if that RPC isn't deployed yet this simply no-ops,
-    so the in-session change still works.
-    """
-    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
-        return
-    url = f"{SUPABASE_URL}/rest/v1/rpc/runtime_set_dispatch_region"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID, "_region": region}
-    try:
-        async with http.post(url, headers=headers, json=body) as resp:
-            await resp.text()
-    except Exception as exc:
-        print(f"persist_region failed (non-fatal): {exc}", flush=True)
-
-
 def _key_fingerprint(name, val):
     raw = os.environ.get(name, "")
     stripped = raw.strip()
@@ -596,8 +559,6 @@ async def refresh_runtime_config():
     key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
     if key:
         ERLC_KEY = key
-    # Adopt the dashboard-chosen region (state/country) on startup + each refresh.
-    await load_region_from_dashboard()
     vc = await fetch_dispatch_voice_channel(diag=True)
     print(f"config refresh: ERLC_secret={'read' if key else 'env/none'} "
           f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}", flush=True)
@@ -713,147 +674,6 @@ async def transcribe(wav_bytes):
         return None
 
 
-# ============================================================================
-# Region engine — all 50 US states + countries, each with a real radio-code
-# reference the AI is given so it uses accurate codes instead of guessing.
-# ============================================================================
-
-NATO_PHONETIC = (
-    "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliet Kilo Lima "
-    "Mike November Oscar Papa Quebec Romeo Sierra Tango Uniform Victor Whiskey "
-    "X-ray Yankee Zulu"
-)
-
-# The APCO-derived 10-codes the large majority of US agencies actually use.
-US_TEN_CODES = (
-    "10-4 acknowledged; 10-6 busy; 10-7 out of service; 10-8 in service/available; "
-    "10-9 say again; 10-19 return to station; 10-20 location; 10-23 on scene/stand by; "
-    "10-27 license check; 10-28 registration check; 10-29 wants/warrants check; "
-    "10-32 person with a gun; 10-50 traffic accident; 10-76 en route; 10-97 arrived; "
-    "10-98 assignment complete; 10-99 officer needs emergency help; Code 4 no further "
-    "assistance needed; Signal 100 hold the air for emergency traffic"
-)
-
-# Response/priority codes common across US agencies.
-US_RESPONSE_CODES = (
-    "Code 1 routine (no lights/siren); Code 2 urgent (no siren); "
-    "Code 3 emergency (lights and siren)"
-)
-
-# Region-specific real additions layered ON TOP of the common US set.
-STATE_EXTRAS = {
-    "California": (
-        "California agencies also use Penal Code call types on the air: 187 homicide, "
-        "207 kidnapping, 211 robbery, 240 assault, 245 assault with a deadly weapon, "
-        "459 burglary, 484 theft, 415 disturbance, 5150 mental-health hold, "
-        "23152 DUI. CHP uses '11-' codes: 11-80 accident major injury, 11-99 officer "
-        "needs help."
-    ),
-    "New York": (
-        "New York (NYPD-style) uses its own 10-codes: 10-13 officer needs assistance, "
-        "10-30 robbery in progress, 10-31 burglary in progress, 10-34 assault, "
-        "10-52 dispute, 10-53 vehicle accident, 10-85 need backup at scene."
-    ),
-    "Florida": (
-        "Many Florida agencies use Signal codes: Signal 4 accident, Signal 7 dead body, "
-        "Signal 20 mentally ill, Signal 34 robbery, Signal 43 subject with a weapon."
-    ),
-}
-
-# Country profiles for non-US regions (real conventions, no fake 10-codes).
-COUNTRY_PROFILES = {
-    "United Kingdom": (
-        "UK police do NOT use 10-codes. Control (not 'dispatch') speaks mostly plain "
-        "English with NATO phonetics. Use response grades: Grade 1 immediate/emergency, "
-        "Grade 2 prompt, Grade 3 scheduled. Say 'received' not '10-4', 'show me on "
-        "scene', 'making' (en route). Identity/IC codes (IC1-IC6) may describe people. "
-        "Use 'RTC' for road traffic collision and 'PNC check' for records."
-    ),
-    "Canada": (
-        "Canadian agencies largely use the same 10-codes as the US (10-4, 10-7, 10-8, "
-        "10-20, etc.); RCMP also uses plain language. Use NATO phonetics."
-    ),
-    "Australia": (
-        "Australian police use plain-language status calls and VKG-style procedure "
-        "rather than US 10-codes: 'received', 'en route', 'on scene', 'code 1' urgent, "
-        "'signal 1' understood. Use NATO phonetics."
-    ),
-    "Germany": (
-        "German police use plain radio procedure with NATO phonetics (German variant "
-        "possible). No US 10-codes; keep it terse and professional."
-    ),
-    "Mexico": (
-        "Mexican agencies commonly use 'clave' codes and plain Spanish/English radio "
-        "procedure; no US 10-codes. Keep transmissions short and professional."
-    ),
-}
-
-US_STATES = [
-    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
-    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
-    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine",
-    "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
-    "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey",
-    "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio",
-    "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina",
-    "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia",
-    "Washington", "West Virginia", "Wisconsin", "Wyoming",
-]
-
-COUNTRIES = [
-    "the United States", "United Kingdom", "Canada", "Australia",
-    "Germany", "Mexico",
-]
-
-# The full picker/autocomplete catalog: countries first, then all 50 states.
-REGION_CATALOG = COUNTRIES + US_STATES
-
-
-def canonical_region(name):
-    """Match free-text input to a catalog entry (case/space-insensitive)."""
-    n = " ".join((name or "").split()).strip()
-    if not n:
-        return "the United States"
-    low = n.lower().lstrip("the ").strip()
-    for entry in REGION_CATALOG:
-        if entry.lower().lstrip("the ").strip() == low:
-            return entry
-    # Unknown but non-empty (e.g. a city) — keep it as typed; the AI still gets
-    # a sensible default code reference below.
-    return n
-
-
-def _is_us_region(region):
-    r = region.lower().lstrip("the ").strip()
-    return r == "united states" or region in US_STATES
-
-
-def code_reference_for(region):
-    """A concise, accurate radio-code block to hand the AI for this region."""
-    lines = [f"Phonetic alphabet (NATO): {NATO_PHONETIC}."]
-    if region in COUNTRY_PROFILES:
-        lines.append(COUNTRY_PROFILES[region])
-    elif _is_us_region(region):
-        lines.append(f"Radio codes: {US_TEN_CODES}.")
-        lines.append(f"Response codes: {US_RESPONSE_CODES}.")
-        if region in STATE_EXTRAS:
-            lines.append(STATE_EXTRAS[region])
-        else:
-            lines.append(
-                "Some agencies here have moved to plain language; mirror whatever "
-                "codes the unit uses and stay consistent."
-            )
-    else:
-        # Unknown region: give the common US set as a baseline but tell the AI to
-        # adapt to that area's real conventions.
-        lines.append(
-            f"Use the real radio codes, signals, and procedure that police in "
-            f"{region} actually use. If unsure, default to standard 10-codes "
-            f"(10-4 acknowledged, 10-20 location, 10-97 on scene) and NATO phonetics."
-        )
-    return " ".join(lines)
-
-
 def build_dispatch_system(region):
     return (
         f"You are Oversite Dispatch, a professional emergency dispatcher working in "
@@ -861,8 +681,6 @@ def build_dispatch_system(region):
         f"real dispatcher in {region} talks: use the real radio codes, signals, "
         f"phonetic alphabet, and calm, clipped cadence that agencies there actually "
         f"use. Answer with exactly one short radio transmission.\n"
-        f"Radio-code reference for {region} — use these, do not invent others: "
-        f"{code_reference_for(region)}\n"
         "Rules:\n"
         "- Keep every reply to ONE short sentence. Radio brevity. No preamble, no sign-off.\n"
         "- Do not include the unit's callsign in your reply; it is added automatically. "
@@ -920,8 +738,6 @@ def build_call_system(region):
         f"call and must broadcast it to units over the radio, exactly the way a real "
         f"dispatcher in {region} would, using that region's real radio codes, priority "
         f"language, and calm cadence.\n"
-        f"Radio-code reference for {region} — use these, do not invent others: "
-        f"{code_reference_for(region)}\n"
         "Rules:\n"
         "- One broadcast, two or three short sentences at most.\n"
         "- State the nature of the call and the location. Say the location only once, "
@@ -937,17 +753,15 @@ def build_call_system(region):
     )
 
 
-# Normalize whatever came in from the env/dashboard to a catalog entry.
-DISPATCH_REGION = canonical_region(DISPATCH_REGION)
 DISPATCH_SYSTEM = build_dispatch_system(DISPATCH_REGION)
 CALL_SYSTEM = build_call_system(DISPATCH_REGION)
 
 
 def set_region(region):
     global DISPATCH_REGION, DISPATCH_SYSTEM, CALL_SYSTEM
-    DISPATCH_REGION = canonical_region(region)
-    DISPATCH_SYSTEM = build_dispatch_system(DISPATCH_REGION)
-    CALL_SYSTEM = build_call_system(DISPATCH_REGION)
+    DISPATCH_REGION = region
+    DISPATCH_SYSTEM = build_dispatch_system(region)
+    CALL_SYSTEM = build_call_system(region)
 
 
 async def safe_respond(interaction, text):
@@ -957,36 +771,23 @@ async def safe_respond(interaction, text):
         print(f"interaction response failed: {exc}", flush=True)
 
 
-async def region_autocomplete(interaction, current: str):
-    cur = " ".join((current or "").split()).lower().lstrip("the ").strip()
-    if cur:
-        matches = [r for r in REGION_CATALOG if cur in r.lower()]
-    else:
-        # Empty box: show countries first, then the first states.
-        matches = REGION_CATALOG
-    return [discord.app_commands.Choice(name=r, value=r) for r in matches[:25]]
-
-
 @command_tree.command(
     name="region",
-    description="Set the real-world area dispatch talks like (state or country)",
+    description="Set the real-world area dispatch talks like (state, country, or city)",
     guild=DISPATCH_GUILD,
 )
-@discord.app_commands.describe(area="Pick a state or country — for example Texas, California, United Kingdom")
-@discord.app_commands.autocomplete(area=region_autocomplete)
+@discord.app_commands.describe(area="For example: Texas, Alaska, Dubai, United Kingdom")
 @discord.app_commands.default_permissions(manage_guild=True)
 async def region_command(interaction, area: str):
     area = " ".join(area.split()).strip()
     if not area:
-        await safe_respond(interaction, "Pick a state or country from the list.")
+        await safe_respond(interaction, "Give me an area, like Texas, Alaska, or Dubai.")
         return
     set_region(area)
-    # Best-effort persist so the dashboard reflects it and it survives a restart.
-    await persist_region(DISPATCH_REGION)
     print(f"region changed to {DISPATCH_REGION} by {interaction.user}", flush=True)
     await safe_respond(interaction,
         f"Dispatch is now running as **{DISPATCH_REGION}**. New calls and radio "
-        f"replies will use that area's real codes and style.")
+        f"replies will use that area's codes and style.")
 
 
 @command_tree.command(
