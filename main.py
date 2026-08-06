@@ -61,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "roster-1"
+BUILD = "roster-2"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -2654,6 +2654,14 @@ async def on_ready():
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
     print(f"region: {DISPATCH_REGION}", flush=True)
+    # --- TEMP DIAGNOSTIC: what does the bot actually hold for the ElevenLabs key? ---
+    print(
+        f"ELEVENLABS_API_KEY check: len={len(XI_KEY)} "
+        f"first6={XI_KEY[:6]!r} startswith_sk_={XI_KEY.startswith('sk_')} | "
+        f"VOICE_ID={VOICE_ID!r}",
+        flush=True,
+    )
+    # --- end diagnostic ---
     load_links()
     await sync_commands()
     if VOICE_CMD_ENABLED:
