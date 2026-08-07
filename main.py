@@ -1487,11 +1487,12 @@ def wants_clear_stop(text):
 
 def wants_backup(text):
     low = _flat(text)
-    triggers = ("start me another unit", "start another unit", "another unit",
-                "additional unit", "send backup", "send me backup", "need backup",
-                "requesting backup", "request backup", "need another unit",
-                "get me another unit", "second unit", "start me a unit")
-    return any(t in low for t in triggers)
+    if "backup" in low or "back up" in low:
+        return True
+    request = any(w in low for w in ("need", "request", "send", "start", "get me", "require", "want"))
+    if "additional" in low and (request or "unit" in low or "officer" in low):
+        return True
+    return any(t in low for t in ("another unit", "another officer", "second unit", "more units"))
 
 
 def wants_bolo_read(text):
