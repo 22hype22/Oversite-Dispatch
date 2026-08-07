@@ -108,7 +108,7 @@ CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sh
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
-BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "1800"))
+BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
 # When an officer calls a traffic stop while sitting in a "Traffic Stop"-style
 # voice channel, prepend the nearest postal code to that channel's name, then
 # restore the original name once the stop ends / everyone leaves. Needs the
@@ -1501,10 +1501,22 @@ def wants_bolo_read(text):
 
 def extract_bolo(text):
     low = text.lower()
-    for marker in ("bolo for", "b.o.l.o. for", "lookout for", "look out for", "bulletin for"):
+    markers = ("be on the lookout for", "be on the lookout on", "on the lookout for",
+               "put out a bolo for", "put out a bolo on", "put out a bolo",
+               "bolo out for", "bolo out on", "bolo for", "bolo on",
+               "b.o.l.o. for", "b.o.l.o. on", "lookout for", "look out for",
+               "lookout on", "look out on", "bulletin for", "bulletin on")
+    for marker in markers:
         idx = low.find(marker)
         if idx >= 0:
-            return autocorrect(text[idx + len(marker):].strip(" ,.-"))
+            desc = text[idx + len(marker):].strip(" ,.-")
+            if desc:
+                return autocorrect(desc)
+    idx = low.find("bolo")
+    if idx >= 0:
+        desc = text[idx + 4:].strip(" ,.-")
+        if len(desc) >= 3:
+            return autocorrect(desc)
     return ""
 
 
@@ -1512,6 +1524,7 @@ def add_bolo(desc, callsign):
     bolos.append({"desc": desc, "callsign": callsign, "time": time.time()})
     cutoff = time.time() - BOLO_EXPIRE
     bolos[:] = [b for b in bolos if b["time"] >= cutoff][-8:]
+    print(f"bolo logged: '{desc}' per {callsign or 'unknown'} (active: {len(bolos)})", flush=True)
 
 
 def read_bolos(callsign=""):
