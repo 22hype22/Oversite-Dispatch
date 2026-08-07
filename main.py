@@ -61,7 +61,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "roster-2"
+BUILD = "roster-3"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -137,6 +137,7 @@ response_cache = {}
 tone_path = None
 status_board = {}
 open_calls = {}
+cleared_calls = set()
 callsign_links = {}
 active_stops = {}
 nick_original = {}
@@ -1516,6 +1517,27 @@ def read_status_board(callsign=""):
     return " ".join(parts)
 
 
+def wants_call_cleared(text):
+    low = _flat(text)
+    triggers = ("call cleared", "call is cleared", "call is clear", "clear the call",
+                "clear that call", "clear the last call", "cancel the call",
+                "disregard the call", "call complete", "call completed", "close the call")
+    return any(t in low for t in triggers)
+
+
+def extract_call_number(text):
+    match = re.search(r"call\s*(?:number\s*)?(\d{1,6})", text.lower())
+    return int(match.group(1)) if match else None
+
+
+def mark_call_cleared(number):
+    if number is None:
+        return False
+    cleared_calls.add(number)
+    open_calls.pop(number, None)
+    return True
+
+
 def read_calls_holding(callsign=""):
     calls = list(open_calls.values())
     ack = f"Unit {callsign}, " if callsign else ""
@@ -2307,6 +2329,25 @@ async def handle_utterance(member, pcm):
         who = f", per Unit {callsign}" if callsign else ""
         await announce(f"All units, be on the lookout for {bolo_desc}{who}.", title="BOLO")
         return
+    if wants_call_cleared(text):
+        ack = f"Unit {callsign}, " if callsign else ""
+        low = _flat(text)
+        if "all call" in low or "all calls" in low or "clear all" in low:
+            had = list(open_calls.keys())
+            for n in had:
+                mark_call_cleared(n)
+            msg = "10-4, all calls cleared." if had else "no calls are holding to clear."
+            await announce(f"{ack}{msg}", title="Calls Cleared")
+            return
+        number = extract_call_number(text)
+        if number is None and last_call is not None:
+            number = last_call.get("CallNumber")
+        if number is not None:
+            mark_call_cleared(number)
+            await announce(f"{ack}10-4, call number {number} is cleared.", title="Call Cleared")
+        else:
+            await announce(f"{ack}there are no active calls to clear.", title="Call Cleared")
+        return
     status = detect_status(text)
     clearing = wants_clear_stop(text)
     if clearing and member.id in active_stops:
@@ -2467,22 +2508,24 @@ async def poll_calls():
     if calls and not _call_debugged:
         _call_debugged = True
         print(f"call API sample: {calls[0]}", flush=True)
+    current_numbers = {c.get("CallNumber") for c in calls if c.get("CallNumber") is not None}
+    cleared_calls.intersection_update(current_numbers)
     prev_open = set(open_calls.keys())
     open_calls.clear()
     for call in calls:
         number = call.get("CallNumber")
-        if number is not None:
+        if number is not None and number not in cleared_calls:
             open_calls[number] = call
     if CALL_CLEARED:
         for num in prev_open:
-            if num not in open_calls and ("call", num) in seen_keys:
+            if num not in open_calls and num not in cleared_calls and ("call", num) in seen_keys:
                 await announce(f"Be advised, call number {num} has cleared.", title="Call Cleared")
     pending = []
     for call in calls:
         number = call.get("CallNumber")
         started = call.get("StartedAt", 0)
         key = ("call", number)
-        if started < boot_time or key in seen_keys:
+        if started < boot_time or key in seen_keys or number in cleared_calls:
             continue
         seen_keys.add(key)
         pending.append(call)
