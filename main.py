@@ -1540,9 +1540,11 @@ def read_status_board(callsign=""):
 
 def wants_call_cleared(text):
     low = _flat(text)
+    if "in custody" in low:
+        return True
     if "call" not in low:
         return False
-    words = ("clear", "cancel", "disregard", "complete", "done", "close", "void")
+    words = ("clear", "cancel", "conclud", "disregard", "complete", "done", "close", "void")
     return any(w in low for w in words)
 
 
@@ -2378,17 +2380,17 @@ async def handle_utterance(member, pcm):
             had = list(open_calls.keys())
             for n in had:
                 mark_call_cleared(n)
-            msg = "10-4, all calls cleared." if had else "no calls are holding to clear."
-            await announce(f"{ack}{msg}", title="Calls Cleared")
+            msg = "10-4, all calls are concluded, all units disregard." if had else "no calls are holding to clear."
+            await announce(f"{ack}{msg}", title="Calls Concluded")
             return
         number = extract_call_number(text)
         if number is None and last_call is not None:
             number = last_call.get("CallNumber")
         if number is not None:
             mark_call_cleared(number)
-            await announce(f"{ack}10-4, call number {number} is cleared.", title="Call Cleared")
+            await announce(f"{ack}10-4, call number {number} is concluded. All units, disregard.", title="Call Concluded")
         else:
-            await announce(f"{ack}there are no active calls to clear.", title="Call Cleared")
+            await announce(f"{ack}there are no active calls to clear.", title="Call Concluded")
         return
     status = detect_status(text)
     clearing = wants_clear_stop(text)
