@@ -1912,32 +1912,59 @@ async def assign_backup(member, spoken_callsign):
     if isinstance(players, list):
         for p in players:
             team = str(p.get("Team") or "").lower()
-            pos = extract_player_pos(p)
-            if pos and any(t in team for t in CALL_TEAMS):
-                pname = str(p.get("Player") or "").split(":")[0]
-                cs = str(p.get("Callsign") or "").strip() or pname
-                officers.append((norm_callsign(pname), cs, pos, extract_street(p), extract_postal(p)))
-    idents = duty_idents(member)
-    req = next((o for o in officers if o[0] in idents), None)
-    req_cs = spoken_callsign or (req[1] if req else clean_name(getattr(member, "display_name", "unit")))
-    others = [o for o in officers if not req or o[0] != req[0]]
-    if not others:
-        await announce(f"Unit {req_cs}, be advised, no other units are online at this time.", title="Backup")
+            if not any(t in team for t in CALL_TEAMS):
+                continue
+            pname = str(p.get("Player") or "").split(":")[0]
+            cs = str(p.get("Callsign") or "").strip() or pname
+            officers.append({
+                "name": norm_callsign(pname),
+                "cs": cs,
+                "cs_norm": norm_callsign(cs),
+                "pos": extract_player_pos(p),
+                "street": extract_street(p),
+                "postal": extract_postal(p),
+            })
+
+    if not officers:
+        await announce("Be advised, no units are currently active. No backup is available.", title="Backup")
         return
+
+    req = None
+    sk = norm_callsign(spoken_callsign)
+    if sk:
+        req = next((o for o in officers if o["cs_norm"] == sk or o["name"] == sk), None)
     if req is None:
-        await announce(f"Unit {req_cs}, units are on, but I cannot locate your position, advise your location.",
-                       title="Backup")
+        idents = duty_idents(member)
+        req = next((o for o in officers if o["name"] in idents), None)
+    req_cs = spoken_callsign or (req["cs"] if req else clean_name(getattr(member, "display_name", "unit")))
+
+    others = [o for o in officers if not req or o["cs_norm"] != req["cs_norm"]]
+    if not others:
+        await announce(f"Unit {req_cs}, be advised, no other units are available for backup at this time.", title="Backup")
         return
-    nearest = min(others, key=lambda o: (o[2][0] - req[2][0]) ** 2 + (o[2][1] - req[2][1]) ** 2)
+
     where_bits = []
-    if req[4]:
-        where_bits.append(f"postal {req[4]}")
-    if req[3]:
-        where_bits.append(req[3])
+    if req and req.get("postal"):
+        where_bits.append(f"postal {req['postal']}")
+    if req and req.get("street"):
+        where_bits.append(req["street"])
     loc = ", ".join(where_bits)
-    loc_str = f" at {loc}" if loc else ""
-    await announce(f"Unit {nearest[1]}, respond to assist Unit {req_cs}{loc_str}, Code 3.", title="Backup")
-    print(f"backup: {nearest[1]} assigned to {req_cs}", flush=True)
+
+    if loc:
+        await announce(f"All units, Unit {req_cs} is requesting backup to {loc}.", title="Backup", tone=True)
+    else:
+        await announce(f"All units, Unit {req_cs} is requesting backup.", title="Backup", tone=True)
+
+    with_pos = [o for o in others if o.get("pos")]
+    if req and req.get("pos") and with_pos:
+        nearest = min(with_pos, key=lambda o: (o["pos"][0] - req["pos"][0]) ** 2 + (o["pos"][1] - req["pos"][1]) ** 2)
+        await announce(
+            f"Unit {nearest['cs']}, you are the closest unit to the backup request, respond Code 3.",
+            title="Backup")
+        print(f"backup: {nearest['cs']} assigned to {req_cs}", flush=True)
+    else:
+        await announce(f"Any available unit, respond to assist Unit {req_cs}, Code 3.", title="Backup")
+        print(f"backup: general call for {req_cs}", flush=True)
 
 
 async def clear_traffic_stop(member, callsign=""):
