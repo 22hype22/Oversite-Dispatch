@@ -1519,10 +1519,10 @@ def read_status_board(callsign=""):
 
 def wants_call_cleared(text):
     low = _flat(text)
-    triggers = ("call cleared", "call is cleared", "call is clear", "clear the call",
-                "clear that call", "clear the last call", "cancel the call",
-                "disregard the call", "call complete", "call completed", "close the call")
-    return any(t in low for t in triggers)
+    if "call" not in low:
+        return False
+    words = ("clear", "cancel", "disregard", "complete", "done", "close", "void")
+    return any(w in low for w in words)
 
 
 def extract_call_number(text):
