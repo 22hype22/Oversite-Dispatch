@@ -2190,6 +2190,40 @@ def _kill_time(entry):
     return ts / 1000 if ts > 1e12 else ts
 
 
+async def announce_officers_down(downed):
+    groups = {}
+    for d in downed:
+        groups.setdefault(d.get("postal") or "", []).append(d)
+    for postal, group in groups.items():
+        if len(group) >= 2:
+            callsigns = [g["cs"] for g in group if g.get("cs")]
+            units = ", ".join(f"Unit {c}" for c in callsigns) if callsigns else "multiple units"
+            where = f" at postal {postal}" if postal else ""
+            await announce(
+                f"Multiple officers down{where}. {units}. Any available unit, respond Code 3.",
+                title="Officers Down", tone=True)
+            print(f"officers down (multiple){' @ ' + postal if postal else ''}: {callsigns}", flush=True)
+            continue
+        d = group[0]
+        parts = [f"All units, officer down, Unit {d['cs']}."]
+        where_bits = []
+        if d.get("postal"):
+            where_bits.append(f"nearest postal {d['postal']}")
+        if d.get("street"):
+            where_bits.append(d["street"])
+        if where_bits:
+            joined = ", ".join(where_bits)
+            parts.append(joined[:1].upper() + joined[1:] + ".")
+        if d.get("veh"):
+            line = f"Last known at a traffic stop with a {d['veh']}"
+            if d.get("plate"):
+                line += f", license plate {d['plate']}"
+            parts.append(line + ".")
+        parts.append("Any available unit, respond Code 3.")
+        await announce(" ".join(parts), title="Officer Down", tone=True)
+        print(f"officer down: {d['cs']}", flush=True)
+
+
 async def officer_down_loop():
     global _kill_debugged
     await client.wait_until_ready()
@@ -2204,6 +2238,7 @@ async def officer_down_loop():
                     if kills and not _kill_debugged:
                         _kill_debugged = True
                         print(f"killlog sample: {kills[0]}", flush=True)
+                    downed = []
                     for k in kills:
                         name = str(k.get("Killed") or "").split(":")[0]
                         keyid = norm_callsign(name)
@@ -2220,23 +2255,9 @@ async def officer_down_loop():
                                 s = active_stops.pop(suid)
                                 if s.get("vehicle"):
                                     veh, plate = s["vehicle"], s.get("plate", "")
-                            parts = [f"All units, officer down, Unit {cs}."]
-                            where_bits = []
-                            if postal:
-                                where_bits.append(f"nearest postal {postal}")
-                            if street:
-                                where_bits.append(street)
-                            if where_bits:
-                                joined = ", ".join(where_bits)
-                                parts.append(joined[:1].upper() + joined[1:] + ".")
-                            if veh:
-                                line = f"Last known at a traffic stop with a {veh}"
-                                if plate:
-                                    line += f", license plate {plate}"
-                                parts.append(line + ".")
-                            parts.append("Any available unit, respond Code 3.")
-                            await announce(" ".join(parts), title="Officer Down", tone=True)
-                            print(f"officer down: {cs}", flush=True)
+                            downed.append({"cs": cs, "street": street, "postal": postal, "veh": veh, "plate": plate})
+                    if downed:
+                        await announce_officers_down(downed)
                 players = data.get("Players")
                 if isinstance(players, list):
                     officer_last_seen.clear()
