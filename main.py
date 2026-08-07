@@ -104,6 +104,7 @@ OFFICER_DOWN_POLL = float(os.environ.get("OFFICER_DOWN_POLL", "4"))
 SUSPECT_RADIUS = float(os.environ.get("SUSPECT_RADIUS", "60"))
 PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
 PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
+PURSUIT_CALLOUT_SECONDS = float(os.environ.get("PURSUIT_CALLOUT_SECONDS", "25"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
@@ -1539,6 +1540,21 @@ def read_bolos(callsign=""):
     return " ".join(parts)
 
 
+def available_units(exclude=None):
+    now = time.time()
+    ex = norm_callsign(exclude) if exclude else None
+    out = []
+    for cs, v in status_board.items():
+        if now - v.get("time", 0) >= 10800:
+            continue
+        st = str(v.get("status") or "").lower()
+        if "10-8" in st or "available" in st or "in service" in st:
+            if ex and norm_callsign(cs) == ex:
+                continue
+            out.append(cs)
+    return out
+
+
 def read_status_board(callsign=""):
     now = time.time()
     entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
@@ -2209,12 +2225,23 @@ async def officer_down_loop():
 async def end_stop_pursuit(uid, stop, street):
     stop["pursuit"] = True
     stop["slow_since"] = None
+    stop["last_callout"] = time.time()
     await move_member(stop["member"], VOICE_CHANNEL_ID)
     cs = stop["callsign"]
     where = f" near {street}" if street else ""
     await announce(
         f"All units, Unit {cs} is in pursuit, subject fleeing a traffic stop{where}. "
         f"Clear the air.", title="Pursuit", tone=True)
+    avail = available_units(exclude=cs)
+    if avail:
+        names = ", ".join(f"Unit {u}" for u in avail[:4])
+        await announce(
+            f"{names}, you are 10-8, respond to assist Unit {cs} in the pursuit, Code 3.",
+            title="Pursuit Assist")
+    else:
+        await announce(
+            f"All available units, respond to assist Unit {cs} in the pursuit, Code 3.",
+            title="Pursuit Assist")
     print(f"pursuit triggered for {cs}", flush=True)
 
 
@@ -2262,6 +2289,12 @@ async def stop_watch_loop():
                                 f"All units, the pursuit involving Unit {stop['callsign']} "
                                 f"is terminated. Resume normal traffic.", title="Pursuit Over")
                             print(f"pursuit ended for {stop['callsign']}", flush=True)
+                    if uid in active_stops and now - stop.get("last_callout", 0) >= PURSUIT_CALLOUT_SECONDS:
+                        stop["last_callout"] = now
+                        where = f", {street}" if street else ""
+                        await announce(
+                            f"Unit {stop['callsign']} still in active pursuit{where}. "
+                            f"Available units continue to assist, Code 3.", title="Pursuit")
                     continue
                 if speed >= 3:
                     print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
