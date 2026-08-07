@@ -1852,11 +1852,16 @@ async def start_traffic_stop(member, spoken_callsign=""):
     link = callsign_links.get(member.id) or {}
     positions = await player_positions()
     candidates = name_match_keys(member)
-    key = next((c for c in candidates if c in positions), None)
-    radio_cs = link.get("callsign") or spoken_callsign or clean_name(who)
+    key = None
+    spoken_key = norm_callsign(spoken_callsign)
+    if spoken_key and spoken_key in positions:
+        key = spoken_key
+    if key is None:
+        key = next((c for c in candidates if c in positions), None)
+    radio_cs = spoken_callsign or link.get("callsign") or clean_name(who)
     if key is None:
         print(f"traffic stop: could not match {who} to an in-game player. "
-              f"tried {candidates}, available {sorted(positions)} "
+              f"spoken='{spoken_callsign}' tried {candidates} available {sorted(positions)} "
               f"(ERLC_KEY={'set' if ERLC_KEY else 'MISSING'}, "
               f"players_returned={len(positions)})", flush=True)
         return
