@@ -319,6 +319,13 @@ def build_call_line(call, nearest=""):
     team = (call.get("Team") or "").strip()
     number = call.get("CallNumber")
 
+    if isinstance(nearest, (list, tuple)):
+        nearest_units = [u for u in nearest if u]
+    elif nearest:
+        nearest_units = [nearest]
+    else:
+        nearest_units = []
+
     parts = ["Attention units."]
 
     if desc and loc:
@@ -330,8 +337,13 @@ def build_call_line(call, nearest=""):
     else:
         parts.append("Report of an incident, details to follow.")
 
-    if nearest:
-        parts.append(f"Unit {nearest}, you are the closest unit, respond Code 3.")
+    if len(nearest_units) == 1:
+        parts.append(f"Unit {nearest_units[0]}, you are the closest unit, respond Code 3.")
+    elif len(nearest_units) > 1:
+        parts.append(
+            f"Unit {nearest_units[0]}, you are the closest unit, respond Code 3. "
+            f"Unit {nearest_units[1]}, respond as backup."
+        )
     elif team:
         parts.append(f"{team} units respond Code 3.")
     else:
@@ -943,8 +955,11 @@ def build_call_system(region):
         "- State the nature of the call and the location. Say the location only once, "
         "do not repeat it.\n"
         "- Direct the appropriate units to respond with the correct priority code.\n"
-        "- If a closest available unit is provided, assign that exact unit by callsign "
-        "to respond, for example 'Unit 1-Sam-32, you are closest, respond Code 3'.\n"
+        "- If closest available unit(s) are provided, assign the nearest one as the "
+        "primary unit by callsign, for example 'Unit 1-Sam-32, you are the closest unit, "
+        "respond Code 3'. If a second unit is provided, you may also assign it as backup "
+        "for serious calls, for example 'Unit 2-Adam-14, respond to assist'. Only use the "
+        "callsigns provided; never invent one.\n"
         "- End by stating the time exactly as given in the record.\n"
         "- Do not invent any detail that is not in the record. Do not add a call-taker "
         "name, phone number, or facts you were not given.\n"
@@ -1073,8 +1088,12 @@ async def anthropic_call(system, user_msg, max_tokens=200):
 
 
 async def compose_dispatch(call, nearest=None):
+    if isinstance(nearest, str):
+        nearest_units = [nearest] if nearest else []
+    else:
+        nearest_units = [u for u in (nearest or []) if u]
     if not AI_ENABLED:
-        return build_call_line(call, nearest or "")
+        return build_call_line(call, nearest_units)
     desc = autocorrect((call.get("Description") or "").strip())
     loc = (call.get("PositionDescriptor") or "").strip()
     team = (call.get("Team") or "").strip()
@@ -1086,10 +1105,12 @@ async def compose_dispatch(call, nearest=None):
         f"Incident number: {number}\n"
         f"Time: {local_time_str()} hours"
     )
-    if nearest:
-        record += f"\nClosest available unit: {nearest}"
+    if len(nearest_units) == 1:
+        record += f"\nClosest available unit: {nearest_units[0]}"
+    elif len(nearest_units) > 1:
+        record += f"\nClosest available units, nearest first: {', '.join(nearest_units)}"
     reply = await anthropic_call(CALL_SYSTEM, record, max_tokens=220)
-    return reply or build_call_line(call, nearest or "")
+    return reply or build_call_line(call, nearest_units)
 
 
 async def dispatch_ai_reply(text, callsign):
@@ -1733,12 +1754,19 @@ async def player_positions():
 
 
 def extract_call_pos(call):
-    pos = call.get("Position") if isinstance(call.get("Position"), dict) else None
-    if pos is not None:
-        x = _num(pos, "X", "LocationX")
-        z = _num(pos, "Z", "LocationZ")
+    raw = call.get("Position")
+    if isinstance(raw, dict):
+        x = _num(raw, "X", "LocationX")
+        z = _num(raw, "Z", "LocationZ")
         if x is not None and z is not None:
             return (x, z)
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            if len(raw) >= 3:
+                return (float(raw[0]), float(raw[2]))
+            return (float(raw[0]), float(raw[1]))
+        except (TypeError, ValueError):
+            pass
     x = _num(call, "X", "LocationX")
     z = _num(call, "Z", "LocationZ")
     if x is not None and z is not None:
@@ -1769,6 +1797,20 @@ def pick_nearest(call, units):
         if best_d is None or d < best_d:
             best, best_d = cs, d
     return best
+
+
+def pick_nearest_units(call, units, count=2):
+    cpos = extract_call_pos(call)
+    if cpos is None or not units:
+        return []
+    ranked = sorted(units, key=lambda u: (u[1][0] - cpos[0]) ** 2 + (u[1][1] - cpos[1]) ** 2)
+    picked = []
+    for cs, _pos in ranked:
+        if cs and cs not in picked:
+            picked.append(cs)
+        if len(picked) >= count:
+            break
+    return picked
 
 
 async def move_member(member, channel_id):
@@ -2532,7 +2574,7 @@ async def poll_calls():
     units = await duty_units() if pending else []
     for call in pending:
         last_call = call
-        nearest = pick_nearest(call, units)
+        nearest = pick_nearest_units(call, units, 2)
         line = await compose_dispatch(call, nearest)
         if len(open_calls) > 1:
             line = f"{line} Be advised, you now have {len(open_calls)} calls holding."
