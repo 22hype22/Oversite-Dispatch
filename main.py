@@ -941,22 +941,13 @@ def build_dispatch_system(region):
         "the black SUV on Highway 55, advise if you need backup'. NEVER ask a unit to "
         "advise a plate, location, or description they have already given. Only ask for "
         "a plate or location when the unit gave none at all.\n"
-        "- You CAN run plates, names, and people when a unit asks for a records check. "
-        "There is no real database, so you invent a realistic return and read it back like "
-        "a real dispatcher would, staying fully in character — never say you cannot run it, "
-        "and never hint that the result is made up. Keep returns short and in radio format. "
-        "Most returns should come back clean or valid, because that is what is realistic; "
-        "only occasionally does something flag.\n"
-        "- Running a PLATE, for example: 'that plate returns to a blue sedan, registered to "
-        "a [name], registration valid, no wants, not reported stolen' — or vary it with "
-        "'comes back clear', 'shows expired registration', 'registered owner has a revoked "
-        "license', or 'returns stolen out of the county, use caution' when you want to add "
-        "some action. Always reference the actual plate the unit gave you.\n"
-        "- Running a PERSON, name, or username, for example: 'that name comes back with a "
-        "valid license, no wants or warrants, no priors' — or occasionally 'shows a "
-        "misdemeanor warrant, confirm before you take action', 'has a suspended license', "
-        "or 'flagged as a known offender, use caution'. Always reference the actual name or "
-        "username the unit gave you.\n"
+        "- Plates, names, and records checks are run against a REAL database by another "
+        "part of dispatch, not by you. NEVER invent a return, a registered owner, a "
+        "warrant, or a license status — a made-up return would contradict the real one. "
+        "NEVER say 'stand by', 'give me a second', or that you will get back to them. If a "
+        "unit asks for a plate, name, or records check and has not yet given the plate or "
+        "the name, reply with exactly 'go ahead with that plate' or 'go ahead with that "
+        "name' and nothing else.\n"
         "- Only respond to genuine police, sheriff, or emergency radio traffic. If the "
         "transmission is off-topic, a joke, small talk, or a personal or non-police "
         "question (for example asking what you had for lunch), do NOT respond. In that "
@@ -2796,13 +2787,29 @@ _NAME_SKIP = {"name", "username", "user", "the", "is", "as", "in", "its", "it's"
               "spelled", "spelt", "spell", "goes", "by", "on", "im", "i'm", "checking", "check"}
 
 
+_RECORDS_REQ = re.compile(
+    r"\b(records? check|record check|wants and warrants|wants or warrants|warrant check|"
+    r"criminal history|check .{0,12}?for (?:wants|warrants|priors)|priors|"
+    r"10-?29|ten twenty ?nine|10-?27|ten twenty ?seven|"
+    r"run (?:him|her|them|this (?:guy|subject|person|driver)|a (?:name|person|subject|record)))\b", re.I)
+# The AI used to answer a records check with "stand by" and then nothing ever
+# came back. Any reply that promises a lookup is turned into a real one.
+_PROMISE = re.compile(
+    r"\b(stand ?by|give me a (?:second|sec|moment|minute)|one moment|hold on|"
+    r"let me (?:run|check|look|pull)|i'?ll (?:run|check|get back|have)|checking now|"
+    r"working on (?:that|it)|pulling (?:that|it) up|looking (?:that|it) up|"
+    r"go ahead with (?:that|the|your))\b", re.I)
+
+
 def lookup_request_kind(text):
-    """'run a plate' / 'have a name for you' -> which check is being asked for."""
+    """'run a plate' / 'have a name for you' / 'records check' -> which check."""
     low = _flat(text)
     if _PLATE_REQ.search(low):
         return "plate"
     if _NAME_REQ.search(low):
         return "name"
+    if _RECORDS_REQ.search(low):
+        return "plate" if "plate" in low else "name"
     return ""
 
 
@@ -3485,6 +3492,17 @@ async def process_transmission(member, text):
         print("ignored off-topic transmission", flush=True)
         return
     if body:
+        # Dispatch never promises to look something up and then goes quiet: a
+        # reply like "stand by" becomes the real check, asking for the plate
+        # or the name and handling whatever comes back next.
+        if _PROMISE.search(body):
+            low = _flat(text)
+            kind = "plate" if "plate" in low or "tag" in low else "name"
+            _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
+            ack = f"Unit {callsign}, " if callsign else ""
+            await announce(f"{ack}go ahead with that {kind}.",
+                           title="Plate Check" if kind == "plate" else "Name Check")
+            return
         if callsign:
             await announce(f"Unit {callsign}, " + strip_callsign_echo(body), title="Dispatch")
         else:
