@@ -65,6 +65,7 @@ if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
 BUILD = "memory-4"
+_BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -3828,60 +3829,77 @@ async def on_voice_state_update(member, before, after):
 
 @client.event
 async def on_ready():
-    global http, tone_path
+    global http, tone_path, VOICE_CHANNEL_ID
     if http is None:
         http = aiohttp.ClientSession()
-    await refresh_runtime_config()
     print(f"dispatch online as {client.user}", flush=True)
     print(f"running build: {BUILD}", flush=True)
-    print(f"region: {DISPATCH_REGION}", flush=True)
-    # --- TEMP DIAGNOSTIC: what does the bot actually hold for the ElevenLabs key? ---
-    print(f"ELEVENLABS_API_KEY check: len={len(XI_KEY)} | VOICE_ID={VOICE_ID!r}", flush=True)
-    # --- end diagnostic ---
-    load_links()
-    await load_state()
     try:
         client.loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(_graceful_shutdown()))
     except Exception as exc:
         print(f"could not hook SIGTERM: {exc}", flush=True)
-    await sync_commands()
-    if VOICE_CMD_ENABLED:
-        print("voice commands: ENABLED", flush=True)
-    else:
-        reason = "disabled by config" if not VOICE_COMMANDS else (
-            "voice-recv extension missing" if not VOICE_RECV_AVAILABLE else "libopus not loaded")
-        print(f"voice commands: OFF ({reason}) — 911 dispatch still runs normally", flush=True)
-    if AI_ENABLED:
-        print(f"ai responses: ENABLED (model {AI_MODEL})", flush=True)
-    else:
-        print("ai responses: OFF (set ANTHROPIC_API_KEY to let dispatch answer radio traffic)", flush=True)
-    if ALERT_TONES and tone_path is None:
-        tone_path = await client.loop.run_in_executor(None, make_tone)
-        print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
-    if TRAFFIC_STOP_RETURN:
-        print(f"traffic-stop auto-return: ON (flee speed {FLEE_SPEED}/sec, needs Move Members perm + /link)", flush=True)
-    else:
-        print("traffic-stop auto-return: OFF (set TRAFFIC_STOP_RETURN=1 to enable)", flush=True)
-    if STATUS_CHECKS:
-        print(f"status checks: ON (after {STATUS_CHECK_SECONDS}s on a stop; in-game PM needs command permission)", flush=True)
-    if OFFICER_DOWN:
-        print("officer-down detection: ON (auto-alerts when an on-duty unit is killed in game)", flush=True)
-    if CALLSIGN_NICK:
-        print("on-duty callsign nicknames: ON (needs Manage Nicknames perm; cannot rename the server owner)", flush=True)
-    if TS_CHANNEL_LABELS:
-        print("traffic-stop VC labels: ON (prepends nearest postal to Traffic Stop channels; needs Manage Channels perm)", flush=True)
-    await ensure_voice()
-    client.loop.create_task(_supervise("playback_worker", playback_worker))
-    client.loop.create_task(_supervise("dispatch_loop", dispatch_loop))
-    client.loop.create_task(_supervise("voice_guard", voice_guard))
-    client.loop.create_task(_supervise("stop_watch_loop", stop_watch_loop))
-    client.loop.create_task(_supervise("nick_watch_loop", nick_watch_loop))
-    client.loop.create_task(_supervise("officer_down_loop", officer_down_loop))
-    client.loop.create_task(_supervise("config_refresh_loop", config_refresh_loop))
-    client.loop.create_task(_supervise("voice_channel_watch_loop", voice_channel_watch_loop))
-    client.loop.create_task(_supervise("identity_watch_loop", identity_watch_loop))
-    client.loop.create_task(_supervise("state_save_loop", state_save_loop))
-    client.loop.create_task(_supervise("pursuit_track_loop", pursuit_track_loop))
+
+    # Back in the channel FIRST. One quick read for the channel id, then join.
+    # Secrets, region, saved memory, command sync and tone generation all
+    # happen after — command sync alone has taken over a minute when a guild
+    # rejects it, and it used to run ahead of the voice join, which is why a
+    # redeploy left the channel silent for so long.
+    try:
+        vc = await fetch_dispatch_voice_channel()
+        if vc:
+            VOICE_CHANNEL_ID = int(str(vc).strip())
+    except Exception as exc:
+        print(f"voice channel read failed: {exc}", flush=True)
+    joined = await ensure_voice()
+    print(f"voice ready {time.time() - _BOOT_T0:.1f}s after start "
+          f"({'in channel' if joined else 'not yet'})", flush=True)
+
+    # The watchers run while the rest of startup finishes.
+    for _name, _fn in (("playback_worker", playback_worker), ("dispatch_loop", dispatch_loop),
+                       ("voice_guard", voice_guard), ("stop_watch_loop", stop_watch_loop),
+                       ("nick_watch_loop", nick_watch_loop), ("officer_down_loop", officer_down_loop),
+                       ("config_refresh_loop", config_refresh_loop),
+                       ("voice_channel_watch_loop", voice_channel_watch_loop),
+                       ("identity_watch_loop", identity_watch_loop),
+                       ("state_save_loop", state_save_loop),
+                       ("pursuit_track_loop", pursuit_track_loop)):
+        client.loop.create_task(_supervise(_name, _fn))
+
+    async def _finish_startup():
+        await refresh_runtime_config()
+        print(f"region: {DISPATCH_REGION}", flush=True)
+        load_links()
+        await load_state()
+        if not joined:
+            await ensure_voice()
+        if VOICE_CMD_ENABLED:
+            print("voice commands: ENABLED", flush=True)
+        else:
+            reason = "disabled by config" if not VOICE_COMMANDS else (
+                "voice-recv extension missing" if not VOICE_RECV_AVAILABLE else "libopus not loaded")
+            print(f"voice commands: OFF ({reason}) — 911 dispatch still runs normally", flush=True)
+        if AI_ENABLED:
+            print(f"ai responses: ENABLED (model {AI_MODEL})", flush=True)
+        else:
+            print("ai responses: OFF (set ANTHROPIC_API_KEY to let dispatch answer radio traffic)", flush=True)
+        if TRAFFIC_STOP_RETURN:
+            print(f"traffic-stop auto-return: ON (flee speed {FLEE_SPEED}/sec, needs Move Members perm + /link)", flush=True)
+        if STATUS_CHECKS:
+            print(f"status checks: ON (after {STATUS_CHECK_SECONDS}s on a stop)", flush=True)
+        if OFFICER_DOWN:
+            print("officer-down detection: ON", flush=True)
+        if CALLSIGN_NICK:
+            print("on-duty callsign nicknames: ON (needs Manage Nicknames perm)", flush=True)
+        if TS_CHANNEL_LABELS:
+            print("traffic-stop VC labels: ON (needs Manage Channels perm)", flush=True)
+        if ALERT_TONES and tone_path is None:
+            globals()["tone_path"] = await client.loop.run_in_executor(None, make_tone)
+            print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
+        # Slowest and least urgent: a guild that rejects it can block for a minute.
+        await sync_commands()
+        print(f"startup complete {time.time() - _BOOT_T0:.1f}s after start", flush=True)
+
+    client.loop.create_task(_supervise("startup", _finish_startup))
 
 
 async def _supervise(name, factory):
