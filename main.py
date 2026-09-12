@@ -6,6 +6,7 @@ import wave
 import time
 import random
 import asyncio
+import traceback
 import difflib
 import logging
 import tempfile
@@ -404,9 +405,10 @@ async def fetch_bot_secret(key, diag=False):
         async with http.post(url, headers=headers, json=body) as resp:
             raw = await resp.text()
             if diag:
+                shown = raw[:200] if resp.status != 200 else f"<{len(raw.strip().strip(chr(34)))} chars>"
                 print(
                     f"secret[{key}]: bot_id={BOT_ORDER_ID!r} "
-                    f"HTTP {resp.status} body={raw[:200]!r}",
+                    f"HTTP {resp.status} body={shown}",
                     flush=True,
                 )
             if resp.status != 200:
@@ -2877,15 +2879,31 @@ async def on_ready():
     if TS_CHANNEL_LABELS:
         print("traffic-stop VC labels: ON (prepends nearest postal to Traffic Stop channels; needs Manage Channels perm)", flush=True)
     await ensure_voice()
-    client.loop.create_task(playback_worker())
-    client.loop.create_task(dispatch_loop())
-    client.loop.create_task(voice_guard())
-    client.loop.create_task(stop_watch_loop())
-    client.loop.create_task(nick_watch_loop())
-    client.loop.create_task(officer_down_loop())
-    client.loop.create_task(config_refresh_loop())
-    client.loop.create_task(voice_channel_watch_loop())
-    client.loop.create_task(identity_watch_loop())
+    client.loop.create_task(_supervise("playback_worker", playback_worker))
+    client.loop.create_task(_supervise("dispatch_loop", dispatch_loop))
+    client.loop.create_task(_supervise("voice_guard", voice_guard))
+    client.loop.create_task(_supervise("stop_watch_loop", stop_watch_loop))
+    client.loop.create_task(_supervise("nick_watch_loop", nick_watch_loop))
+    client.loop.create_task(_supervise("officer_down_loop", officer_down_loop))
+    client.loop.create_task(_supervise("config_refresh_loop", config_refresh_loop))
+    client.loop.create_task(_supervise("voice_channel_watch_loop", voice_channel_watch_loop))
+    client.loop.create_task(_supervise("identity_watch_loop", identity_watch_loop))
+
+
+async def _supervise(name, factory):
+    """Run a background loop and start it again if it ever raises. Before
+    this, one failed announcement (a TTS or API hiccup) ended the dispatch
+    loop for the life of the process while everything else kept logging."""
+    while not client.is_closed():
+        try:
+            await factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"{name} crashed, restarting in 5s: {exc!r}", flush=True)
+            traceback.print_exc()
+            await asyncio.sleep(5)
 
 
 client.run(TOKEN)
