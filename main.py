@@ -121,6 +121,10 @@ HOLD_SECONDS = float(os.environ.get("DISPATCH_HOLD_SECONDS", "3.0"))
 # After "go ahead with that plate", the next transmission from that unit within
 # this many seconds is the plate (or the name).
 LOOKUP_WINDOW = float(os.environ.get("DISPATCH_LOOKUP_WINDOW", "45"))
+# Spelling a plate comes through as several short transmissions. Dispatch
+# collects them and waits this long after the unit stops before answering,
+# instead of cutting in after the first letter or two.
+LOOKUP_HOLD = float(os.environ.get("LOOKUP_HOLD_SECONDS", "3.0"))
 # During a pursuit with an air unit up, how often the suspect's road is checked.
 TRACK_POLL_SECONDS = float(os.environ.get("TRACK_POLL_SECONDS", "2"))
 STATE_SAVE_SECONDS = int(os.environ.get("STATE_SAVE_SECONDS", "20"))
@@ -1742,6 +1746,7 @@ known_callsigns = {}   # normalised -> as written; every callsign dispatch has s
 voice_callsigns = {}   # Discord member id -> {"callsign", "at"}: who this voice is, learned from what they said
 plate_memory = {}      # normalised plate -> {"vehicle", "owner", "callsign", "at"}
 wanted_persons = {}    # normalised name -> {"name", "reason", "callsign", "at"}
+citations = {}         # normalised name -> [{"kind", "reason", "callsign", "at"}]: tickets and warnings
 last_subject = {}      # Discord member id -> {"name", "plate", "at"}: who they just ran
 _subject_any = {}      # the last person anyone ran, so any unit can follow up on it
 air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
@@ -1812,6 +1817,7 @@ def _state_snapshot():
         "voice_callsigns": {str(k): v for k, v in voice_callsigns.items()},
         "plate_memory": dict(sorted(plate_memory.items(), key=lambda kv: -float((kv[1] or {}).get("at") or 0))[:500]),
         "wanted_persons": dict(wanted_persons),
+        "citations": {k: v[-5:] for k, v in citations.items()},
         "response_cache": {k: v for k, v in response_cache.items() if isinstance(v, list)},
         "stop_channel_original": {str(k): v for k, v in stop_channel_original.items()},
         "active_stops": stops,
@@ -1891,6 +1897,7 @@ async def load_state():
                 voice_callsigns[int(k)] = v
         plate_memory.update({k: v for k, v in (st.get("plate_memory") or {}).items() if isinstance(v, dict)})
         wanted_persons.update({k: v for k, v in (st.get("wanted_persons") or {}).items() if isinstance(v, dict)})
+        citations.update({k: v for k, v in (st.get("citations") or {}).items() if isinstance(v, list)})
         response_cache.update({k: v for k, v in (st.get("response_cache") or {}).items() if isinstance(v, list)})
         for k, v in (st.get("stop_channel_original") or {}).items():
             if str(k).isdigit():
@@ -1918,7 +1925,7 @@ async def load_state():
     print(f"state restored: {len(status_board)} unit status(es), {len(bolos)} BOLO(s), "
           f"{len(callsign_links)} link(s), {len(known_callsigns)} known callsign(s), "
           f"{restored_stops} active stop(s), {len(plate_memory)} plate(s), "
-          f"{len(wanted_persons)} wanted", flush=True)
+          f"{len(wanted_persons)} wanted, {sum(len(v) for v in citations.values())} citation(s)", flush=True)
 
 
 async def state_save_loop():
@@ -2691,6 +2698,7 @@ def clean_transcript(text):
 
 _held = {}            # member id -> {"text", "at", "task"}: a transmission that stopped mid-thought
 _pending_lookup = {}  # member id -> {"kind", "callsign", "at"}: waiting for the plate or the name
+_lookup_buf = {}      # member id -> letters collected so far while they spell one out
 _speaking_now = set()
 
 RESTART_PHRASES = ("correction", "disregard", "scratch that", "strike that", "start over",
@@ -2793,7 +2801,10 @@ _NAME_SKIP = {"name", "names", "username", "user", "users", "the", "is", "as", "
               "any", "anything", "anybody", "anyone", "want", "wants", "warrant", "warrants", "wanted",
               "record", "records", "priors", "criminal", "history", "run", "running", "over", "pulled",
               "stopped", "stop", "vehicle", "car", "plate", "plates", "tag", "tags", "and", "or", "with",
-              "to", "me", "my", "got", "get", "have", "has", "there", "here", "back", "comes", "come"}
+              "to", "me", "my", "got", "get", "have", "has", "there", "here", "back", "comes", "come",
+              "ticket", "tickets", "citation", "citations", "warning", "warnings", "verbal", "written",
+              "cited", "ticketed", "issuing", "issued", "issue", "giving", "gave", "writing", "wrote",
+              "cutting", "serving", "served", "speeding"}
 
 
 _RECORDS_REQ = re.compile(
@@ -2999,6 +3010,71 @@ def clear_wanted(name):
     return wanted_persons.pop(norm_callsign(name), None) is not None
 
 
+CITE_EXPIRE = int(os.environ.get("CITE_EXPIRE", "604800"))  # a week
+
+_CITE_ADD = re.compile(
+    r"\b(?:issu(?:e|ed|ing)|wrote|writing|write|gave|giving|give|cut|cutting|serv(?:ed|ing))\b"
+    r"[^.]{0,30}?\b(citation|ticket|written warning|verbal warning|warning)\b", re.I)
+_CITE_QUESTION = re.compile(r"\b(any|was|were|did|does|do|has|have|is|are|got)\b[^.]{0,30}?"
+                            r"\b(citation|ticket|warning|cited|ticketed)\b", re.I)
+_Q_CITE = re.compile(r"\b(citation|citations|ticket|tickets|warning|warnings|cited|ticketed)\b", re.I)
+
+
+def human_ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"about {hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def add_citation(name, kind, reason, callsign=""):
+    name = str(name or "").strip()
+    if not name:
+        return
+    rec = {"kind": kind, "reason": (reason or "").strip(), "callsign": callsign, "at": time.time()}
+    citations.setdefault(norm_callsign(name), []).append(rec)
+    citations[norm_callsign(name)] = citations[norm_callsign(name)][-5:]
+    print(f"citation: {name} {kind} for {reason or 'unspecified'} per {callsign or 'unknown'}", flush=True)
+
+
+def citation_list(name):
+    """Live tickets and warnings on file for a name, newest first."""
+    key = norm_callsign(name)
+    recs = [r for r in (citations.get(key) or []) if time.time() - float(r.get("at") or 0) <= CITE_EXPIRE]
+    if recs:
+        citations[key] = recs
+    else:
+        citations.pop(key, None)
+    return sorted(recs, key=lambda r: -float(r.get("at") or 0))
+
+
+def citation_phrase(name, subject=""):
+    """'be advised, X was issued a ticket for speeding by Unit 1S-032 about ten
+    minutes ago' — what dispatch adds after a wants and warrants check."""
+    recs = citation_list(name)
+    if not recs:
+        return ""
+    who = subject or name
+    out = []
+    for i, r in enumerate(recs[:2]):
+        kind = r.get("kind") or "citation"
+        seg = f"{who} was issued a {kind}" if i == 0 else f"and another {kind}"
+        if r.get("reason"):
+            seg += f" for {r['reason']}"
+        if r.get("callsign"):
+            seg += f" by Unit {r['callsign']}"
+        seg += f" {human_ago(time.time() - float(r.get('at') or 0))}"
+        out.append(seg)
+    return "be advised, " + ", ".join(out)
+
+
 def wanted_phrase(name):
     """'wanted for armed robbery, per Unit 1S-032' — the line that leads a return."""
     rec = wanted_entry(name)
@@ -3058,7 +3134,8 @@ things this those to too under up us want wanted wants warrant warrants was we w
 which who whose will with would yes you your 10-27 10-28 10-29 1027 1028 1029 dispatch check checking
 criminal history plate plates tag tags vehicle car driving location 20 twenty
 user users username name names suspect individual male female party occupant dude kid lady gentleman
-anybody anyone pulled stopped stop my mine guy girl""".split())
+anybody anyone pulled stopped stop my mine guy girl
+ticket tickets citation citations warning warnings cited ticketed issued issue""".split())
 _Q_WANTS = re.compile(r"\b(wants?|warrants?|wanted|10-?29|ten twenty ?nine|priors|criminal history|record)\b", re.I)
 _Q_VEHICLE = re.compile(r"\b(driving|drive|drives|vehicle|car|plate|tag|10-?28|ten twenty ?eight)\b", re.I)
 _Q_WHERE = re.compile(r"\b(where|location|last seen|what.{0,8}20\b|his 20|her 20|their 20)\b", re.I)
@@ -3155,6 +3232,9 @@ def person_lines(real, ingame, vehicles, lead="", known_plate=""):
     flags = bolo_matches(real)
     if flags:
         out.append(f"matches an active BOLO: {flags[0]}")
+    cite = citation_phrase(real, lead or real)
+    if cite:
+        out.append(cite)
     return out
 
 
@@ -3168,32 +3248,48 @@ async def answer_followup(member, text, callsign):
     # subject, even when they say a word like "vehicle".
     if detect_status(text) or wants_backup(text) or wants_call_cleared(text) or extract_bolo(text):
         return False
+    # "Issuing him a ticket" states something; it is logged, not answered.
+    if _CITE_ADD.search(text) and not _CITE_QUESTION.search(text):
+        return False
     low = _flat(text)
     # It has to read as a question about somebody.
     if not (_PRONOUN.search(low) or re.search(
             r"\b(any|anything|what|whats|where|is|are|does|do|did|got|has|have|show|10-?29|10-?28)\b", low)):
         return False
     wants = bool(_Q_WANTS.search(low))
+    cites = bool(_Q_CITE.search(low))
     vehicle = bool(_Q_VEHICLE.search(low))
     where = bool(_Q_WHERE.search(low))
-    if not (wants or vehicle or where):
+    if not (wants or cites or vehicle or where):
         return False
     real = subj["name"]
     ack = f"Unit {callsign}, " if callsign else ""
     players, vehicles = await snapshot_players_vehicles()
     ingame = find_player_in(players, real)
     remember_subject(member, real, subj.get("plate"))
-    if wants:
+    if wants or cites:
         rec = wanted_entry(real)
+        if cites and not wants:
+            recs = citation_list(real)
+            if recs:
+                line = f"{ack}{citation_phrase(real, real)}."
+            else:
+                line = f"{ack}{real} has no citations or warnings on file."
+            await announce(line, title="Citations")
+            print(f"follow-up by {callsign or getattr(member, 'display_name', '?')} on {real}: citations", flush=True)
+            return True
         if rec:
             reason = rec.get("reason") or "an outstanding warrant"
             who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
             line = f"{ack}{real} is wanted for {reason}{who}, use caution."
         else:
-            line = f"{ack}{real} shows clear, no wants or warrants."
+            line = f"{ack}{real} shows clear, no current wants or warrants."
         flags = bolo_matches(real)
         if flags:
             line += f" Be advised, matches an active BOLO: {flags[0]}."
+        cite = citation_phrase(real, real)
+        if cite:
+            line += f" {cite[0].upper()}{cite[1:]}."
         await announce(line, title="Wants and Warrants", tone=bool(rec))
     elif vehicle:
         desc, plate = vehicle_for(vehicles, real)
@@ -3406,6 +3502,40 @@ async def handle_special(member, text, callsign):
     global air_manual_until
     now = time.time()
     ack = f"Unit {callsign}, " if callsign else ""
+    # "Issuing him a ticket for speeding" — logged against whoever is on the
+    # air, so a later wants and warrants check reports it.
+    cm = _CITE_ADD.search(text)
+    if cm and not _CITE_QUESTION.search(text):
+        kind = "warning" if "warning" in cm.group(1).lower() else "citation"
+        reason_m = re.search(r"\bfor\s+(.+?)(?:\.|$)", text, re.I)
+        reason = reason_m.group(1).strip() if reason_m else ""
+        # The reason clause is dropped before looking for who it was issued to,
+        # so "for no headlights" cannot be mistaken for a name.
+        body = re.sub(r"\bfor\s+.+$", "", text, flags=re.I)
+        cands = [t for t in re.split(r"[^A-Za-z0-9_]+", body)
+                 if len(t) >= 3 and t.lower() not in _NAME_SKIP and not is_callsign_token(t)
+                 and t.lower() not in ("dispatch", "issuing", "issued", "giving", "writing", "cutting", "serving")]
+        target, best_r = "", 0.0
+        if cands:
+            players, _v = await snapshot_players_vehicles()
+            for c in cands:
+                for pl in players:
+                    pname = str(pl.get("Player") or "").split(":")[0]
+                    r = difflib.SequenceMatcher(None, c.lower(), pname.lower()).ratio()
+                    if r > best_r:
+                        best_r, target = r, pname
+        if best_r < 0.6:
+            subj = recent_subject(member)
+            target = subj["name"] if subj else ""
+        if target:
+            add_citation(target, kind, reason, callsign)
+            remember_subject(member, target)
+            why = f" for {reason}" if reason else ""
+            await announce(f"{ack}copy, showing a {kind} issued to {target}{why}.", title="Citation")
+        else:
+            await announce(f"{ack}copy, who was that {kind} issued to?", title="Citation")
+        return True
+
     # "Any wants or warrants on that user?" is about the subject just run, so
     # it is answered before anything treats it as a brand new check. A unit
     # plainly offering a fresh plate or name skips straight to the lookup.
@@ -3503,6 +3633,71 @@ async def handle_special(member, text, callsign):
     return False
 
 
+def spelling_fragment(text):
+    """Mostly single letters, phonetic words or digits — the unit is spelling
+    something out and has not finished."""
+    toks = [t for t in re.split(r"[^a-z0-9]+", _flat(text)) if t]
+    if not toks:
+        return False
+    spelled = sum(1 for t in toks
+                  if len(t) == 1 or t in _PHON or t in _NUM_ONES or t in _NUM_TEEN or t in _NUM_TENS)
+    return spelled >= max(1, int(len(toks) * 0.6))
+
+
+async def run_buffered_lookup(member):
+    uid = getattr(member, "id", 0)
+    buf = _lookup_buf.pop(uid, None)
+    if not buf:
+        return
+    task = buf.get("task")
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+    pend = _pending_lookup.pop(uid, None) or {"kind": buf["kind"], "callsign": buf.get("callsign"),
+                                              "at": time.time()}
+    await run_lookup(member, pend, " ".join(buf["parts"]))
+
+
+async def collect_lookup(member, pend, text):
+    """A plate or a name given a few letters at a time. Each transmission is
+    added to what came before, and dispatch only answers once the unit has
+    stopped talking — never over the top of them mid-spell."""
+    uid = member.id
+    buf = _lookup_buf.get(uid)
+    if buf is None or buf.get("kind") != pend.get("kind"):
+        buf = {"kind": pend.get("kind"), "callsign": pend.get("callsign"), "parts": [], "task": None}
+        _lookup_buf[uid] = buf
+    if buf.get("task"):
+        buf["task"].cancel()
+        buf["task"] = None
+    buf["parts"].append(text)
+    joined = " ".join(buf["parts"])
+    _pending_lookup[uid] = {**pend, "at": time.time()}
+
+    if buf["kind"] == "plate":
+        got = parse_plate(joined)
+        # A full ER:LC plate is six or seven characters. Anything shorter, or a
+        # fragment that is still being spelled, waits for the rest.
+        done = len(got) >= 7 or (len(got) >= 6 and not spelling_fragment(text))
+    else:
+        got = parse_name(joined)
+        done = len(got) >= 3 and not spelling_fragment(text)
+    if done:
+        await run_buffered_lookup(member)
+        return
+
+    async def _later():
+        waited = 0.0
+        while True:
+            await asyncio.sleep(LOOKUP_HOLD)
+            waited += LOOKUP_HOLD
+            if uid not in _speaking_now or waited >= 20:
+                break
+        await run_buffered_lookup(member)
+
+    buf["task"] = asyncio.ensure_future(_later())
+    print(f"collecting {buf['kind']} from {getattr(member, 'display_name', uid)}: {joined!r} -> {got!r}", flush=True)
+
+
 async def handle_utterance(member, pcm):
     if len(pcm) < MIN_UTTER_BYTES:
         return
@@ -3525,8 +3720,7 @@ async def handle_utterance(member, pcm):
     # A lookup in progress: this transmission is the plate or the name.
     pend = _pending_lookup.get(uid)
     if pend and now - pend["at"] <= LOOKUP_WINDOW and not lookup_request_kind(text):
-        _pending_lookup.pop(uid, None)
-        await run_lookup(member, pend, text)
+        await collect_lookup(member, pend, text)
         return
 
     # Something held from a moment ago: a restart replaces it, a continuation joins it.
