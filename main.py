@@ -2785,9 +2785,15 @@ _NATO = {"a": "Alpha", "b": "Bravo", "c": "Charlie", "d": "Delta", "e": "Echo", 
          "v": "Victor", "w": "Whiskey", "x": "X-ray", "y": "Yankee", "z": "Zulu"}
 _PLATE_SKIP = {"plate", "plates", "the", "is", "as", "in", "its", "it's", "number", "reads", "read", "of", "a",
                "license", "licence", "tag", "dispatch", "for", "you", "go", "ahead", "copy", "ready", "that", "this"}
-_NAME_SKIP = {"name", "username", "user", "the", "is", "as", "in", "its", "it's", "of", "a", "dispatch", "for",
-              "you", "go", "ahead", "copy", "ready", "that", "this", "subject", "person", "roblox", "player",
-              "spelled", "spelt", "spell", "goes", "by", "on", "im", "i'm", "checking", "check"}
+_NAME_SKIP = {"name", "names", "username", "user", "users", "the", "is", "as", "in", "its", "it's", "of", "a",
+              "dispatch", "for", "you", "go", "ahead", "copy", "ready", "that", "this", "subject", "person",
+              "roblox", "player", "spelled", "spelt", "spell", "goes", "by", "on", "im", "i'm", "checking",
+              "check", "suspect", "individual", "male", "female", "party", "occupant", "guy", "dude", "kid",
+              "lady", "gentleman", "driver", "owner", "him", "her", "hers", "them", "they", "their", "his",
+              "any", "anything", "anybody", "anyone", "want", "wants", "warrant", "warrants", "wanted",
+              "record", "records", "priors", "criminal", "history", "run", "running", "over", "pulled",
+              "stopped", "stop", "vehicle", "car", "plate", "plates", "tag", "tags", "and", "or", "with",
+              "to", "me", "my", "got", "get", "have", "has", "there", "here", "back", "comes", "come"}
 
 
 _RECORDS_REQ = re.compile(
@@ -3050,10 +3056,15 @@ how i if in is it its just know last like me my no not now of on one or our out 
 records record run running same say see she show shows so subject that the their them then these they
 things this those to too under up us want wanted wants warrant warrants was we were what whats when where
 which who whose will with would yes you your 10-27 10-28 10-29 1027 1028 1029 dispatch check checking
-criminal history plate plates tag tags vehicle car driving location 20 twenty""".split())
+criminal history plate plates tag tags vehicle car driving location 20 twenty
+user users username name names suspect individual male female party occupant dude kid lady gentleman
+anybody anyone pulled stopped stop my mine guy girl""".split())
 _Q_WANTS = re.compile(r"\b(wants?|warrants?|wanted|10-?29|ten twenty ?nine|priors|criminal history|record)\b", re.I)
 _Q_VEHICLE = re.compile(r"\b(driving|drive|drives|vehicle|car|plate|tag|10-?28|ten twenty ?eight)\b", re.I)
 _Q_WHERE = re.compile(r"\b(where|location|last seen|what.{0,8}20\b|his 20|her 20|their 20)\b", re.I)
+# "I have a plate for you" / "run a name" — a fresh check, not a follow-up.
+_OFFER_LOOKUP = re.compile(r"\b(?:i(?:'ve)? (?:have|got)|have a|got a|run a|running a|need a|do a|get a)\b"
+                           r"[^.]{0,16}\b(plate|tag|name|username|record)\b", re.I)
 _PRONOUN = re.compile(r"\b(he|him|his|she|her|hers|they|them|their|that (?:subject|guy|person|driver|one|name|plate)|"
                       r"this (?:subject|guy|person|driver)|the (?:subject|driver|owner|same)|same (?:subject|guy|person|one))\b", re.I)
 
@@ -3395,6 +3406,13 @@ async def handle_special(member, text, callsign):
     global air_manual_until
     now = time.time()
     ack = f"Unit {callsign}, " if callsign else ""
+    # "Any wants or warrants on that user?" is about the subject just run, so
+    # it is answered before anything treats it as a brand new check. A unit
+    # plainly offering a fresh plate or name skips straight to the lookup.
+    if not _OFFER_LOOKUP.search(_flat(text)):
+        if _PRONOUN.search(text) or not names_someone_new(text):
+            if await answer_followup(member, text, callsign):
+                return True
     kind = lookup_request_kind(text)
     if kind == "plate":
         plate = parse_plate(re.sub(r".*\bplate\b", "", _flat(text)))
@@ -3406,16 +3424,18 @@ async def handle_special(member, text, callsign):
         return True
     if kind == "name":
         name = parse_name(re.sub(r".*\b(name|username|user name|subject|person)\b", "", _flat(text)))
-        if len(name) >= 3 and name not in ("for", "you"):
+        if len(name) >= 3 and name not in _NAME_SKIP:
             await run_lookup(member, {"kind": "name", "callsign": callsign, "at": now}, text)
             return True
         _pending_lookup[member.id] = {"kind": "name", "callsign": callsign, "at": now}
         await announce(f"{ack}go ahead with that name.", title="Name Check")
         return True
-    # "Any wants or warrants?" straight after a check is about that same
-    # subject — answer it instead of asking who they mean.
-    if _PRONOUN.search(text) or not names_someone_new(text):
-        if await answer_followup(member, text, callsign):
+    # "Run ByteRider99 for warrants" — a records question that names somebody
+    # in the same breath, so there is nothing to ask for.
+    if _Q_WANTS.search(_flat(text)) and names_someone_new(text) and not _WANTED_ADD.search(text):
+        cand = parse_name(text)
+        if len(cand) >= 3 and cand not in _NAME_SKIP:
+            await run_lookup(member, {"kind": "name", "callsign": callsign, "at": now}, text)
             return True
     m = _WANTED_CLEAR.search(text)
     if m:
