@@ -109,7 +109,7 @@ PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
 PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 PURSUIT_CALLOUT_SECONDS = float(os.environ.get("PURSUIT_CALLOUT_SECONDS", "25"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
-LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
+LOG_HEARD = os.environ.get("LOG_HEARD", "1").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
@@ -1747,6 +1747,7 @@ def load_links():
 # ============================================================================
 
 known_callsigns = {}   # normalised -> as written; every callsign dispatch has seen or been told
+voice_callsigns = {}   # Discord member id -> {"callsign", "at"}: who this voice is, learned from what they said
 plate_memory = {}      # normalised plate -> {"vehicle", "owner", "callsign", "at"}
 air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
 manual_tracks = {}     # normalised player name -> {"name", "callsign", "since", "street", "last_call"}
@@ -1766,13 +1767,35 @@ def member_callsign(member):
     or the [TAG] the bot put on their nickname when they came on duty."""
     if member is None:
         return ""
-    link = callsign_links.get(getattr(member, "id", 0)) or {}
+    uid = getattr(member, "id", 0)
+    link = callsign_links.get(uid) or {}
     if link.get("callsign"):
         return str(link["callsign"])
     m = re.match(r"^\[([^\]]{1,12})\]", str(getattr(member, "display_name", "") or ""))
     if m and any(ch.isdigit() for ch in m.group(1)):
         return m.group(1).strip()
+    heard = voice_callsigns.get(uid) or {}
+    if heard.get("callsign") and time.time() - float(heard.get("at") or 0) < 12 * 3600:
+        return str(heard["callsign"])
     return ""
+
+
+async def learn_voice_callsign(member, spoken, callsign):
+    """A unit that gave its callsign in a transmission is that callsign from
+    then on: the next time this voice keys up without one, or with a garbled
+    one, dispatch still knows who it is. Tags the nickname when that is on."""
+    if not (spoken and callsign) or member is None:
+        return
+    prev = (voice_callsigns.get(member.id) or {}).get("callsign")
+    voice_callsigns[member.id] = {"callsign": callsign, "at": time.time()}
+    remember_callsign(callsign)
+    if prev != callsign:
+        print(f"voice: {getattr(member, 'display_name', member.id)} is {callsign}", flush=True)
+        if CALLSIGN_NICK and not member_callsign(member) == callsign:
+            try:
+                await set_duty_nick(member, callsign)
+            except Exception as exc:
+                print(f"voice: nick tag failed: {exc}", flush=True)
 
 
 def _state_snapshot():
@@ -1791,6 +1814,7 @@ def _state_snapshot():
         "seen_kills": sorted(str(k) for k in seen_kills),
         "nick_original": {str(k): v for k, v in nick_original.items()},
         "known_callsigns": dict(known_callsigns),
+        "voice_callsigns": {str(k): v for k, v in voice_callsigns.items()},
         "plate_memory": dict(plate_memory),
         "response_cache": {k: v for k, v in response_cache.items() if isinstance(v, list)},
         "stop_channel_original": {str(k): v for k, v in stop_channel_original.items()},
@@ -1866,6 +1890,9 @@ async def load_state():
                 nick_original[int(k)] = v
         known_callsigns.update({k: v for k, v in (st.get("known_callsigns") or {}).items()
                                 if isinstance(k, str) and isinstance(v, str)})
+        for k, v in (st.get("voice_callsigns") or {}).items():
+            if str(k).isdigit() and isinstance(v, dict):
+                voice_callsigns[int(k)] = v
         plate_memory.update({k: v for k, v in (st.get("plate_memory") or {}).items() if isinstance(v, dict)})
         response_cache.update({k: v for k, v in (st.get("response_cache") or {}).items() if isinstance(v, list)})
         for k, v in (st.get("stop_channel_original") or {}).items():
@@ -3240,7 +3267,9 @@ async def handle_utterance(member, pcm):
 
 
 async def process_transmission(member, text):
-    callsign = resolve_callsign(extract_callsign(text), member)
+    spoken = extract_callsign(text)
+    callsign = resolve_callsign(spoken, member)
+    await learn_voice_callsign(member, spoken, callsign)
     if await handle_special(member, text, callsign):
         return
     if wants_repeat(text):
