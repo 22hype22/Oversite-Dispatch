@@ -1979,10 +1979,7 @@ async def suspect_vehicle_near(officer_pos):
     nk = norm_callsign(nearest_name)
     for v in vehicles:
         if norm_callsign(str(v.get("Owner") or "")) == nk:
-            texture = str(v.get("Texture") or "").strip()
-            name = str(v.get("Name") or "").strip()
-            plate = str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or "").strip()
-            return " ".join(x for x in (texture, name) if x), plate
+            return describe_vehicle(v), str(v.get("Plate") or "").strip()
     return "", ""
 
 
@@ -2858,14 +2855,22 @@ async def snapshot_players_vehicles():
     return (players if isinstance(players, list) else []), (vehicles if isinstance(vehicles, list) else [])
 
 
+def describe_vehicle(v):
+    """'Super Red Redline Fire Engine' the way an MDT return reads: colour,
+    livery when there is one, then the model."""
+    color = str(v.get("ColorName") or "").strip()
+    texture = str(v.get("Texture") or "").strip()
+    name = str(v.get("Name") or "").strip()
+    if texture and texture.lower() in name.lower():
+        texture = ""
+    return " ".join(x for x in (color, texture, name) if x)
+
+
 def vehicle_for(vehicles, owner_name):
     nk = norm_callsign(owner_name)
     for v in vehicles:
         if norm_callsign(str(v.get("Owner") or "")) == nk:
-            texture = str(v.get("Texture") or "").strip()
-            name = str(v.get("Name") or "").strip()
-            plate = str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or "").strip()
-            return " ".join(x for x in (texture, name) if x), plate
+            return describe_vehicle(v), str(v.get("Plate") or "").strip()
     return "", ""
 
 
@@ -2932,10 +2937,9 @@ async def run_lookup(member, pend, text):
         pk = norm_callsign(plate)
         hit = None
         for v in vehicles:
-            vplate = norm_callsign(str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or ""))
+            vplate = norm_callsign(str(v.get("Plate") or ""))
             if vplate and vplate == pk:
-                hit = {"vehicle": " ".join(x for x in (str(v.get("Texture") or "").strip(), str(v.get("Name") or "").strip()) if x),
-                       "owner": str(v.get("Owner") or "").strip(), "live": True}
+                hit = {"vehicle": describe_vehicle(v), "owner": str(v.get("Owner") or "").strip(), "live": True}
                 break
         if hit is None and pk in plate_memory:
             m = plate_memory[pk]
