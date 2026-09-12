@@ -1749,6 +1749,7 @@ def load_links():
 known_callsigns = {}   # normalised -> as written; every callsign dispatch has seen or been told
 voice_callsigns = {}   # Discord member id -> {"callsign", "at"}: who this voice is, learned from what they said
 plate_memory = {}      # normalised plate -> {"vehicle", "owner", "callsign", "at"}
+wanted_persons = {}    # normalised name -> {"name", "reason", "callsign", "at"}
 air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
 manual_tracks = {}     # normalised player name -> {"name", "callsign", "since", "street", "last_call"}
 _last_state_blob = None
@@ -1815,7 +1816,8 @@ def _state_snapshot():
         "nick_original": {str(k): v for k, v in nick_original.items()},
         "known_callsigns": dict(known_callsigns),
         "voice_callsigns": {str(k): v for k, v in voice_callsigns.items()},
-        "plate_memory": dict(plate_memory),
+        "plate_memory": dict(sorted(plate_memory.items(), key=lambda kv: -float((kv[1] or {}).get("at") or 0))[:500]),
+        "wanted_persons": dict(wanted_persons),
         "response_cache": {k: v for k, v in response_cache.items() if isinstance(v, list)},
         "stop_channel_original": {str(k): v for k, v in stop_channel_original.items()},
         "active_stops": stops,
@@ -1894,6 +1896,7 @@ async def load_state():
             if str(k).isdigit() and isinstance(v, dict):
                 voice_callsigns[int(k)] = v
         plate_memory.update({k: v for k, v in (st.get("plate_memory") or {}).items() if isinstance(v, dict)})
+        wanted_persons.update({k: v for k, v in (st.get("wanted_persons") or {}).items() if isinstance(v, dict)})
         response_cache.update({k: v for k, v in (st.get("response_cache") or {}).items() if isinstance(v, list)})
         for k, v in (st.get("stop_channel_original") or {}).items():
             if str(k).isdigit():
@@ -1920,7 +1923,8 @@ async def load_state():
     _last_state_blob = json.dumps(_state_snapshot(), sort_keys=True, default=str)
     print(f"state restored: {len(status_board)} unit status(es), {len(bolos)} BOLO(s), "
           f"{len(callsign_links)} link(s), {len(known_callsigns)} known callsign(s), "
-          f"{restored_stops} active stop(s), {len(plate_memory)} plate(s)", flush=True)
+          f"{restored_stops} active stop(s), {len(plate_memory)} plate(s), "
+          f"{len(wanted_persons)} wanted", flush=True)
 
 
 async def state_save_loop():
@@ -2534,6 +2538,8 @@ async def end_stop_pursuit(uid, stop, street):
         players, _v = await snapshot_players_vehicles()
         stop["suspect"] = nearest_suspect(players, stop.get("last"))
         stop["track_street"] = ""
+        if stop["suspect"]:
+            add_wanted(stop["suspect"], "fleeing and eluding", stop.get("callsign"))
     except Exception as exc:
         print(f"could not identify the suspect: {exc}", flush=True)
     await move_member(stop["member"], VOICE_CHANNEL_ID)
@@ -2830,10 +2836,10 @@ def parse_plate(text):
 
 def spell_plate(plate):
     parts = []
-    for ch in plate:
+    for ch in str(plate or ""):
         if ch.isalpha():
             parts.append(_NATO.get(ch.lower(), ch))
-        else:
+        elif ch.isdigit():
             parts.append(ch)
     return " ".join(parts)
 
@@ -2879,7 +2885,10 @@ async def snapshot_players_vehicles():
     data = await erlc_get("/server?Players=true&Vehicles=true")
     players = data.get("Players") if isinstance(data, dict) else None
     vehicles = data.get("Vehicles") if isinstance(data, dict) else None
-    return (players if isinstance(players, list) else []), (vehicles if isinstance(vehicles, list) else [])
+    players = players if isinstance(players, list) else []
+    vehicles = vehicles if isinstance(vehicles, list) else []
+    remember_vehicles(vehicles)
+    return players, vehicles
 
 
 def describe_vehicle(v):
@@ -2937,6 +2946,78 @@ async def roblox_profile(name):
         return None
 
 
+WANTED_EXPIRE = int(os.environ.get("WANTED_EXPIRE", "21600"))  # 6 hours
+
+_WANTED_ADD = re.compile(
+    r"(?:be advised,?\s*)?(?:that\s+)?(?:subject\s+|suspect\s+|player\s+|user\s+|driver\s+)?"
+    r"([a-z0-9_]{3,24})\s+(?:is|has|shows|comes back)\s+(?:back\s+)?"
+    r"(?:as\s+)?(?:10-?99|ten ninety ?nine|wanted|a wanted|flagged|"
+    r"(?:got |with )?an? (?:active )?(?:felony |arrest )?warrant)", re.I)
+_WANTED_CLEAR = re.compile(
+    r"\b(?:clear|cancel|remove|drop|void)\b.{0,24}?\b(?:wanted|warrant|flag)\b.{0,12}?"
+    r"(?:on|for)\s+([a-z0-9_]{3,24})|([a-z0-9_]{3,24})\s+is\s+(?:now\s+)?in custody", re.I)
+_WANTED_REASON = re.compile(r"\bwanted\s+(?:for|on)\s+(.+?)(?:\.|$)", re.I)
+
+
+def wanted_entry(name):
+    """The live wanted record for a name, or None. Records age out."""
+    rec = wanted_persons.get(norm_callsign(name))
+    if not rec:
+        return None
+    if time.time() - float(rec.get("at") or 0) > WANTED_EXPIRE:
+        wanted_persons.pop(norm_callsign(name), None)
+        return None
+    return rec
+
+
+def add_wanted(name, reason, callsign=""):
+    name = str(name or "").strip()
+    if not name:
+        return
+    wanted_persons[norm_callsign(name)] = {"name": name, "reason": (reason or "").strip(),
+                                           "callsign": callsign, "at": time.time()}
+    print(f"wanted: {name} for {reason or 'unspecified'} per {callsign or 'unknown'}", flush=True)
+
+
+def clear_wanted(name):
+    return wanted_persons.pop(norm_callsign(name), None) is not None
+
+
+def wanted_phrase(name):
+    """'wanted for armed robbery, per Unit 1S-032' — the line that leads a return."""
+    rec = wanted_entry(name)
+    if not rec:
+        return ""
+    reason = rec.get("reason") or "an outstanding warrant"
+    who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
+    return f"wanted for {reason}{who}"
+
+
+def remember_vehicles(vehicles):
+    """Every plate seen on the map is filed with its owner, so a plate check
+    still returns the driver after they log off."""
+    now = time.time()
+    for v in vehicles or []:
+        plate = str(v.get("Plate") or "").strip()
+        if not plate:
+            continue
+        plate_memory[norm_callsign(plate)] = {"plate": plate, "vehicle": describe_vehicle(v),
+                                              "owner": str(v.get("Owner") or "").strip(), "at": now}
+
+
+def plate_for_owner(vehicles, owner_name):
+    """The plate on the vehicle this player is driving, live or last known."""
+    _desc, plate = vehicle_for(vehicles, owner_name)
+    if plate:
+        return plate
+    nk = norm_callsign(owner_name)
+    best, best_at = "", 0.0
+    for rec in plate_memory.values():
+        if norm_callsign(rec.get("owner") or "") == nk and float(rec.get("at") or 0) > best_at:
+            best, best_at = rec.get("plate") or "", float(rec.get("at") or 0)
+    return best
+
+
 def bolo_matches(needle):
     nk = norm_callsign(needle)
     if not nk:
@@ -2953,6 +3034,62 @@ async def run_lookup(member, pend, text):
     cs = pend.get("callsign") or member_callsign(member)
     ack = f"Unit {cs}, " if cs else ""
     kind = pend.get("kind")
+    players, vehicles = await snapshot_players_vehicles()
+
+    def find_player(name):
+        best, best_r = None, 0.0
+        for p in players:
+            pname = str(p.get("Player") or "").split(":")[0]
+            r = difflib.SequenceMatcher(None, name.lower(), pname.lower()).ratio()
+            if r > best_r:
+                best_r, best = r, p
+        return best if best_r >= 0.72 else None
+
+    def person_lines(real, ingame, lead="", known_plate=""):
+        """What dispatch knows about a person: wanted first, then where they
+        are, what they are driving and its plate. A vehicle already named in
+        the return (the one the plate was run on) is not described twice."""
+        out = []
+        subject = lead or real
+        want = wanted_phrase(real)
+        if want:
+            out.append(f"be advised, {subject} is {want}")
+        if ingame is not None:
+            team = str(ingame.get("Team") or "").strip()
+            icall = str(ingame.get("Callsign") or "").strip()
+            seg = f"{subject} is in the server" if lead else "shows in the server"
+            if team:
+                seg += f" on {team}"
+            if icall:
+                seg += f" as unit {icall}"
+            out.append(seg)
+            desc, plate = vehicle_for(vehicles, real)
+            same = known_plate and plate and norm_callsign(plate) == norm_callsign(known_plate)
+            if desc and not same:
+                veh = f"driving a {desc}"
+                if plate:
+                    veh += f", plate {spell_plate(plate)}"
+                out.append(veh)
+            elif desc and same:
+                out.append("driving that vehicle now")
+            elif not desc:
+                known = plate_for_owner(vehicles, real)
+                if known and norm_callsign(known) != norm_callsign(known_plate or ""):
+                    out.append(f"last known plate {spell_plate(known)}")
+            street = extract_street(ingame)
+            postal = extract_postal(ingame)
+            if street:
+                out.append(f"last seen on {street}, postal {postal}" if postal else f"last seen on {street}")
+        else:
+            out.append(f"{subject} is not currently in the server" if lead else "not currently in the server")
+            known = plate_for_owner(vehicles, real)
+            if known and norm_callsign(known) != norm_callsign(known_plate or ""):
+                out.append(f"last known plate {spell_plate(known)}")
+        flags = bolo_matches(real)
+        if flags:
+            out.append(f"matches an active BOLO: {flags[0]}")
+        return out
+
     if kind == "plate":
         plate = parse_plate(text)
         if len(plate) < 2:
@@ -2960,37 +3097,36 @@ async def run_lookup(member, pend, text):
             await announce(f"{ack}dispatch did not catch that plate, say again.", title="Plate Check")
             return
         spelled = spell_plate(plate)
-        players, vehicles = await snapshot_players_vehicles()
         pk = norm_callsign(plate)
         hit = None
         for v in vehicles:
-            vplate = norm_callsign(str(v.get("Plate") or ""))
-            if vplate and vplate == pk:
+            if norm_callsign(str(v.get("Plate") or "")) == pk:
                 hit = {"vehicle": describe_vehicle(v), "owner": str(v.get("Owner") or "").strip(), "live": True}
                 break
         if hit is None and pk in plate_memory:
             m = plate_memory[pk]
             hit = {"vehicle": m.get("vehicle") or "", "owner": m.get("owner") or "", "live": False}
-        flags = bolo_matches(plate)
-        if hit:
-            owner = hit["owner"]
-            where = ""
-            if owner:
-                for p in players:
-                    if norm_callsign(str(p.get("Player") or "").split(":")[0]) == norm_callsign(owner):
-                        team = str(p.get("Team") or "").strip()
-                        where = f", currently in the server on {team}" if team else ", currently in the server"
-                        break
-                if not where and hit.get("live") is False:
-                    where = ", owner not currently in the server"
-            line = f"{ack}plate {spelled} returns to a {hit['vehicle'] or 'vehicle'}"
-            line += f", registered to {owner}{where}." if owner else "."
-        else:
+        if not hit:
             line = f"{ack}plate {spelled} shows no record on file."
+            flags = bolo_matches(plate)
+            if flags:
+                line += f" Be advised, that plate matches an active BOLO: {flags[0]}."
+            await announce(line, title="Plate Check")
+            print(f"plate check by {cs or member.display_name}: {plate} -> no record", flush=True)
+            return
+        owner = hit["owner"]
+        parts = [f"{ack}plate {spelled} returns to a {hit['vehicle'] or 'vehicle'}"]
+        if owner:
+            parts.append(f"registered to {owner}")
+            parts.extend(person_lines(owner, find_player(owner), lead="the registered owner", known_plate=plate))
+        else:
+            parts.append("no registered owner on file")
+        flags = bolo_matches(plate)
         if flags:
-            line += f" Be advised, that plate matches an active BOLO: {flags[0]}."
-        await announce(line, title="Plate Check")
-        print(f"plate check by {cs or member.display_name}: {plate} -> {'hit' if hit else 'no record'}", flush=True)
+            parts.append(f"that plate matches an active BOLO: {flags[0]}")
+        await announce(", ".join(parts) + ".", title="Plate Check")
+        print(f"plate check by {cs or member.display_name}: {plate} -> {owner or 'unknown owner'}"
+              f"{' WANTED' if wanted_entry(owner) else ''}", flush=True)
         return
 
     name = parse_name(text)
@@ -2998,19 +3134,11 @@ async def run_lookup(member, pend, text):
         _pending_lookup[member.id] = {**pend, "at": time.time()}
         await announce(f"{ack}dispatch did not catch that name, say again.", title="Name Check")
         return
-    players, vehicles = await snapshot_players_vehicles()
-    ingame = None
-    best = 0.0
-    for p in players:
-        pname = str(p.get("Player") or "").split(":")[0]
-        r = difflib.SequenceMatcher(None, name.lower(), pname.lower()).ratio()
-        if r > best:
-            best, ingame = r, p
-    if ingame is not None and best < 0.72:
-        ingame = None
-    real = str(ingame.get("Player") or "").split(":")[0] if ingame else name
+    ingame = find_player(name)
+    real = str(ingame.get("Player") or "").split(":")[0] if ingame is not None else name
+    parts = [f"{ack}name {real} returns"]
+    parts.extend(person_lines(real, ingame))
     profile = await roblox_profile(real)
-    parts = [f"{ack}name {real}"]
     if profile:
         if profile.get("age"):
             parts.append(f"Roblox account is {profile['age']} old")
@@ -3018,28 +3146,9 @@ async def run_lookup(member, pend, text):
             parts.append("the account is banned on Roblox")
     else:
         parts.append("no Roblox account by that exact name")
-    if ingame:
-        team = str(ingame.get("Team") or "").strip()
-        icall = str(ingame.get("Callsign") or "").strip()
-        veh, _pl = vehicle_for(vehicles, real)
-        seg = "currently in the server"
-        if team:
-            seg += f" on {team}"
-        if icall:
-            seg += f" as unit {icall}"
-        if veh:
-            seg += f", driving a {veh}"
-        street = extract_street(ingame)
-        if street:
-            seg += f", last seen on {street}"
-        parts.append(seg)
-    else:
-        parts.append("not currently in the server")
-    flags = bolo_matches(real)
-    if flags:
-        parts.append(f"be advised, the name matches an active BOLO: {flags[0]}")
     await announce(", ".join(parts) + ".", title="Name Check")
-    print(f"name check by {cs or member.display_name}: {name} -> {real} ({'in game' if ingame else 'not in game'})", flush=True)
+    print(f"name check by {cs or member.display_name}: {name} -> {real}"
+          f"{' WANTED' if wanted_entry(real) else ''} ({'in game' if ingame is not None else 'not in game'})", flush=True)
 
 
 def wants_air_up(text):
@@ -3168,6 +3277,40 @@ async def handle_special(member, text, callsign):
         _pending_lookup[member.id] = {"kind": "name", "callsign": callsign, "at": now}
         await announce(f"{ack}go ahead with that name.", title="Name Check")
         return True
+    m = _WANTED_CLEAR.search(text)
+    if m:
+        target = (m.group(1) or m.group(2) or "").strip()
+        players, _v = await snapshot_players_vehicles()
+        best, best_r = target, 0.0
+        for p in players:
+            pname = str(p.get("Player") or "").split(":")[0]
+            r = difflib.SequenceMatcher(None, target.lower(), pname.lower()).ratio()
+            if r > best_r:
+                best_r, best = r, pname
+        real = best if best_r >= 0.6 else target
+        if clear_wanted(real):
+            await announce(f"{ack}copy, the wanted on {real} is cleared.", title="Wanted Cleared")
+            return True
+        return False
+    m = _WANTED_ADD.search(text)
+    if m and not detect_status(text):
+        target = m.group(1).strip()
+        if target.lower() not in ("dispatch", "unit", "subject", "suspect", "driver") and not is_callsign_token(target):
+            reason_m = _WANTED_REASON.search(text)
+            reason = reason_m.group(1).strip() if reason_m else ""
+            players, _v = await snapshot_players_vehicles()
+            best, best_r = target, 0.0
+            for p in players:
+                pname = str(p.get("Player") or "").split(":")[0]
+                r = difflib.SequenceMatcher(None, target.lower(), pname.lower()).ratio()
+                if r > best_r:
+                    best_r, best = r, pname
+            real = best if best_r >= 0.6 else target
+            add_wanted(real, reason, callsign)
+            why = f" for {reason}" if reason else ""
+            await announce(f"{ack}copy, {real} is flagged wanted{why}. All units be advised.",
+                           title="Wanted", tone=True)
+            return True
     if wants_air_down(text):
         air_manual_until = 0.0
         await announce(f"{ack}copy, air unit is down.", title="Air Unit")
