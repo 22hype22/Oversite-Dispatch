@@ -7,6 +7,8 @@ import time
 import random
 import asyncio
 import traceback
+import signal
+from array import array
 import difflib
 import logging
 import tempfile
@@ -62,7 +64,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "roster-3"
+BUILD = "memory-4"
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -74,7 +76,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 XI_KEY = os.environ["ELEVENLABS_API_KEY"]
 VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWW03F9")
-XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2")
+XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")  # the lowest-latency voice model
 GUILD_ID = int(os.environ.get("DISPATCH_GUILD_ID", "0") or "0")
 VOICE_CHANNEL_ID = int(os.environ.get("DISPATCH_VOICE_CHANNEL_ID", "0") or "0")
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
@@ -111,6 +113,16 @@ LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no",
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
+# How long dispatch waits after a transmission that stopped mid-thought before
+# deciding the unit is done, so a stumble is never answered as if it were the
+# whole message.
+HOLD_SECONDS = float(os.environ.get("DISPATCH_HOLD_SECONDS", "3.0"))
+# After "go ahead with that plate", the next transmission from that unit within
+# this many seconds is the plate (or the name).
+LOOKUP_WINDOW = float(os.environ.get("DISPATCH_LOOKUP_WINDOW", "45"))
+# During a pursuit with an air unit up, how often the suspect's road is checked.
+TRACK_POLL_SECONDS = float(os.environ.get("TRACK_POLL_SECONDS", "2"))
+STATE_SAVE_SECONDS = int(os.environ.get("STATE_SAVE_SECONDS", "20"))
 # When an officer calls a traffic stop while sitting in a "Traffic Stop"-style
 # voice channel, prepend the nearest postal code to that channel's name, then
 # restore the original name once the stop ends / everyone leaves. Needs the
@@ -701,15 +713,21 @@ async def synthesize(text):
 
 async def announce(text, title="911 Call", tone=False):
     print(f"announce: {text[:80]}", flush=True)
-    if TEXT_CHANNEL_ID:
+
+    async def _log():
+        if not TEXT_CHANNEL_ID:
+            return
         channel = client.get_channel(TEXT_CHANNEL_ID)
-        if channel is not None:
-            try:
-                embed = discord.Embed(title=f"📻 {title}", description=text, color=0x3B82F6)
-                await channel.send(embed=embed)
-            except Exception as exc:
-                print(f"text log failed: {exc}", flush=True)
-    path = await synthesize(text)
+        if channel is None:
+            return
+        try:
+            embed = discord.Embed(title=f"📻 {title}", description=text, color=0x3B82F6)
+            await channel.send(embed=embed)
+        except Exception as exc:
+            print(f"text log failed: {exc}", flush=True)
+
+    # The text log and the voice are produced at the same time.
+    path, _ = await asyncio.gather(synthesize(text), _log())
     if path:
         if tone and ALERT_TONES and tone_path:
             await play_queue.put(tone_path)
@@ -718,12 +736,20 @@ async def announce(text, title="911 Call", tone=False):
 
 
 def pcm_to_wav(pcm):
+    """Left channel only: half the bytes to upload, nothing lost from a mono
+    microphone, so the transcript comes back sooner."""
+    try:
+        samples = array("h")
+        samples.frombytes(pcm[: len(pcm) - (len(pcm) % 4)])
+        data, channels = samples[0::2].tobytes(), 1
+    except Exception:
+        data, channels = pcm, 2
     buf = io.BytesIO()
     with wave.open(buf, "wb") as handle:
-        handle.setnchannels(2)
+        handle.setnchannels(channels)
         handle.setsampwidth(2)
         handle.setframerate(48000)
-        handle.writeframes(pcm)
+        handle.writeframes(data)
     return buf.getvalue()
 
 
@@ -1038,6 +1064,7 @@ async def link_command(interaction, callsign: str, roblox: str = ""):
         await safe_respond(interaction, "Give me your callsign, like 1S-32.")
         return
     callsign_links[interaction.user.id] = {"callsign": callsign, "roblox": roblox}
+    remember_callsign(callsign)
     save_links()
     print(f"{interaction.user} linked callsign {callsign} roblox '{roblox}'", flush=True)
     extra = f", matching in-game name **{roblox}**" if roblox else " (matching by your Discord name)"
@@ -1376,21 +1403,39 @@ def spoken_compact(text):
     return "".join(out)
 
 
-def resolve_callsign(spoken):
+def resolve_callsign(spoken, member=None):
+    """Snap what was heard to a callsign dispatch knows: units on the map right
+    now, every callsign it has ever seen or been told, and the speaker's own.
+    "one S zero three two" heard as "one S zero thirty two" still lands on
+    1S-032, and a unit that only mumbled its number is still recognised by
+    the tag on its own nickname."""
+    own = member_callsign(member)
     if not spoken:
-        return spoken
-    active = list({v[0] for v in officer_last_seen.values() if v[0]})
-    if not active:
-        return spoken
+        return own or spoken
     target = spoken_compact(spoken)
     if not target:
-        return spoken
-    best, best_r = spoken, 0.0
-    for cs in active:
-        r = difflib.SequenceMatcher(None, target, norm_callsign(cs)).ratio()
+        return own or spoken
+    active = {norm_callsign(v[0]): v[0] for v in officer_last_seen.values() if v and v[0]}
+    known = dict(known_callsigns)
+    known.update(active)
+    if own:
+        known.setdefault(norm_callsign(own), own)
+    if target in known:
+        return known[target]
+    best, best_r = None, 0.0
+    for nk, disp in known.items():
+        r = difflib.SequenceMatcher(None, target, nk).ratio()
+        if nk in active:
+            r += 0.08  # a unit on the map right now is the likelier match
         if r > best_r:
-            best_r, best = r, cs
-    return best if best_r >= 0.5 else spoken
+            best_r, best = r, disp
+    if own and best_r < 0.9 and difflib.SequenceMatcher(None, target, norm_callsign(own)).ratio() >= 0.45:
+        return own
+    if best is not None and best_r >= 0.6:
+        if norm_callsign(best) != target:
+            print(f"callsign: heard {spoken!r}, going with {best}", flush=True)
+        return best
+    return spoken
 
 
 def strip_callsign_echo(body):
@@ -1693,6 +1738,187 @@ def load_links():
         print(f"could not load callsign links: {exc}", flush=True)
 
 
+
+# ============================================================================
+# Durable memory. Everything the units have told dispatch (statuses, BOLOs,
+# links, learned callsigns, active stops, remembered plates) is written to the
+# dashboard's store whenever it changes and once more right before a redeploy
+# stops the process, then read back on boot. A redeploy no longer forgets.
+# ============================================================================
+
+known_callsigns = {}   # normalised -> as written; every callsign dispatch has seen or been told
+plate_memory = {}      # normalised plate -> {"vehicle", "owner", "callsign", "at"}
+air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
+manual_tracks = {}     # normalised player name -> {"name", "callsign", "since", "street", "last_call"}
+_last_state_blob = None
+_state_loaded = False
+
+
+def remember_callsign(cs):
+    cs = str(cs or "").strip()
+    nk = norm_callsign(cs)
+    if nk and any(ch.isdigit() for ch in nk) and 2 <= len(nk) <= 12:
+        known_callsigns[nk] = cs
+
+
+def member_callsign(member):
+    """The callsign dispatch already knows for this Discord member: their /link,
+    or the [TAG] the bot put on their nickname when they came on duty."""
+    if member is None:
+        return ""
+    link = callsign_links.get(getattr(member, "id", 0)) or {}
+    if link.get("callsign"):
+        return str(link["callsign"])
+    m = re.match(r"^\[([^\]]{1,12})\]", str(getattr(member, "display_name", "") or ""))
+    if m and any(ch.isdigit() for ch in m.group(1)):
+        return m.group(1).strip()
+    return ""
+
+
+def _state_snapshot():
+    stops = {}
+    for uid, st in active_stops.items():
+        d = {k: v for k, v in st.items()
+             if k != "member" and isinstance(v, (str, int, float, bool, type(None), list, dict, tuple))}
+        d["uid"] = int(uid)
+        stops[str(uid)] = d
+    return {
+        "status_board": dict(status_board),
+        "bolos": list(bolos),
+        "callsign_links": {str(k): v for k, v in callsign_links.items()},
+        "cleared_calls": sorted(int(x) for x in cleared_calls if str(x).lstrip("-").isdigit()),
+        "seen_keys": [list(k) for k in seen_keys if isinstance(k, tuple)],
+        "seen_kills": sorted(str(k) for k in seen_kills),
+        "nick_original": {str(k): v for k, v in nick_original.items()},
+        "known_callsigns": dict(known_callsigns),
+        "plate_memory": dict(plate_memory),
+        "response_cache": {k: v for k, v in response_cache.items() if isinstance(v, list)},
+        "stop_channel_original": {str(k): v for k, v in stop_channel_original.items()},
+        "active_stops": stops,
+        "manual_tracks": dict(manual_tracks),
+        "air_manual_until": air_manual_until,
+        "saved_at": time.time(),
+    }
+
+
+async def _state_call(state=None):
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        return None
+    url = f"{SUPABASE_URL}/functions/v1/dispatch-state"
+    headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+               "Content-Type": "application/json"}
+    body = {"botId": BOT_ORDER_ID, "workerToken": WORKER_TOKEN}
+    if state is not None:
+        body["state"] = state
+    try:
+        async with http.post(url, headers=headers, json=body) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                print(f"state {'save' if state is not None else 'load'} HTTP {resp.status}: {raw[:160]}", flush=True)
+                return None
+            return json.loads(raw)
+    except Exception as exc:
+        print(f"state call failed: {exc}", flush=True)
+        return None
+
+
+async def save_state(force=False, reason=""):
+    global _last_state_blob
+    if not _state_loaded:
+        return  # never replace what is saved with an empty boot state
+    snap = _state_snapshot()
+    blob = json.dumps(snap, sort_keys=True, default=str)
+    if not force and blob == _last_state_blob:
+        return
+    res = await _state_call(snap)
+    if isinstance(res, dict) and res.get("ok"):
+        _last_state_blob = blob
+        if reason:
+            print(f"state saved ({reason})", flush=True)
+
+
+async def load_state():
+    global _state_loaded, _last_state_blob, air_manual_until
+    res = await _state_call()
+    if not isinstance(res, dict) or not res.get("ok"):
+        print("state: could not read the saved memory yet, will retry", flush=True)
+        return
+    _state_loaded = True
+    st = res.get("state") or {}
+    if not isinstance(st, dict) or not st:
+        print("state: nothing saved yet", flush=True)
+        return
+    try:
+        status_board.update({k: v for k, v in (st.get("status_board") or {}).items() if isinstance(v, dict)})
+        for b in st.get("bolos") or []:
+            if b not in bolos:
+                bolos.append(b)
+        for k, v in (st.get("callsign_links") or {}).items():
+            if str(k).isdigit() and isinstance(v, dict):
+                callsign_links[int(k)] = v
+        cleared_calls.update(int(x) for x in (st.get("cleared_calls") or []) if str(x).lstrip("-").isdigit())
+        for k in st.get("seen_keys") or []:
+            if isinstance(k, list) and len(k) == 2:
+                seen_keys.add((k[0], k[1]))
+        seen_kills.update(str(k) for k in (st.get("seen_kills") or []))
+        for k, v in (st.get("nick_original") or {}).items():
+            if str(k).isdigit():
+                nick_original[int(k)] = v
+        known_callsigns.update({k: v for k, v in (st.get("known_callsigns") or {}).items()
+                                if isinstance(k, str) and isinstance(v, str)})
+        plate_memory.update({k: v for k, v in (st.get("plate_memory") or {}).items() if isinstance(v, dict)})
+        response_cache.update({k: v for k, v in (st.get("response_cache") or {}).items() if isinstance(v, list)})
+        for k, v in (st.get("stop_channel_original") or {}).items():
+            if str(k).isdigit():
+                stop_channel_original[int(k)] = v
+        manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
+        air_manual_until = float(st.get("air_manual_until") or 0)
+        guild = client.get_guild(GUILD_ID) if GUILD_ID else (client.guilds[0] if client.guilds else None)
+        restored_stops = 0
+        for uid_s, d in (st.get("active_stops") or {}).items():
+            if not (str(uid_s).isdigit() and isinstance(d, dict)):
+                continue
+            member = guild.get_member(int(uid_s)) if guild else None
+            if member is None:
+                continue
+            d = dict(d)
+            d.pop("uid", None)
+            d["member"] = member
+            if "last" in d and isinstance(d["last"], list):
+                d["last"] = tuple(d["last"])
+            active_stops[int(uid_s)] = d
+            restored_stops += 1
+    except Exception as exc:
+        print(f"state: restore hit an error, continuing with what loaded: {exc!r}", flush=True)
+    _last_state_blob = json.dumps(_state_snapshot(), sort_keys=True, default=str)
+    print(f"state restored: {len(status_board)} unit status(es), {len(bolos)} BOLO(s), "
+          f"{len(callsign_links)} link(s), {len(known_callsigns)} known callsign(s), "
+          f"{restored_stops} active stop(s), {len(plate_memory)} plate(s)", flush=True)
+
+
+async def state_save_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(STATE_SAVE_SECONDS)
+        if not _state_loaded:
+            await load_state()
+            continue
+        await save_state()
+
+
+async def _graceful_shutdown():
+    """Railway sends SIGTERM before a redeploy: save first, then go."""
+    print("shutdown: saving dispatch memory before the redeploy", flush=True)
+    try:
+        await asyncio.wait_for(save_state(force=True, reason="shutdown"), 8)
+    except Exception as exc:
+        print(f"shutdown save failed: {exc}", flush=True)
+    try:
+        await client.close()
+    except Exception:
+        pass
+
+
 def _num(d, *keys):
     for k in keys:
         v = d.get(k)
@@ -1772,6 +1998,7 @@ async def player_positions():
                 print(f"players API sample: {players[0]}", flush=True)
             for p in players:
                 name = str(p.get("Player") or "").split(":")[0]
+                remember_callsign(p.get("Callsign"))
                 info = (extract_player_pos(p), extract_street(p), name, extract_postal(p))
                 for ident in (name, p.get("Callsign")):
                     k = norm_callsign(ident)
@@ -1817,6 +2044,7 @@ async def duty_units():
             team = str(p.get("Team") or "").lower()
             pos = extract_player_pos(p)
             if cs and pos and any(t in team for t in CALL_TEAMS):
+                remember_callsign(cs)
                 out.append((cs, pos))
     return out
 
@@ -2100,6 +2328,7 @@ async def get_ingame_callsign(member):
             cs = str(p.get("Callsign") or "").strip()
             if not cs:
                 print(f"nick: matched {member.display_name} in game but no callsign is set on their character", flush=True)
+            remember_callsign(cs)
             return cs or None
     ingame = [str(p.get("Player") or "").split(":")[0] for p in players]
     print(f"nick: {member.display_name} not found among in-game players {ingame} "
@@ -2277,6 +2506,12 @@ async def end_stop_pursuit(uid, stop, street):
     stop["pursuit"] = True
     stop["slow_since"] = None
     stop["last_callout"] = time.time()
+    try:
+        players, _v = await snapshot_players_vehicles()
+        stop["suspect"] = nearest_suspect(players, stop.get("last"))
+        stop["track_street"] = ""
+    except Exception as exc:
+        print(f"could not identify the suspect: {exc}", flush=True)
     await move_member(stop["member"], VOICE_CHANNEL_ID)
     cs = stop["callsign"]
     where = f" near {street}" if street else ""
@@ -2358,6 +2593,9 @@ async def stop_watch_loop():
                     if desc:
                         stop["vehicle"] = desc
                         stop["plate"] = plate
+                        if plate:
+                            plate_memory[norm_callsign(plate)] = {"vehicle": desc, "owner": stop.get("suspect") or "",
+                                                                  "callsign": stop.get("callsign"), "at": now}
                         print(f"stop {stop['callsign']}: suspect vehicle noted", flush=True)
                 if STATUS_CHECKS:
                     await maybe_status_check(uid, stop, pos, street, pname, now)
@@ -2427,6 +2665,510 @@ def clean_transcript(text):
     return " ".join(out) if out else text
 
 
+_held = {}            # member id -> {"text", "at", "task"}: a transmission that stopped mid-thought
+_pending_lookup = {}  # member id -> {"kind", "callsign", "at"}: waiting for the plate or the name
+_speaking_now = set()
+
+RESTART_PHRASES = ("correction", "disregard", "scratch that", "strike that", "start over",
+                   "let me start over", "let me try that again", "try that again")
+STANDBY_PHRASES = ("stand by", "standby", "wait one", "hold on", "one second", "one sec", "give me a second")
+TRAIL_FILLERS = {"uh", "um", "uhh", "umm", "er", "ah", "the", "a", "an", "and", "to", "at", "on",
+                 "in", "for", "with", "is", "of", "i", "im", "we", "be", "my", "our", "that", "this"}
+
+
+def starts_over(text):
+    low = _flat(text).lstrip(" ,.")
+    head = low[:60]
+    return any(head.startswith(p) or f" {p}" in head for p in RESTART_PHRASES)
+
+
+def strip_restart_prefix(text):
+    low = _flat(text)
+    cut = 0
+    for p in RESTART_PHRASES:
+        i = low.find(p)
+        if i != -1 and i <= 40:
+            cut = max(cut, i + len(p))
+    rest = text[cut:].lstrip(" ,.-") if cut else text
+    return rest
+
+
+def looks_unfinished(text):
+    """A transmission that stopped mid-thought: a trailing filler or dangling
+    word, a stand-by, or a fragment with nothing in it but a callsign."""
+    low = _flat(text).strip()
+    if not low:
+        return True
+    words = re.findall(r"[a-z0-9']+", low)
+    if not words:
+        return True
+    if any(p in low for p in STANDBY_PHRASES):
+        return True
+    if words[-1] in TRAIL_FILLERS:
+        return True
+    if text.rstrip().endswith(("-", "—", "…", ",")):
+        return True
+    if has_intent(text):
+        return False
+    strict = lambda w: any(ch.isdigit() for ch in w) or w in CALLSIGN_NUMS or w in CALLSIGN_PHON or (len(w) == 1 and w.isalpha())
+    body = [w for w in words if w != "dispatch" and not strict(w)]
+    return len(body) < 2
+
+
+def has_intent(text):
+    """Whether dispatch would know what to do with this on its own."""
+    if detect_status(text) or wants_repeat(text) or wants_roster(text) or wants_status_board(text):
+        return True
+    if wants_calls_holding(text) or wants_backup(text) or wants_bolo_read(text) or wants_call_cleared(text):
+        return True
+    if extract_bolo(text) or lookup_request_kind(text) or wants_air_up(text) or wants_air_down(text):
+        return True
+    key = normalize_intent(text, "")
+    if not key:
+        return False
+    if fallback_reply(key) is not None:
+        return True
+    # Four real words beyond the callsign: a unit that only keyed up with its
+    # number is still waiting to say what it wants.
+    words = [w for w in key.split() if len(w) > 1 and w not in CALLSIGN_NUMS and w not in CALLSIGN_PHON]
+    return len(words) >= 4
+
+
+def merge_fragments(first, second):
+    """Join a held fragment with what followed it. A restart that repeats the
+    beginning of the fragment replaces it; otherwise the two are one message."""
+    a = _flat(first).split()
+    b = _flat(second).split()
+    if not a:
+        return second
+    head = a[:3]
+    if len(b) >= len(head) and b[: len(head)] == head:
+        return second
+    if len(b) >= 2 and " ".join(b[:2]) in " ".join(a):
+        return second
+    return first.rstrip(" ,.-") + " " + second
+
+
+# ============================================================================
+# Plate and name checks, the air unit, and live suspect tracking.
+# ============================================================================
+
+_PLATE_REQ = re.compile(r"\b(run|running|check|checking|got|have|need|got a|10-28|ten twenty eight)\b.*\bplate\b|\bplate for you\b|\brun a plate\b", re.I)
+_NAME_REQ = re.compile(r"\b(run|running|check|checking|got|have|need)\b.*\b(name|username|user name|person|subject|10-29)\b|\bname for you\b|\brun a name\b|\bname check\b", re.I)
+_NATO = {"a": "Alpha", "b": "Bravo", "c": "Charlie", "d": "Delta", "e": "Echo", "f": "Foxtrot", "g": "Golf",
+         "h": "Hotel", "i": "India", "j": "Juliet", "k": "Kilo", "l": "Lima", "m": "Mike", "n": "November",
+         "o": "Oscar", "p": "Papa", "q": "Quebec", "r": "Romeo", "s": "Sierra", "t": "Tango", "u": "Uniform",
+         "v": "Victor", "w": "Whiskey", "x": "X-ray", "y": "Yankee", "z": "Zulu"}
+_PLATE_SKIP = {"plate", "plates", "the", "is", "as", "in", "its", "it's", "number", "reads", "read", "of", "a",
+               "license", "licence", "tag", "dispatch", "for", "you", "go", "ahead", "copy", "ready", "that", "this"}
+_NAME_SKIP = {"name", "username", "user", "the", "is", "as", "in", "its", "it's", "of", "a", "dispatch", "for",
+              "you", "go", "ahead", "copy", "ready", "that", "this", "subject", "person", "roblox", "player",
+              "spelled", "spelt", "spell", "goes", "by", "on", "im", "i'm", "checking", "check"}
+
+
+def lookup_request_kind(text):
+    """'run a plate' / 'have a name for you' -> which check is being asked for."""
+    low = _flat(text)
+    if _PLATE_REQ.search(low):
+        return "plate"
+    if _NAME_REQ.search(low):
+        return "name"
+    return ""
+
+
+def parse_plate(text):
+    """'alpha bravo one two three' / 'A B C 1 2 3' / 'ABC123' -> 'ABC123'."""
+    low = _flat(text).replace("x-ray", "xray").replace("x ray", "xray")
+    low = re.sub(r"\bas in \w+", " ", low)
+    tokens = [t for t in re.split(r"[\s,.\-]+", low) if t]
+    out = []
+    for t in tokens:
+        if len(t) == 1 and t.isalnum():
+            out.append(t)  # a spelled letter or digit, even "a" and "i"
+            continue
+        if t in _PLATE_SKIP or t in REQUEST_WORDS:
+            continue
+        if t in _PHON:
+            out.append(_PHON[t])
+        elif t in _NUM_ONES:
+            out.append(_NUM_ONES[t])
+        elif t in _NUM_TEEN:
+            out.append(_NUM_TEEN[t])
+        elif t in _NUM_TENS:
+            out.append(str(_NUM_TENS[t]))
+        elif t.isalnum() and any(ch.isdigit() for ch in t) and len(t) <= 8:
+            out.append(t)
+        elif t.isalpha() and len(t) <= 3 and t.upper() == t.upper() and len(out) > 0:
+            out.append(t)
+    plate = "".join(out).upper()
+    return plate[:10]
+
+
+def spell_plate(plate):
+    parts = []
+    for ch in plate:
+        if ch.isalpha():
+            parts.append(_NATO.get(ch.lower(), ch))
+        else:
+            parts.append(ch)
+    return " ".join(parts)
+
+
+def parse_name(text):
+    low = _flat(text)
+    m = re.search(r"\b(name is|username is|name of|goes by|it is|its|it's)\b\s+(.+)$", low)
+    if m:
+        low = m.group(2)
+    tokens = [t for t in re.split(r"[\s,.]+", low) if t]
+    keep = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in _NAME_SKIP or t in REQUEST_WORDS or t == "dispatch":
+            i += 1
+            continue
+        # Spoken numbers become digits ("twenty two" -> 22) so 22hype22 survives.
+        if t in _NUM_TENS:
+            val = _NUM_TENS[t]
+            if i + 1 < len(tokens) and tokens[i + 1] in _NUM_ONES and tokens[i + 1] not in ("zero", "oh", "o"):
+                val += int(_NUM_ONES[tokens[i + 1]])
+                i += 1
+            keep.append(str(val))
+        elif t in _NUM_TEEN:
+            keep.append(_NUM_TEEN[t])
+        elif t in _NUM_ONES and t != "o":
+            keep.append(_NUM_ONES[t])
+        elif t.isalnum():
+            keep.append(t)
+        i += 1
+    if not keep:
+        return ""
+    # Spelled letters, or a word with numbers around it, are one username.
+    if all(len(t) == 1 for t in keep) or (len(keep) <= 4 and any(t.isdigit() for t in keep)):
+        return "".join(keep)[:24]
+    keep.sort(key=len, reverse=True)
+    return keep[0][:24]
+
+
+async def snapshot_players_vehicles():
+    """One API call for everyone in the game and every vehicle out."""
+    data = await erlc_get("/server?Players=true&Vehicles=true")
+    players = data.get("Players") if isinstance(data, dict) else None
+    vehicles = data.get("Vehicles") if isinstance(data, dict) else None
+    return (players if isinstance(players, list) else []), (vehicles if isinstance(vehicles, list) else [])
+
+
+def vehicle_for(vehicles, owner_name):
+    nk = norm_callsign(owner_name)
+    for v in vehicles:
+        if norm_callsign(str(v.get("Owner") or "")) == nk:
+            texture = str(v.get("Texture") or "").strip()
+            name = str(v.get("Name") or "").strip()
+            plate = str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or "").strip()
+            return " ".join(x for x in (texture, name) if x), plate
+    return "", ""
+
+
+async def roblox_profile(name):
+    """Public Roblox profile for a username: display name, id, account age."""
+    try:
+        async with http.post("https://users.roblox.com/v1/usernames/users",
+                             json={"usernames": [name], "excludeBannedUsers": False}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        hit = ((data or {}).get("data") or [None])[0]
+        if not hit:
+            return None
+        async with http.get(f"https://users.roblox.com/v1/users/{hit['id']}") as resp:
+            if resp.status != 200:
+                return {"name": hit.get("name"), "display": hit.get("displayName"), "id": hit.get("id")}
+            user = await resp.json()
+        created = str(user.get("created") or "")
+        age = ""
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            days = (datetime.now(timezone.utc) - dt).days
+            if days >= 365:
+                age = f"{days // 365} year{'s' if days // 365 != 1 else ''}"
+            elif days >= 30:
+                age = f"{days // 30} month{'s' if days // 30 != 1 else ''}"
+            else:
+                age = f"{days} day{'s' if days != 1 else ''}"
+        except Exception:
+            pass
+        return {"name": user.get("name") or hit.get("name"), "display": user.get("displayName") or hit.get("displayName"),
+                "id": user.get("id") or hit.get("id"), "age": age, "banned": bool(user.get("isBanned"))}
+    except Exception as exc:
+        print(f"roblox lookup failed: {exc}", flush=True)
+        return None
+
+
+def bolo_matches(needle):
+    nk = norm_callsign(needle)
+    if not nk:
+        return []
+    out = []
+    for b in bolos:
+        desc = b.get("desc") if isinstance(b, dict) else str(b)
+        if nk in norm_callsign(desc):
+            out.append(desc)
+    return out
+
+
+async def run_lookup(member, pend, text):
+    cs = pend.get("callsign") or member_callsign(member)
+    ack = f"Unit {cs}, " if cs else ""
+    kind = pend.get("kind")
+    if kind == "plate":
+        plate = parse_plate(text)
+        if len(plate) < 2:
+            _pending_lookup[member.id] = {**pend, "at": time.time()}
+            await announce(f"{ack}dispatch did not catch that plate, say again.", title="Plate Check")
+            return
+        spelled = spell_plate(plate)
+        players, vehicles = await snapshot_players_vehicles()
+        pk = norm_callsign(plate)
+        hit = None
+        for v in vehicles:
+            vplate = norm_callsign(str(v.get("Plate") or v.get("LicensePlate") or v.get("PlateText") or ""))
+            if vplate and vplate == pk:
+                hit = {"vehicle": " ".join(x for x in (str(v.get("Texture") or "").strip(), str(v.get("Name") or "").strip()) if x),
+                       "owner": str(v.get("Owner") or "").strip(), "live": True}
+                break
+        if hit is None and pk in plate_memory:
+            m = plate_memory[pk]
+            hit = {"vehicle": m.get("vehicle") or "", "owner": m.get("owner") or "", "live": False}
+        flags = bolo_matches(plate)
+        if hit:
+            owner = hit["owner"]
+            where = ""
+            if owner:
+                for p in players:
+                    if norm_callsign(str(p.get("Player") or "").split(":")[0]) == norm_callsign(owner):
+                        team = str(p.get("Team") or "").strip()
+                        where = f", currently in the server on {team}" if team else ", currently in the server"
+                        break
+                if not where and hit.get("live") is False:
+                    where = ", owner not currently in the server"
+            line = f"{ack}plate {spelled} returns to a {hit['vehicle'] or 'vehicle'}"
+            line += f", registered to {owner}{where}." if owner else "."
+        else:
+            line = f"{ack}plate {spelled} shows no record on file."
+        if flags:
+            line += f" Be advised, that plate matches an active BOLO: {flags[0]}."
+        await announce(line, title="Plate Check")
+        print(f"plate check by {cs or member.display_name}: {plate} -> {'hit' if hit else 'no record'}", flush=True)
+        return
+
+    name = parse_name(text)
+    if len(name) < 3:
+        _pending_lookup[member.id] = {**pend, "at": time.time()}
+        await announce(f"{ack}dispatch did not catch that name, say again.", title="Name Check")
+        return
+    players, vehicles = await snapshot_players_vehicles()
+    ingame = None
+    best = 0.0
+    for p in players:
+        pname = str(p.get("Player") or "").split(":")[0]
+        r = difflib.SequenceMatcher(None, name.lower(), pname.lower()).ratio()
+        if r > best:
+            best, ingame = r, p
+    if ingame is not None and best < 0.72:
+        ingame = None
+    real = str(ingame.get("Player") or "").split(":")[0] if ingame else name
+    profile = await roblox_profile(real)
+    parts = [f"{ack}name {real}"]
+    if profile:
+        if profile.get("age"):
+            parts.append(f"Roblox account is {profile['age']} old")
+        if profile.get("banned"):
+            parts.append("the account is banned on Roblox")
+    else:
+        parts.append("no Roblox account by that exact name")
+    if ingame:
+        team = str(ingame.get("Team") or "").strip()
+        icall = str(ingame.get("Callsign") or "").strip()
+        veh, _pl = vehicle_for(vehicles, real)
+        seg = "currently in the server"
+        if team:
+            seg += f" on {team}"
+        if icall:
+            seg += f" as unit {icall}"
+        if veh:
+            seg += f", driving a {veh}"
+        street = extract_street(ingame)
+        if street:
+            seg += f", last seen on {street}"
+        parts.append(seg)
+    else:
+        parts.append("not currently in the server")
+    flags = bolo_matches(real)
+    if flags:
+        parts.append(f"be advised, the name matches an active BOLO: {flags[0]}")
+    await announce(", ".join(parts) + ".", title="Name Check")
+    print(f"name check by {cs or member.display_name}: {name} -> {real} ({'in game' if ingame else 'not in game'})", flush=True)
+
+
+def wants_air_up(text):
+    low = _flat(text)
+    return any(p in low for p in ("air unit up", "air unit is up", "air is up", "air one up", "air one is up",
+                                  "helicopter is up", "helicopter up", "airborne", "in the air", "air support up",
+                                  "air support is up", "bird is up", "bird up"))
+
+
+def wants_air_down(text):
+    low = _flat(text)
+    return any(p in low for p in ("air unit down", "air unit is down", "air is down", "helicopter is down",
+                                  "helicopter down", "landing", "air unit landing", "bird is down", "air support down"))
+
+
+def heli_out(players, vehicles):
+    """A police unit is in a helicopter right now."""
+    police = {norm_callsign(str(p.get("Player") or "").split(":")[0])
+              for p in players if any(t in str(p.get("Team") or "").lower() for t in CALL_TEAMS)}
+    for v in vehicles:
+        name = str(v.get("Name") or "").lower()
+        if ("heli" in name or "chopper" in name or "airbus" in name) and norm_callsign(str(v.get("Owner") or "")) in police:
+            return True
+    return False
+
+
+def air_unit_active(players, vehicles):
+    return time.time() < air_manual_until or heli_out(players, vehicles)
+
+
+def nearest_suspect(players, officer_pos):
+    """The closest non-police player to the officer: the subject of the stop."""
+    if officer_pos is None:
+        return ""
+    best, best_d = "", None
+    for p in players:
+        team = str(p.get("Team") or "").lower()
+        if any(t in team for t in CALL_TEAMS):
+            continue
+        pos = extract_player_pos(p)
+        if pos is None:
+            continue
+        d = ((pos[0] - officer_pos[0]) ** 2 + (pos[1] - officer_pos[1]) ** 2) ** 0.5
+        if best_d is None or d < best_d:
+            best_d, best = d, str(p.get("Player") or "").split(":")[0]
+    return best if best and best_d is not None and best_d <= SUSPECT_RADIUS * 2 else ""
+
+
+_TRACK_REQ = re.compile(r"\b(track|tracking|start tracking|keep eyes on|eyes on|follow)\b\s+(?:the\s+)?(?:suspect\s+|subject\s+|player\s+|user\s+)?([a-z0-9_]{3,24})", re.I)
+
+
+def wants_track(text):
+    m = _TRACK_REQ.search(_flat(text))
+    return m.group(2) if m else ""
+
+
+def wants_track_stop(text):
+    low = _flat(text)
+    return any(p in low for p in ("stop tracking", "lost the suspect", "lost visual", "terminate tracking", "cancel tracking"))
+
+
+async def pursuit_track_loop():
+    """Turn by turn. While a pursuit is running and the air unit is up, or a
+    unit asked dispatch to track someone, the suspect's road is checked every
+    couple of seconds and every change of road is put out the moment it happens."""
+    await client.wait_until_ready()
+    print("live suspect tracking: ready (air unit up, or 'dispatch, track NAME')", flush=True)
+    while not client.is_closed():
+        pursuits = [(uid, st) for uid, st in active_stops.items() if st.get("pursuit")]
+        if not pursuits and not manual_tracks:
+            await asyncio.sleep(TRACK_POLL_SECONDS)
+            continue
+        players, vehicles = await snapshot_players_vehicles()
+        now = time.time()
+        by_name = {norm_callsign(str(p.get("Player") or "").split(":")[0]): p for p in players}
+        air = air_unit_active(players, vehicles)
+        targets = []
+        for uid, st in pursuits:
+            if not st.get("suspect"):
+                st["suspect"] = nearest_suspect(players, st.get("last"))
+                if st["suspect"]:
+                    print(f"pursuit {st.get('callsign')}: suspect identified as {st['suspect']}", flush=True)
+            if st.get("suspect") and air:
+                targets.append((st, st["suspect"], f" fleeing from Unit {st.get('callsign')}"))
+        for key, tr in list(manual_tracks.items()):
+            if now - float(tr.get("since") or now) > 1800:
+                manual_tracks.pop(key, None)
+                continue
+            targets.append((tr, tr.get("name") or key, ""))
+        for holder, name, who in targets:
+            p = by_name.get(norm_callsign(name))
+            if p is None:
+                continue
+            street = extract_street(p)
+            postal = extract_postal(p)
+            if not street or street == holder.get("track_street"):
+                continue
+            if now - float(holder.get("track_call") or 0) < 2.0:
+                continue
+            holder["track_street"] = street
+            holder["track_call"] = now
+            where = f"{street}, postal {postal}" if postal else street
+            await announce(f"Suspect{who} now on {where}.", title="Suspect Location")
+        await asyncio.sleep(TRACK_POLL_SECONDS)
+
+
+async def handle_special(member, text, callsign):
+    """Requests that sit outside the normal reply flow. True when handled."""
+    global air_manual_until
+    now = time.time()
+    ack = f"Unit {callsign}, " if callsign else ""
+    kind = lookup_request_kind(text)
+    if kind == "plate":
+        plate = parse_plate(re.sub(r".*\bplate\b", "", _flat(text)))
+        if len(plate) >= 3:
+            await run_lookup(member, {"kind": "plate", "callsign": callsign, "at": now}, text)
+            return True
+        _pending_lookup[member.id] = {"kind": "plate", "callsign": callsign, "at": now}
+        await announce(f"{ack}go ahead with that plate.", title="Plate Check")
+        return True
+    if kind == "name":
+        name = parse_name(re.sub(r".*\b(name|username|user name|subject|person)\b", "", _flat(text)))
+        if len(name) >= 3 and name not in ("for", "you"):
+            await run_lookup(member, {"kind": "name", "callsign": callsign, "at": now}, text)
+            return True
+        _pending_lookup[member.id] = {"kind": "name", "callsign": callsign, "at": now}
+        await announce(f"{ack}go ahead with that name.", title="Name Check")
+        return True
+    if wants_air_down(text):
+        air_manual_until = 0.0
+        await announce(f"{ack}copy, air unit is down.", title="Air Unit")
+        return True
+    if wants_air_up(text):
+        air_manual_until = now + 3600
+        await announce(f"{ack}copy, air unit is up. Dispatch will put out the suspect's location turn by turn.", title="Air Unit")
+        return True
+    if wants_track_stop(text):
+        if manual_tracks:
+            manual_tracks.clear()
+            await announce(f"{ack}copy, tracking terminated.", title="Tracking")
+            return True
+        return False
+    target = wants_track(text)
+    if target and not detect_status(text):
+        players, _v = await snapshot_players_vehicles()
+        best, best_r = "", 0.0
+        for p in players:
+            pname = str(p.get("Player") or "").split(":")[0]
+            r = difflib.SequenceMatcher(None, target.lower(), pname.lower()).ratio()
+            if r > best_r:
+                best_r, best = r, pname
+        if best and best_r >= 0.6:
+            manual_tracks[norm_callsign(best)] = {"name": best, "callsign": callsign, "since": now, "track_street": "", "track_call": 0}
+            await announce(f"{ack}copy, dispatch is tracking {best} and will call every turn.", title="Tracking")
+        else:
+            await announce(f"{ack}dispatch does not see {target} in the server.", title="Tracking")
+        return True
+    return False
+
+
 async def handle_utterance(member, pcm):
     if len(pcm) < MIN_UTTER_BYTES:
         return
@@ -2443,9 +3185,60 @@ async def handle_utterance(member, pcm):
     who = getattr(member, "display_name", "unit")
     if LOG_HEARD:
         print(f"heard {who}: {text}", flush=True)
+    uid = member.id
+    now = time.time()
+
+    # A lookup in progress: this transmission is the plate or the name.
+    pend = _pending_lookup.get(uid)
+    if pend and now - pend["at"] <= LOOKUP_WINDOW and not lookup_request_kind(text):
+        _pending_lookup.pop(uid, None)
+        await run_lookup(member, pend, text)
+        return
+
+    # Something held from a moment ago: a restart replaces it, a continuation joins it.
+    held = _held.pop(uid, None)
+    if held:
+        task = held.get("task")
+        if task:
+            task.cancel()
+        if starts_over(text):
+            text = strip_restart_prefix(text)
+            if not text.strip():
+                return
+        elif now - held["at"] <= HOLD_SECONDS + 2.5:
+            text = merge_fragments(held["text"], text)
+        elif not is_for_dispatch(text):
+            text = held["text"] if is_for_dispatch(held["text"]) else text
     if not is_for_dispatch(text):
         return
-    callsign = resolve_callsign(extract_callsign(text))
+
+    if looks_unfinished(text):
+        # The unit stopped mid-thought. Say nothing; wait for them to start over
+        # or pick up where they were. If they never do, the fragment is used
+        # only when dispatch can act on it, otherwise it is dropped quietly.
+        async def _later():
+            waited = 0.0
+            while True:
+                await asyncio.sleep(HOLD_SECONDS)
+                waited += HOLD_SECONDS
+                if uid not in _speaking_now or waited >= 15:
+                    break
+            h = _held.pop(uid, None)
+            if h and has_intent(h["text"]):
+                await process_transmission(member, h["text"])
+            elif h:
+                print(f"dropped an unfinished transmission from {who}: {h['text']!r}", flush=True)
+        _held[uid] = {"text": text, "at": now, "task": asyncio.ensure_future(_later())}
+        print(f"holding for {who}: {text!r}", flush=True)
+        return
+
+    await process_transmission(member, text)
+
+
+async def process_transmission(member, text):
+    callsign = resolve_callsign(extract_callsign(text), member)
+    if await handle_special(member, text, callsign):
+        return
     if wants_repeat(text):
         if last_call is not None:
             ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
@@ -2575,7 +3368,12 @@ if VOICE_RECV_AVAILABLE:
                 self.buffers.setdefault(user.id, bytearray()).extend(pcm)
 
         @voice_recv.AudioSink.listener()
+        def on_voice_member_speaking_start(self, member):
+            _speaking_now.add(member.id)
+
+        @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
+            _speaking_now.discard(member.id)
             pcm = self.buffers.pop(member.id, None)
             self.decoders.pop(member.id, None)
             if pcm:
@@ -2844,14 +3642,14 @@ async def on_ready():
     print(f"running build: {BUILD}", flush=True)
     print(f"region: {DISPATCH_REGION}", flush=True)
     # --- TEMP DIAGNOSTIC: what does the bot actually hold for the ElevenLabs key? ---
-    print(
-        f"ELEVENLABS_API_KEY check: len={len(XI_KEY)} "
-        f"first6={XI_KEY[:6]!r} startswith_sk_={XI_KEY.startswith('sk_')} | "
-        f"VOICE_ID={VOICE_ID!r}",
-        flush=True,
-    )
+    print(f"ELEVENLABS_API_KEY check: len={len(XI_KEY)} | VOICE_ID={VOICE_ID!r}", flush=True)
     # --- end diagnostic ---
     load_links()
+    await load_state()
+    try:
+        client.loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(_graceful_shutdown()))
+    except Exception as exc:
+        print(f"could not hook SIGTERM: {exc}", flush=True)
     await sync_commands()
     if VOICE_CMD_ENABLED:
         print("voice commands: ENABLED", flush=True)
@@ -2888,6 +3686,8 @@ async def on_ready():
     client.loop.create_task(_supervise("config_refresh_loop", config_refresh_loop))
     client.loop.create_task(_supervise("voice_channel_watch_loop", voice_channel_watch_loop))
     client.loop.create_task(_supervise("identity_watch_loop", identity_watch_loop))
+    client.loop.create_task(_supervise("state_save_loop", state_save_loop))
+    client.loop.create_task(_supervise("pursuit_track_loop", pursuit_track_loop))
 
 
 async def _supervise(name, factory):
