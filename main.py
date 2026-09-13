@@ -94,6 +94,11 @@ SPEED = float(os.environ.get("DISPATCH_SPEED", "1.05"))
 # This is what makes it sound like a dispatcher on the air rather than a
 # narrator, and it does more for realism than expression alone.
 RADIO_FX = os.environ.get("RADIO_FX", "1").lower() not in ("0", "false", "no", "off")
+# Radio is half-duplex: one voice at a time. Dispatch holds a transmission
+# while a unit is keyed up rather than speaking over the top of them.
+AIR_WAIT = float(os.environ.get("AIR_WAIT_SECONDS", "6"))
+# The beat of dead air between one transmission and the next.
+TRANSMIT_GAP = float(os.environ.get("TRANSMIT_GAP_SECONDS", "0.45"))
 # The courtesy beep at the end of a transmission.
 ROGER_BEEP = os.environ.get("ROGER_BEEP", "1").lower() not in ("0", "false", "no", "off")
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
@@ -314,6 +319,87 @@ def _tz():
     return None
 
 
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+_TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+          "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def num_words(n):
+    """13 -> 'thirteen'. Radio says numbers, it does not spell them."""
+    n = int(n)
+    if n < 10:
+        return _ONES[n]
+    if n < 20:
+        return _TEENS[n - 10]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _TENS[tens] + (f" {_ONES[ones]}" if ones else "")
+    hundreds, rest = divmod(n, 100)
+    return _ONES[hundreds] + " hundred" + (f" {num_words(rest)}" if rest else "")
+
+
+def digit_words(digits):
+    """'032' -> 'zero three two', the way a callsign is read."""
+    return " ".join(_ONES[int(c)] for c in str(digits) if c.isdigit())
+
+
+def _say_callsign(m):
+    lead, letters, tail = m.group(1), m.group(2), m.group(3)
+    said = [digit_words(lead) if lead.startswith("0") else num_words(lead)]
+    said += [_NATO.get(c.lower(), c) for c in letters]
+    said.append(digit_words(tail) if tail.startswith("0") or len(tail) > 2 else num_words(tail))
+    return " ".join(said)
+
+
+def _say_time(m):
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if minute == 0:
+        return f"{num_words(hour)} hundred hours"
+    if minute < 10:
+        return f"{num_words(hour)} oh {num_words(minute)} hours"
+    return f"{num_words(hour)} {num_words(minute)} hours"
+
+
+_RE_CALLSIGN = re.compile(r"\b(\d{1,2})([A-Za-z]{1,2})-?(\d{1,3})\b")
+_RE_TENCODE = re.compile(r"\b10-(\d{1,3})\b")
+_RE_CLOCK = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b(?:\s+hours)?", re.I)
+_RE_CODE = re.compile(r"\b(Code|Signal)\s*-\s*(\d{1,2})\b", re.I)
+
+
+def speech_text(text):
+    """Rewrite a line the way a dispatcher reads it aloud, just before it is
+    spoken. The written form is what goes in the text log — only the voice
+    gets this. Without it the model guesses at '1S-032' and '10-8'.
+    """
+    out = str(text or "")
+    out = _RE_CALLSIGN.sub(_say_callsign, out)
+    out = _RE_TENCODE.sub(lambda m: "ten " + num_words(m.group(1)), out)
+    out = _RE_CLOCK.sub(_say_time, out)
+    out = _RE_CODE.sub(lambda m: f"{m.group(1)} {num_words(m.group(2))}", out)
+    return out
+
+
+# How dispatch opens a transmission to one unit. Real traffic uses the bare
+# callsign, never "Unit" in front of it, and drops it altogether when the same
+# unit was already addressed moments ago in the same exchange.
+ADDRESS_GAP = float(os.environ.get("ADDRESS_GAP_SECONDS", "25"))
+_last_addressed = {}
+
+
+def addr(callsign, member=None):
+    if not callsign:
+        return ""
+    uid = getattr(member, "id", None)
+    if uid is not None:
+        now = time.time()
+        recent = now - _last_addressed.get(uid, 0) < ADDRESS_GAP
+        _last_addressed[uid] = now
+        if recent:
+            return ""
+    return f"{callsign}, "
+
+
 def local_time_str():
     return datetime.now(_tz() or timezone.utc).strftime("%H:%M")
 
@@ -372,11 +458,11 @@ def build_call_line(call, nearest=""):
         parts.append("Report of an incident, details to follow.")
 
     if len(nearest_units) == 1:
-        parts.append(f"Unit {nearest_units[0]}, you are the closest unit, respond Code 3.")
+        parts.append(f"{nearest_units[0]}, you are the closest unit, respond Code 3.")
     elif len(nearest_units) > 1:
         parts.append(
-            f"Unit {nearest_units[0]}, you are the closest unit, respond Code 3. "
-            f"Unit {nearest_units[1]}, respond as backup."
+            f"{nearest_units[0]}, you are the closest unit, respond Code 3. "
+            f"{nearest_units[1]}, respond as backup."
         )
     elif team:
         parts.append(f"{team} units respond Code 3.")
@@ -731,7 +817,7 @@ async def erlc_command(command):
 async def synthesize(text):
     url = f"{XI_BASE}/text-to-speech/{VOICE_ID}"
     payload = {
-        "text": text,
+        "text": speech_text(text),
         "model_id": XI_MODEL,
         "voice_settings": {"stability": XI_STABILITY, "similarity_boost": 0.85,
                            "style": XI_STYLE, "use_speaker_boost": True},
@@ -1544,7 +1630,7 @@ def wants_roster(text):
     return any(t in low for t in triggers)
 
 
-async def read_roster(callsign=""):
+async def read_roster(callsign="", member=None):
     data = await erlc_get("/server?Players=true")
     units = []
     if isinstance(data, dict) and isinstance(data.get("Players"), list):
@@ -1553,11 +1639,16 @@ async def read_roster(callsign=""):
             if any(t in team for t in CALL_TEAMS):
                 pname = str(p.get("Player") or "").split(":")[0]
                 units.append(str(p.get("Callsign") or "").strip() or pname)
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     if not units:
         return f"{ack}no units are currently on patrol."
     word = "unit" if len(units) == 1 else "units"
-    return f"{ack}current roster, {len(units)} {word} on patrol. {', '.join(units[:12])}."
+    line = f"{ack}{num_words(len(units))} {word} on patrol"
+    if units:
+        line += ", " + ", ".join(units[:4])
+        if len(units) > 4:
+            line += f", and {num_words(len(units) - 4)} more"
+    return line + "."
 
 
 def wants_clear_stop(text):
@@ -1612,10 +1703,10 @@ def add_bolo(desc, callsign):
     print(f"bolo logged: '{desc}' per {callsign or 'unknown'} (active: {len(bolos)})", flush=True)
 
 
-def read_bolos(callsign=""):
+def read_bolos(callsign="", member=None):
     cutoff = time.time() - BOLO_EXPIRE
     active = [b for b in bolos if b["time"] >= cutoff]
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     if not active:
         return f"{ack}no active B O L Os at this time."
     parts = [f"{ack}current B O L Os."]
@@ -1639,16 +1730,28 @@ def available_units(exclude=None):
     return out
 
 
-def read_status_board(callsign=""):
+def read_status_board(callsign="", member=None):
+    """A count and what is actually notable. No dispatcher reads a dozen
+    units over the air one after another."""
     now = time.time()
-    entries = [(cs, v["status"]) for cs, v in status_board.items() if now - v["time"] < 10800]
-    ack = f"Unit {callsign}, " if callsign else ""
+    entries = [(cs, str(v.get("status") or "")) for cs, v in status_board.items()
+               if now - v.get("time", 0) < 10800]
+    ack = addr(callsign, member)
     if not entries:
-        return f"{ack}no unit statuses on file at this time."
-    parts = [f"{ack}current unit status."]
-    for cs, st in entries[:12]:
-        parts.append(f"Unit {cs} shows {st}.")
-    return " ".join(parts)
+        return f"{ack}no unit statuses on file."
+    free = [cs for cs, st in entries
+            if "10-8" in st.lower() or "available" in st.lower() or "in service" in st.lower()]
+    busy = [(cs, st) for cs, st in entries if cs not in free]
+    word = "unit" if len(entries) == 1 else "units"
+    bits = [f"{ack}{num_words(len(entries))} {word} on the board"]
+    if free:
+        bits.append(f"{num_words(len(free))} showing 10-8")
+    for cs, st in busy[:3]:
+        bits.append(f"{cs} is {st}")
+    if len(busy) > 3:
+        rest = len(busy) - 3
+        bits.append(f"and {num_words(rest)} other{'s' if rest != 1 else ''} assigned")
+    return ", ".join(bits) + "."
 
 
 def wants_call_cleared(text):
@@ -1674,9 +1777,9 @@ def mark_call_cleared(number):
     return True
 
 
-def read_calls_holding(callsign=""):
+def read_calls_holding(callsign="", member=None):
     calls = list(open_calls.values())
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     if not calls:
         return f"{ack}no calls holding at this time, all quiet."
     word = "call" if len(calls) == 1 else "calls"
@@ -2240,7 +2343,7 @@ async def assign_backup(member, spoken_callsign):
 
     others = [o for o in officers if not req or o["cs_norm"] != req["cs_norm"]]
     if not others:
-        await announce(f"Unit {req_cs}, be advised, no other units are available for backup at this time.", title="Backup")
+        await announce(f"{req_cs}, be advised, no other units are available for backup at this time.", title="Backup")
         return
 
     where_bits = []
@@ -2259,7 +2362,7 @@ async def assign_backup(member, spoken_callsign):
     if req and req.get("pos") and with_pos:
         nearest = min(with_pos, key=lambda o: (o["pos"][0] - req["pos"][0]) ** 2 + (o["pos"][1] - req["pos"][1]) ** 2)
         await announce(
-            f"Unit {nearest['cs']}, you are the closest unit to the backup request, respond Code 3.",
+            f"{nearest['cs']}, you are the closest unit to the backup request, respond Code 3.",
             title="Backup")
         print(f"backup: {nearest['cs']} assigned to {req_cs}", flush=True)
     else:
@@ -2277,7 +2380,7 @@ async def clear_traffic_stop(member, callsign=""):
     if prev is not None and prev.id in stop_channel_original and not channel_humans(prev):
         schedule_restore(prev)
     print(f"traffic stop cleared for {getattr(member, 'display_name', '?')}", flush=True)
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     await announce(f"{ack}10-4, showing you clear of the traffic stop.", title="Clear")
 
 
@@ -2497,7 +2600,7 @@ async def announce_officers_down(downed):
     for postal, group in groups.items():
         if len(group) >= 2:
             callsigns = [g["cs"] for g in group if g.get("cs")]
-            units = ", ".join(f"Unit {c}" for c in callsigns) if callsigns else "multiple units"
+            units = ", ".join(callsigns) if callsigns else "multiple units"
             where = f" at postal {postal}" if postal else ""
             await announce(
                 f"Multiple officers down{where}. {units}. Any available unit, respond Code 3.",
@@ -2587,17 +2690,17 @@ async def end_stop_pursuit(uid, stop, street):
     cs = stop["callsign"]
     where = f" near {street}" if street else ""
     await announce(
-        f"All units, Unit {cs} is in pursuit, subject fleeing a traffic stop{where}. "
+        f"All units, {cs} is in pursuit, subject fleeing a traffic stop{where}. "
         f"Clear the air.", title="Pursuit", tone=True)
     avail = available_units(exclude=cs)
     if avail:
-        names = ", ".join(f"Unit {u}" for u in avail[:4])
+        names = ", ".join(avail[:4])
         await announce(
-            f"{names}, you are 10-8, respond to assist Unit {cs} in the pursuit, Code 3.",
+            f"{names}, you are 10-8, respond to assist {cs} in the pursuit, Code 3.",
             title="Pursuit Assist")
     else:
         await announce(
-            f"All available units, respond to assist Unit {cs} in the pursuit, Code 3.",
+            f"All available units, respond to assist {cs} in the pursuit, Code 3.",
             title="Pursuit Assist")
     print(f"pursuit triggered for {cs}", flush=True)
 
@@ -2643,14 +2746,14 @@ async def stop_watch_loop():
                         elif now - stop["slow_since"] >= PURSUIT_END_SECONDS:
                             active_stops.pop(uid, None)
                             await announce(
-                                f"All units, the pursuit involving Unit {stop['callsign']} "
+                                f"All units, the pursuit involving {stop['callsign']} "
                                 f"is terminated. Resume normal traffic.", title="Pursuit Over")
                             print(f"pursuit ended for {stop['callsign']}", flush=True)
                     if uid in active_stops and now - stop.get("last_callout", 0) >= PURSUIT_CALLOUT_SECONDS:
                         stop["last_callout"] = now
                         where = f", {street}" if street else ""
                         await announce(
-                            f"Unit {stop['callsign']} still in active pursuit{where}. "
+                            f"{stop['callsign']} still in active pursuit{where}. "
                             f"Available units continue to assist, Code 3.", title="Pursuit")
                     continue
                 if speed >= 3:
@@ -2703,7 +2806,7 @@ async def maybe_status_check(uid, stop, pos, street, pname, now):
         active_stops.pop(uid, None)
         where = f", last known location {street}" if street else ""
         await announce(
-            f"All units, be advised, Unit {stop['callsign']} is not responding to a "
+            f"All units, be advised, {stop['callsign']} is not responding to a "
             f"status check{where}. Any available unit, check their welfare.",
             title="Welfare Check", tone=True)
         print(f"status check FAILED for {stop['callsign']} — welfare broadcast", flush=True)
@@ -2913,7 +3016,7 @@ def spell_plate(plate):
         if ch.isalpha():
             parts.append(_NATO.get(ch.lower(), ch))
         elif ch.isdigit():
-            parts.append(ch)
+            parts.append(_ONES[int(ch)])
     return " ".join(parts)
 
 
@@ -3309,7 +3412,7 @@ async def answer_followup(member, text, callsign):
     if not (wants or cites or vehicle or where):
         return False
     real = subj["name"]
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     players, vehicles = await snapshot_players_vehicles()
     ingame = find_player_in(players, real)
     remember_subject(member, real, subj.get("plate"))
@@ -3369,7 +3472,7 @@ async def answer_followup(member, text, callsign):
 
 async def run_lookup(member, pend, text):
     cs = pend.get("callsign") or member_callsign(member)
-    ack = f"Unit {cs}, " if cs else ""
+    ack = addr(cs, member)
     kind = pend.get("kind")
     players, vehicles = await snapshot_players_vehicles()
 
@@ -3547,7 +3650,7 @@ async def handle_special(member, text, callsign):
     """Requests that sit outside the normal reply flow. True when handled."""
     global air_manual_until
     now = time.time()
-    ack = f"Unit {callsign}, " if callsign else ""
+    ack = addr(callsign, member)
     # "Issuing him a ticket for speeding" — logged against whoever is on the
     # air, so a later wants and warrants check reports it.
     cm = _CITE_ADD.search(text)
@@ -3724,7 +3827,7 @@ async def collect_lookup(member, pend, text):
         bare = re.sub(r"\b(a|the|that|this|my|for|me|you|is|it|please)\b", " ", low)
         bare = re.sub(r"\b(plate|tag|registration|name|username|person|subject|records?)\b", " ", bare).strip()
         if not bare:
-            ack = f"Unit {pend.get('callsign')}, " if pend.get("callsign") else ""
+            ack = addr(pend.get("callsign"), member)
             await announce(f"{ack}go ahead with that {kind}.",
                            title="Plate Check" if kind == "plate" else "Name Check")
             return
@@ -3843,26 +3946,28 @@ async def process_transmission(member, text):
         return
     if wants_repeat(text):
         if last_call is not None:
-            ack = f"Unit {callsign}, copy. " if callsign else "Copy. "
+            ack = addr(callsign, member) or "Copy. "
+            if callsign:
+                ack += "copy. "
             await announce(ack + build_call_line(last_call), title="Repeat")
         else:
-            ack = f"Unit {callsign}, " if callsign else ""
+            ack = addr(callsign, member)
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
         return
     if wants_roster(text):
-        await announce(await read_roster(callsign), title="Roster")
+        await announce(await read_roster(callsign, member), title="Roster")
         return
     if wants_status_board(text):
-        await announce(read_status_board(callsign), title="Unit Status")
+        await announce(read_status_board(callsign, member), title="Unit Status")
         return
     if wants_calls_holding(text):
-        await announce(read_calls_holding(callsign), title="Calls Holding")
+        await announce(read_calls_holding(callsign, member), title="Calls Holding")
         return
     if wants_backup(text):
         await assign_backup(member, callsign)
         return
     if wants_bolo_read(text):
-        await announce(read_bolos(callsign), title="BOLO")
+        await announce(read_bolos(callsign, member), title="BOLO")
         return
     bolo_desc = extract_bolo(text)
     if bolo_desc:
@@ -3871,7 +3976,7 @@ async def process_transmission(member, text):
         await announce(f"All units, be on the lookout for {bolo_desc}{who}.", title="BOLO")
         return
     if wants_call_cleared(text):
-        ack = f"Unit {callsign}, " if callsign else ""
+        ack = addr(callsign, member)
         low = _flat(text)
         if "all call" in low or "all calls" in low or "clear all" in low:
             had = list(open_calls.keys())
@@ -3903,7 +4008,7 @@ async def process_transmission(member, text):
         if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
     if not status and not normalize_intent(text, callsign):
-        ack = f"Unit {callsign}, " if callsign else ""
+        ack = addr(callsign, member)
         await announce(f"{ack}you are unreadable, say again.", title="Say Again")
         return
     body = await dispatch_reply_body(text, callsign)
@@ -3923,7 +4028,7 @@ async def process_transmission(member, text):
             else:
                 kind = "ask"  # they never said which — ask, do not guess
             _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
-            ack = f"Unit {callsign}, " if callsign else ""
+            ack = addr(callsign, member)
             if kind == "ask":
                 await announce(f"{ack}is that a plate or a name?", title="Check")
             else:
@@ -3931,11 +4036,11 @@ async def process_transmission(member, text):
                                title="Plate Check" if kind == "plate" else "Name Check")
             return
         if callsign:
-            await announce(f"Unit {callsign}, " + strip_callsign_echo(body), title="Dispatch")
+            await announce(addr(callsign, member) + strip_callsign_echo(body), title="Dispatch")
         else:
             await announce(body, title="Dispatch")
     else:
-        ack = f"Unit {callsign}, " if callsign else ""
+        ack = addr(callsign, member)
         await announce(f"{ack}dispatch copies, 10-4.", title="Dispatch")
 
 
@@ -4042,12 +4147,30 @@ def voice_filter():
     return f'-filter:a "{",".join(parts)}"' if parts else None
 
 
+async def wait_for_clear_air(limit=None):
+    """Hold while any unit is transmitting, then leave a beat before keying up."""
+    limit = AIR_WAIT if limit is None else limit
+    waited = 0.0
+    while _speaking_now and waited < limit:
+        await asyncio.sleep(0.15)
+        waited += 0.15
+    if waited:
+        await asyncio.sleep(0.25)
+    return waited
+
+
 async def playback_worker():
     while True:
         path = await play_queue.get()
         try:
             connected = await wait_for_voice()
             if connected and voice_client is not None:
+                # The courtesy beep is the tail of a transmission already on
+                # the air, so it never waits.
+                if path != roger_path:
+                    held = await wait_for_clear_air()
+                    if held:
+                        print(f"held transmission {held:.1f}s for a unit on the air", flush=True)
                 if voice_client.is_playing():
                     stopper = getattr(voice_client, "stop_playing", voice_client.stop)
                     stopper()
@@ -4062,6 +4185,11 @@ async def playback_worker():
                 print("playing audio in voice channel", flush=True)
                 await done.wait()
                 print("finished playing", flush=True)
+                # Dead air after the end of a transmission, not between the
+                # words and their own courtesy beep.
+                ends_transmission = (path == roger_path) or (not ROGER_BEEP and path != tone_path)
+                if ends_transmission and TRANSMIT_GAP > 0:
+                    await asyncio.sleep(TRANSMIT_GAP)
             else:
                 print("dropping audio — not connected to voice", flush=True)
         except Exception as exc:
