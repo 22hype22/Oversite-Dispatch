@@ -64,7 +64,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "guild-1"
+BUILD = "guild-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -4691,28 +4691,30 @@ async def sync_commands():
         return
     guild = dispatch_guild()
     fp = tree_fingerprint()
-    done = []
+    # Each step says so as it lands. A global sync can sit in a rate limit for
+    # a long time, and that must not hide the fact that the commands are
+    # already live in the customer's server.
     if guild is not None:
         try:
             command_tree.copy_global_to(guild=guild)
             synced = await command_tree.sync(guild=guild)
-            done.append(f"{len(synced)} in {guild.name}")
+            commands_synced = True
+            print(f"slash commands live in {guild.name}: "
+                  f"{', '.join('/' + c.name for c in synced) or 'none'}", flush=True)
         except Exception as exc:
             print(f"guild command sync failed: {exc}", flush=True)
     else:
         print("command sync: bot is not in a server yet", flush=True)
-    if fp != command_fp:
-        try:
-            synced = await command_tree.sync()
-            command_fp = fp
-            done.append(f"{len(synced)} global")
-        except Exception as exc:
-            print(f"global command sync failed: {exc}", flush=True)
-    else:
-        done.append("global unchanged")
-    if done:
+    if fp == command_fp:
+        print("global command set unchanged, not re-syncing", flush=True)
+        return
+    try:
+        synced = await command_tree.sync()
+        command_fp = fp
         commands_synced = True
-        print(f"slash commands synced: {', '.join(done)}", flush=True)
+        print(f"global command set updated: {len(synced)} command(s)", flush=True)
+    except Exception as exc:
+        print(f"global command sync failed: {exc}", flush=True)
 
 
 @client.event
