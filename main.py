@@ -77,12 +77,25 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 XI_KEY = os.environ["ELEVENLABS_API_KEY"]
 VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWW03F9")
-XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")  # the lowest-latency voice model
+# Turbo v2.5 measured both better and faster than Flash on this voice, so it
+# is the default. v3 is more expressive again but adds ~1.8s per transmission,
+# which is too long for radio traffic.
+XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+# Lower stability and a little style let the delivery move; at stability 0.65
+# with style 0 every line came out identically flat.
+XI_STABILITY = float(os.environ.get("ELEVENLABS_STABILITY", "0.45"))
+XI_STYLE = float(os.environ.get("ELEVENLABS_STYLE", "0.35"))
 GUILD_ID = int(os.environ.get("DISPATCH_GUILD_ID", "0") or "0")
 VOICE_CHANNEL_ID = int(os.environ.get("DISPATCH_VOICE_CHANNEL_ID", "0") or "0")
 TEXT_CHANNEL_ID = int(os.environ.get("DISPATCH_TEXT_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
-SPEED = float(os.environ.get("DISPATCH_SPEED", "1.25"))
+SPEED = float(os.environ.get("DISPATCH_SPEED", "1.05"))
+# Band-limit, compress and clip the speech the way a land-mobile radio does.
+# This is what makes it sound like a dispatcher on the air rather than a
+# narrator, and it does more for realism than expression alone.
+RADIO_FX = os.environ.get("RADIO_FX", "1").lower() not in ("0", "false", "no", "off")
+# The courtesy beep at the end of a transmission.
+ROGER_BEEP = os.environ.get("ROGER_BEEP", "1").lower() not in ("0", "false", "no", "off")
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
 STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -154,6 +167,8 @@ http = None
 last_call = None
 response_cache = {}
 tone_path = None
+roger_path = None
+_KEEP_AUDIO = set()   # generated once at boot and reused, never deleted after playing
 status_board = {}
 open_calls = {}
 cleared_calls = set()
@@ -374,6 +389,28 @@ def build_call_line(call, nearest=""):
     parts.append(f"Time, {local_time_str()}.")
 
     return " ".join(parts)
+
+
+def make_roger():
+    """The short courtesy beep a radio console sends at the end of a
+    transmission, so units hear where one stops."""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        args = [
+            FFMPEG_EXE, "-y", "-f", "lavfi", "-i",
+            "sine=frequency=1350:sample_rate=48000:duration=0.10",
+            "-filter:a", "volume=0.20,afade=t=in:st=0:d=0.008,afade=t=out:st=0.072:d=0.028",
+            "-ac", "2", "-ar", "48000", path,
+        ]
+        import subprocess
+        result = subprocess.run(args, capture_output=True)
+        if result.returncode == 0 and os.path.getsize(path) > 0:
+            return path
+        print(f"roger beep failed: {result.stderr[:200]!r}", flush=True)
+    except Exception as exc:
+        print(f"roger beep error: {exc}", flush=True)
+    return None
 
 
 def make_tone():
@@ -696,7 +733,8 @@ async def synthesize(text):
     payload = {
         "text": text,
         "model_id": XI_MODEL,
-        "voice_settings": {"stability": 0.65, "similarity_boost": 0.85, "style": 0.0, "use_speaker_boost": True},
+        "voice_settings": {"stability": XI_STABILITY, "similarity_boost": 0.85,
+                           "style": XI_STYLE, "use_speaker_boost": True},
     }
     headers = {"xi-api-key": XI_KEY, "Content-Type": "application/json"}
     try:
@@ -737,6 +775,8 @@ async def announce(text, title="911 Call", tone=False):
         if tone and ALERT_TONES and tone_path:
             await play_queue.put(tone_path)
         await play_queue.put(path)
+        if ROGER_BEEP and roger_path:
+            await play_queue.put(roger_path)
         print("audio queued for playback", flush=True)
 
 
@@ -3986,6 +4026,22 @@ async def wait_for_voice(timeout=20):
     return False
 
 
+def voice_filter():
+    """The ffmpeg chain every spoken line goes through: cut to the radio band,
+    squash the dynamics the way a radio does, stop it clipping, then pace it."""
+    parts = []
+    if RADIO_FX:
+        parts += [
+            "highpass=f=280",
+            "lowpass=f=3400",
+            "acompressor=threshold=0.10:ratio=6:attack=5:release=90:makeup=2",
+            "alimiter=limit=0.92",
+        ]
+    if SPEED and abs(SPEED - 1.0) > 0.001:
+        parts.append(f"atempo={SPEED}")
+    return f'-filter:a "{",".join(parts)}"' if parts else None
+
+
 async def playback_worker():
     while True:
         path = await play_queue.get()
@@ -4000,9 +4056,7 @@ async def playback_worker():
                 def after(_err):
                     client.loop.call_soon_threadsafe(done.set)
 
-                is_tone = path == tone_path
-                options = None if is_tone else (
-                    f'-filter:a "atempo={SPEED}"' if SPEED and SPEED != 1.0 else None)
+                options = None if path in _KEEP_AUDIO else voice_filter()
                 source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
@@ -4013,7 +4067,7 @@ async def playback_worker():
         except Exception as exc:
             print(f"playback failed: {exc}", flush=True)
         finally:
-            if path != tone_path:
+            if path not in _KEEP_AUDIO:
                 try:
                     os.remove(path)
                 except OSError:
@@ -4280,7 +4334,16 @@ async def on_ready():
             print("traffic-stop VC labels: ON (needs Manage Channels perm)", flush=True)
         if ALERT_TONES and tone_path is None:
             globals()["tone_path"] = await client.loop.run_in_executor(None, make_tone)
+            if tone_path:
+                _KEEP_AUDIO.add(tone_path)
             print(f"alert tones: {'ready' if tone_path else 'unavailable'}", flush=True)
+        if ROGER_BEEP and roger_path is None:
+            globals()["roger_path"] = await client.loop.run_in_executor(None, make_roger)
+            if roger_path:
+                _KEEP_AUDIO.add(roger_path)
+        print(f"voice: {XI_MODEL} | stability {XI_STABILITY} style {XI_STYLE} | "
+              f"radio filter {'on' if RADIO_FX else 'off'} | roger beep "
+              f"{'on' if roger_path else 'off'} | speed {SPEED}", flush=True)
         # Slowest and least urgent: a guild that rejects it can block for a minute.
         await sync_commands()
         print(f"startup complete {time.time() - _BOOT_T0:.1f}s after start", flush=True)
