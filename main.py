@@ -2705,7 +2705,13 @@ RESTART_PHRASES = ("correction", "disregard", "scratch that", "strike that", "st
                    "let me start over", "let me try that again", "try that again")
 STANDBY_PHRASES = ("stand by", "standby", "wait one", "hold on", "one second", "one sec", "give me a second")
 TRAIL_FILLERS = {"uh", "um", "uhh", "umm", "er", "ah", "the", "a", "an", "and", "to", "at", "on",
-                 "in", "for", "with", "is", "of", "i", "im", "we", "be", "my", "our", "that", "this"}
+                 "in", "for", "with", "is", "of", "i", "im", "we", "be", "my", "our", "that", "this",
+                 # Verbs and prepositions that cannot end a transmission — the unit
+                 # was cut off mid-request, so wait instead of answering half of it.
+                 # Words that CAN end one (me, you, over, out, up) are deliberately
+                 # not here: "can you run a plate for me" is a complete request.
+                 "run", "running", "check", "checking", "get", "need", "needs", "want",
+                 "give", "gave", "tell", "see", "from", "into", "onto", "near"}
 
 
 def starts_over(text):
@@ -3662,6 +3668,26 @@ async def collect_lookup(member, pend, text):
     added to what came before, and dispatch only answers once the unit has
     stopped talking — never over the top of them mid-spell."""
     uid = member.id
+    if pend.get("kind") == "ask":
+        # "A plate for me" / "the name is X" / a plate-shaped string — work out
+        # which was meant from what they actually said.
+        low = _flat(text)
+        if re.search(r"\b(plate|tag|registration)\b", low):
+            kind = "plate"
+        elif re.search(r"\b(name|username|person|subject|records?)\b", low):
+            kind = "name"
+        else:
+            guess = parse_plate(text)
+            kind = "plate" if len(guess) >= 5 and any(c.isdigit() for c in guess) else "name"
+        pend = {**pend, "kind": kind, "at": time.time()}
+        _pending_lookup[uid] = pend
+        bare = re.sub(r"\b(a|the|that|this|my|for|me|you|is|it|please)\b", " ", low)
+        bare = re.sub(r"\b(plate|tag|registration|name|username|person|subject|records?)\b", " ", bare).strip()
+        if not bare:
+            ack = f"Unit {pend.get('callsign')}, " if pend.get("callsign") else ""
+            await announce(f"{ack}go ahead with that {kind}.",
+                           title="Plate Check" if kind == "plate" else "Name Check")
+            return
     buf = _lookup_buf.get(uid)
     if buf is None or buf.get("kind") != pend.get("kind"):
         buf = {"kind": pend.get("kind"), "callsign": pend.get("callsign"), "parts": [], "task": None}
@@ -3699,9 +3725,17 @@ async def collect_lookup(member, pend, text):
 
 
 async def handle_utterance(member, pcm):
-    if len(pcm) < MIN_UTTER_BYTES:
+    uid = getattr(member, "id", 0)
+    now = time.time()
+    # Dispatch just asked this unit for a plate or a name, so it is listening
+    # for a short answer. A plate read straight back — "LEB011" — is well under
+    # the normal minimum and used to be thrown away before it was even
+    # transcribed, which is why it only worked when the unit said "dispatch"
+    # again and spoke for longer.
+    awaiting = uid in _pending_lookup or uid in _lookup_buf
+    if len(pcm) < (MIN_UTTER_BYTES // 5 if awaiting else MIN_UTTER_BYTES):
         return
-    if audioop is not None:
+    if audioop is not None and not awaiting:
         try:
             if audioop.rms(pcm, 2) < SILENCE_RMS:
                 return
@@ -3713,9 +3747,7 @@ async def handle_utterance(member, pcm):
     text = clean_transcript(text)
     who = getattr(member, "display_name", "unit")
     if LOG_HEARD:
-        print(f"heard {who}: {text}", flush=True)
-    uid = member.id
-    now = time.time()
+        print(f"heard {who}{' (awaiting)' if awaiting else ''}: {text}", flush=True)
 
     # A lookup in progress: this transmission is the plate or the name.
     pend = _pending_lookup.get(uid)
@@ -3844,11 +3876,19 @@ async def process_transmission(member, text):
         # or the name and handling whatever comes back next.
         if _PROMISE.search(body):
             low = _flat(text)
-            kind = "plate" if "plate" in low or "tag" in low else "name"
+            if re.search(r"\b(plate|tag|registration|10-?28)\b", low):
+                kind = "plate"
+            elif re.search(r"\b(name|username|person|subject|records?|warrants?|wants|10-?29)\b", low):
+                kind = "name"
+            else:
+                kind = "ask"  # they never said which — ask, do not guess
             _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
             ack = f"Unit {callsign}, " if callsign else ""
-            await announce(f"{ack}go ahead with that {kind}.",
-                           title="Plate Check" if kind == "plate" else "Name Check")
+            if kind == "ask":
+                await announce(f"{ack}is that a plate or a name?", title="Check")
+            else:
+                await announce(f"{ack}go ahead with that {kind}.",
+                               title="Plate Check" if kind == "plate" else "Name Check")
             return
         if callsign:
             await announce(f"Unit {callsign}, " + strip_callsign_echo(body), title="Dispatch")
