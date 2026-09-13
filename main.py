@@ -64,7 +64,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "radio-1"
+BUILD = "guild-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -161,7 +161,22 @@ ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 command_tree = discord.app_commands.CommandTree(client)
-DISPATCH_GUILD = discord.Object(id=GUILD_ID)
+DISPATCH_GUILD = discord.Object(id=GUILD_ID) if GUILD_ID else None
+
+
+def dispatch_guild():
+    """The server this bot serves. The configured id when there is one,
+    otherwise the server it is actually in — preferring whichever holds the
+    voice channel the dashboard picked, since that is the one on the air."""
+    if GUILD_ID:
+        found = client.get_guild(GUILD_ID)
+        if found is not None:
+            return found
+    if VOICE_CHANNEL_ID:
+        channel = client.get_channel(VOICE_CHANNEL_ID)
+        if channel is not None and getattr(channel, "guild", None) is not None:
+            return channel.guild
+    return client.guilds[0] if client.guilds else None
 
 # Urgent traffic does not wait behind a routine readback, so the air queue is
 # ordered, not first-come. Items are (priority, sequence, path, transmission).
@@ -175,6 +190,7 @@ _now_playing = {"tx": None, "prio": PRIO_ROUTINE}
 seen_keys = set()
 boot_time = time.time()
 commands_synced = False
+command_fp = ""       # the command set Discord was last given globally
 voice_client = None
 http = None
 last_call = None
@@ -253,7 +269,7 @@ def schedule_restore(channel, delay=RESTORE_GRACE):
 _last_presence = None
 _last_bio = None
 bolos = []
-seen_kills = set()
+seen_kills = {}       # kill id -> None: a set that remembers insertion order
 officer_last_seen = {}
 _players_debugged = False
 _call_debugged = False
@@ -1460,6 +1476,7 @@ def match_cached_intent(key):
     if not key:
         return None
     if key in response_cache:
+        response_cache[key] = response_cache.pop(key)   # most recently used last
         return key
     matches = difflib.get_close_matches(key, list(response_cache), n=1, cutoff=0.85)
     return matches[0] if matches else None
@@ -1551,6 +1568,8 @@ async def dispatch_reply_body(text, callsign):
     if body:
         if body.strip().strip(".!").upper() == "IGNORE":
             return IGNORE
+        if hit and hit in response_cache:
+            response_cache[hit] = response_cache.pop(hit)
         store = response_cache.setdefault(hit or key, [])
         if body not in store:
             store.append(body)
@@ -2089,7 +2108,45 @@ async def learn_voice_callsign(member, spoken, callsign):
                 print(f"voice: nick tag failed: {exc}", flush=True)
 
 
+SEEN_KEEP = int(os.environ.get("SEEN_KEEP", "800"))          # calls and kills remembered
+STATUS_KEEP = float(os.environ.get("STATUS_KEEP", "10800"))  # the window the board reads
+CACHE_KEEP = int(os.environ.get("RESPONSE_CACHE_KEEP", "300"))
+PLATE_KEEP = int(os.environ.get("PLATE_KEEP", "500"))
+
+
+def _call_number(key):
+    try:
+        return int(key[1])
+    except Exception:
+        return -1
+
+
+def prune_memory():
+    """Keep what dispatch actually uses and drop the rest. Without this every
+    collection here grows for the life of the bot, and all of it is written to
+    the saved state on every cycle."""
+    now = time.time()
+    if len(seen_keys) > SEEN_KEEP:
+        keep = sorted(seen_keys, key=_call_number)[-SEEN_KEEP:]
+        seen_keys.clear()
+        seen_keys.update(keep)
+    while len(seen_kills) > SEEN_KEEP:
+        seen_kills.pop(next(iter(seen_kills)), None)
+    for cs in [c for c, v in status_board.items()
+               if now - float((v or {}).get("time") or 0) > STATUS_KEEP]:
+        status_board.pop(cs, None)
+    while len(response_cache) > CACHE_KEEP:
+        response_cache.pop(next(iter(response_cache)), None)
+    if len(plate_memory) > PLATE_KEEP:
+        keep = sorted(plate_memory.items(), key=lambda kv: -float((kv[1] or {}).get("at") or 0))[:PLATE_KEEP]
+        plate_memory.clear()
+        plate_memory.update(keep)
+    for name in [n for n in list(citations) if not citation_list(n)]:
+        citations.pop(name, None)
+
+
 def _state_snapshot():
+    prune_memory()
     stops = {}
     for uid, st in active_stops.items():
         d = {k: v for k, v in st.items()
@@ -2102,7 +2159,7 @@ def _state_snapshot():
         "callsign_links": {str(k): v for k, v in callsign_links.items()},
         "cleared_calls": sorted(int(x) for x in cleared_calls if str(x).lstrip("-").isdigit()),
         "seen_keys": [list(k) for k in seen_keys if isinstance(k, tuple)],
-        "seen_kills": sorted(str(k) for k in seen_kills),
+        "seen_kills": [str(k) for k in seen_kills],
         "nick_original": {str(k): v for k, v in nick_original.items()},
         "known_callsigns": dict(known_callsigns),
         "voice_callsigns": {str(k): v for k, v in voice_callsigns.items()},
@@ -2114,6 +2171,7 @@ def _state_snapshot():
         "active_stops": stops,
         "manual_tracks": dict(manual_tracks),
         "air_manual_until": air_manual_until,
+        "command_fp": command_fp,
         "saved_at": time.time(),
     }
 
@@ -2177,7 +2235,7 @@ async def load_state():
         for k in st.get("seen_keys") or []:
             if isinstance(k, list) and len(k) == 2:
                 seen_keys.add((k[0], k[1]))
-        seen_kills.update(str(k) for k in (st.get("seen_kills") or []))
+        seen_kills.update({str(k): None for k in (st.get("seen_kills") or [])})
         for k, v in (st.get("nick_original") or {}).items():
             if str(k).isdigit():
                 nick_original[int(k)] = v
@@ -2195,7 +2253,8 @@ async def load_state():
                 stop_channel_original[int(k)] = v
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
-        guild = client.get_guild(GUILD_ID) if GUILD_ID else (client.guilds[0] if client.guilds else None)
+        globals()["command_fp"] = str(st.get("command_fp") or "")
+        guild = dispatch_guild()
         restored_stops = 0
         for uid_s, d in (st.get("active_stops") or {}).items():
             if not (str(uid_s).isdigit() and isinstance(d, dict)):
@@ -2693,7 +2752,7 @@ async def nick_watch_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         if CALLSIGN_NICK:
-            guild = client.get_guild(GUILD_ID)
+            guild = dispatch_guild()
             voice_members = []
             if guild is not None:
                 for vc in guild.voice_channels:
@@ -2797,7 +2856,7 @@ async def officer_down_loop():
                         seen_key = (keyid, ts)
                         if not keyid or ts < boot_time or seen_key in seen_kills:
                             continue
-                        seen_kills.add(seen_key)
+                        seen_kills[seen_key] = None
                         info = officer_last_seen.get(keyid)
                         if info:
                             cs, street, postal = info
@@ -4544,7 +4603,7 @@ async def ensure_voice():
     # a single guild's cache is cold). Fall back to the configured guild.
     channel = client.get_channel(VOICE_CHANNEL_ID)
     if channel is None:
-        guild = client.get_guild(GUILD_ID) if GUILD_ID else client.guilds[0]
+        guild = dispatch_guild()
         channel = guild.get_channel(VOICE_CHANNEL_ID) if guild else None
     if channel is None:
         print(f"voice channel {VOICE_CHANNEL_ID} not found in any server yet", flush=True)
@@ -4580,7 +4639,7 @@ async def voice_guard():
     await client.wait_until_ready()
     stuck_since = None
     while not client.is_closed():
-        guild = client.get_guild(GUILD_ID)
+        guild = dispatch_guild()
         vc = guild.voice_client if guild is not None else None
         if vc is not None and vc.is_connected():
             stuck_since = None
@@ -4602,17 +4661,58 @@ async def voice_guard():
         await asyncio.sleep(15)
 
 
+def tree_fingerprint():
+    """A stable hash of the command set, so a boot can tell whether Discord
+    already has this exact one. Any failure returns a value that cannot match
+    what was stored, so a broken fingerprint forces a sync rather than
+    skipping one forever."""
+    import hashlib
+    cmds = command_tree.get_commands()
+    payload = []
+    for c in cmds:
+        try:
+            payload.append(c.to_dict(command_tree))
+        except Exception as exc:
+            print(f"command fingerprint failed for {getattr(c, 'name', '?')}: {exc}", flush=True)
+            return f"error:{time.time()}"
+    try:
+        raw = json.dumps({"count": len(cmds), "commands": payload}, sort_keys=True, default=str)
+    except Exception:
+        return f"error:{time.time()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 async def sync_commands():
-    global commands_synced
+    """Guild first: it lands instantly and Discord does not ration it. The
+    global set is only pushed when the commands actually changed, because that
+    call is capped per day and a bot that redeploys often will hit it."""
+    global commands_synced, command_fp
     if commands_synced:
         return
-    try:
-        await command_tree.sync()
-        await command_tree.sync(guild=DISPATCH_GUILD)
+    guild = dispatch_guild()
+    fp = tree_fingerprint()
+    done = []
+    if guild is not None:
+        try:
+            command_tree.copy_global_to(guild=guild)
+            synced = await command_tree.sync(guild=guild)
+            done.append(f"{len(synced)} in {guild.name}")
+        except Exception as exc:
+            print(f"guild command sync failed: {exc}", flush=True)
+    else:
+        print("command sync: bot is not in a server yet", flush=True)
+    if fp != command_fp:
+        try:
+            synced = await command_tree.sync()
+            command_fp = fp
+            done.append(f"{len(synced)} global")
+        except Exception as exc:
+            print(f"global command sync failed: {exc}", flush=True)
+    else:
+        done.append("global unchanged")
+    if done:
         commands_synced = True
-        print("slash commands synced — /region ready, old commands removed", flush=True)
-    except Exception as exc:
-        print(f"command sync failed: {exc}", flush=True)
+        print(f"slash commands synced: {', '.join(done)}", flush=True)
 
 
 @client.event
