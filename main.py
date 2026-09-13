@@ -28,6 +28,8 @@ import aiohttp
 import discord
 import imageio_ffmpeg
 
+from state_codes import STATE_CODES, state_code_block
+
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR)
@@ -64,7 +66,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "guild-2"
+BUILD = "codes-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1088,24 +1090,6 @@ US_RESPONSE_CODES = (
 )
 
 # Region-specific real additions layered ON TOP of the common US set.
-STATE_EXTRAS = {
-    "California": (
-        "California agencies also use Penal Code call types on the air: 187 homicide, "
-        "207 kidnapping, 211 robbery, 240 assault, 245 assault with a deadly weapon, "
-        "459 burglary, 484 theft, 415 disturbance, 5150 mental-health hold, "
-        "23152 DUI. CHP uses '11-' codes: 11-80 accident major injury, 11-99 officer "
-        "needs help."
-    ),
-    "New York": (
-        "New York (NYPD-style) uses its own 10-codes: 10-13 officer needs assistance, "
-        "10-30 robbery in progress, 10-31 burglary in progress, 10-34 assault, "
-        "10-52 dispute, 10-53 vehicle accident, 10-85 need backup at scene."
-    ),
-    "Florida": (
-        "Many Florida agencies use Signal codes: Signal 4 accident, Signal 7 dead body, "
-        "Signal 20 mentally ill, Signal 34 robbery, Signal 43 subject with a weapon."
-    ),
-}
 
 # Country profiles for non-US regions (real conventions, no fake 10-codes).
 COUNTRY_PROFILES = {
@@ -1181,10 +1165,26 @@ def code_reference_for(region):
     if region in COUNTRY_PROFILES:
         lines.append(COUNTRY_PROFILES[region])
     elif _is_us_region(region):
-        lines.append(f"Radio codes: {US_TEN_CODES}.")
+        block = state_code_block(region)
+        entry = STATE_CODES.get(region)
+        system = entry["system"] if entry else "apco"
+        # A state that does not run 10-codes must not be handed the common set
+        # as well, or the AI mixes the two on the air.
+        if system in ("ten", "apco"):
+            lines.append(f"Radio codes: {US_TEN_CODES}.")
         lines.append(f"Response codes: {US_RESPONSE_CODES}.")
-        if region in STATE_EXTRAS:
-            lines.append(STATE_EXTRAS[region])
+        if block:
+            lines.append(block)
+            if system in ("signal", "plain"):
+                lines.append(
+                    "Use that system, not the standard 10-codes. If a unit keys "
+                    "up with a 10-code anyway, answer in kind and stay consistent."
+                )
+            elif system == "ten":
+                lines.append(
+                    "Where this state's own code differs from the common one, "
+                    "the state's meaning wins."
+                )
         else:
             lines.append(
                 "Some agencies here have moved to plain language; mirror whatever "
