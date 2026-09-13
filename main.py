@@ -66,7 +66,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "codes-2"
+BUILD = "handover-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1004,8 +1004,12 @@ def cut_in():
         print(f"cut-in failed: {exc}", flush=True)
 
 
-async def announce(text, title="911 Call", tone=False, urgent=None):
-    print(f"announce: {text[:80]}", flush=True)
+async def announce(text, title="911 Call", tone=False, urgent=None, force=False):
+    # While a person has the seat the bot writes the call to the text channel
+    # but does not speak, so they can read the calls and run the radio
+    # themselves. force is for the handover lines themselves.
+    muted = dispatch_held() and not force
+    print(f"announce{' (muted, human dispatch)' if muted else ''}: {text[:80]}", flush=True)
 
     async def _log():
         if not TEXT_CHANNEL_ID:
@@ -1019,6 +1023,9 @@ async def announce(text, title="911 Call", tone=False, urgent=None):
         except Exception as exc:
             print(f"text log failed: {exc}", flush=True)
 
+    if muted:
+        await _log()
+        return
     # The text log and the voice are produced at the same time.
     path, _ = await asyncio.gather(synthesize(text), _log())
     if path:
@@ -2171,6 +2178,7 @@ def _state_snapshot():
         "active_stops": stops,
         "manual_tracks": dict(manual_tracks),
         "air_manual_until": air_manual_until,
+        "human_dispatch": dict(human_dispatch),
         "command_fp": command_fp,
         "saved_at": time.time(),
     }
@@ -2254,6 +2262,11 @@ async def load_state():
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
         globals()["command_fp"] = str(st.get("command_fp") or "")
+        hd = st.get("human_dispatch")
+        if isinstance(hd, dict) and hd.get("uid"):
+            human_dispatch.clear()
+            human_dispatch.update(hd)
+            print(f"state: {held_by_name()} still has the dispatch seat", flush=True)
         guild = dispatch_guild()
         restored_stops = 0
         for uid_s, d in (st.get("active_stops") or {}).items():
@@ -3050,6 +3063,10 @@ _held = {}            # member id -> {"text", "at", "task"}: a transmission that
 _pending_lookup = {}  # member id -> {"kind", "callsign", "at"}: waiting for the plate or the name
 _lookup_buf = {}      # member id -> letters collected so far while they spell one out
 _speaking_now = set()
+# A real person has taken the dispatch seat. While this is set the bot keeps
+# listening and keeps writing the text log, so whoever is dispatching can read
+# the calls, but it does not key up. Empty means the bot has the seat.
+human_dispatch = {}   # {"uid", "name", "callsign", "at"}
 
 RESTART_PHRASES = ("correction", "disregard", "scratch that", "strike that", "start over",
                    "let me start over", "let me try that again", "try that again")
@@ -4145,10 +4162,93 @@ async def handle_utterance(member, pcm):
     await process_transmission(member, text)
 
 
+# "I'll take over as dispatch", "I'm running dispatch", "let me take dispatch".
+# Only ever tested when the bot still has the seat, so it cannot collide with
+# the hand-back wording below.
+_TAKEOVER = re.compile(
+    r"\b(?:i|ill|im|i am|i will|we|well|we will|let me|imma)\b[^.]{0,24}?"
+    r"\b(?:take|taking|takeover|run|running|handle|handling|cover|covering|be|being|got|have)\b"
+    r"[^.]{0,20}?\bdispatch(?:er|ing)?\b", re.I)
+_TAKEOVER_BARE = re.compile(
+    r"\b(?:tak(?:e|ing)\s*over|takeover)\b[^.]{0,20}?\bdispatch(?:er|ing)?\b", re.I)
+
+# "I'm done being dispatch", "dispatch you're back up", "take it back".
+# Only ever tested while a person holds the seat.
+_HANDBACK = re.compile(
+    r"\b(?:"
+    r"done\s+(?:being\s+|with\s+|on\s+)?dispatch(?:ing)?"
+    r"|(?:im|i am|i'?m)\s+done"
+    r"|you\s+(?:have|got|can\s+have|can\s+take|are\s+back)\b"
+    r"|youre?\s+back"
+    r"|dispatch\s*(?:is|s)?\s*back\s*up"
+    r"|back\s+to\s+you"
+    r"|tak(?:e|ing)\s+(?:it\s+|dispatch\s+)?back"
+    r"|tak(?:e|ing)\s+over\s+again"
+    r"|resum(?:e|ing)\s+dispatch"
+    r"|(?:giv(?:e|ing)|hand(?:ing)?)\s+(?:it|dispatch)?\s*back"
+    r"|off\s+dispatch"
+    r"|clear(?:ing)?\s+(?:of\s+|from\s+)?dispatch"
+    r"|dispatch,?\s+tak(?:e|ing)\s+over"
+    r")\b", re.I)
+
+
+def dispatch_held():
+    """True when a person has the seat and the bot should stay off the air."""
+    return bool(human_dispatch.get("uid"))
+
+
+def held_by_name():
+    return human_dispatch.get("callsign") or human_dispatch.get("name") or "a unit"
+
+
+async def take_dispatch(member, callsign):
+    human_dispatch.clear()
+    human_dispatch.update({
+        "uid": getattr(member, "id", 0),
+        "name": getattr(member, "display_name", "") or "",
+        "callsign": callsign or "",
+        "at": time.time(),
+    })
+    # Nothing half-finished should be waiting to speak once the bot goes quiet.
+    _pending_lookup.clear()
+    _lookup_buf.clear()
+    for h in list(_held.values()):
+        task = h.get("task")
+        if task:
+            task.cancel()
+    _held.clear()
+    who = callsign or human_dispatch["name"] or "you"
+    await announce(
+        f"10-4, {who} has dispatch. Dispatch is standing by and off the air.",
+        title="Dispatch Handover", force=True)
+    print(f"human dispatch: {who} has the seat", flush=True)
+
+
+async def release_dispatch(reason="handed back"):
+    if not dispatch_held():
+        return
+    who = held_by_name()
+    human_dispatch.clear()
+    await announce("Dispatch is back up and taking calls. All units, go ahead.",
+                   title="Dispatch Handover", force=True)
+    print(f"human dispatch: {who} released the seat ({reason})", flush=True)
+
+
 async def process_transmission(member, text):
     spoken = extract_callsign(text)
     callsign = resolve_callsign(spoken, member)
     await learn_voice_callsign(member, spoken, callsign)
+
+    # Somebody is dispatching. The only thing the bot listens for is being
+    # handed the seat back; everything else is theirs to answer.
+    if dispatch_held():
+        if _HANDBACK.search(_flat(text)):
+            await release_dispatch()
+        return
+    if _TAKEOVER.search(_flat(text)) or _TAKEOVER_BARE.search(_flat(text)):
+        await take_dispatch(member, callsign)
+        return
+
     if await handle_special(member, text, callsign):
         return
     if wants_repeat(text):
@@ -4640,6 +4740,14 @@ async def voice_guard():
     stuck_since = None
     while not client.is_closed():
         guild = dispatch_guild()
+        # Belt and braces for the handover: if the person holding the seat is
+        # not in the channel any more, take it back. Covers a missed voice
+        # event and a redeploy that restored the seat with them long gone.
+        if dispatch_held() and guild is not None and VOICE_CHANNEL_ID:
+            ch = guild.get_channel(VOICE_CHANNEL_ID)
+            if ch is not None and not any(m.id == human_dispatch.get("uid")
+                                          for m in getattr(ch, "members", [])):
+                await release_dispatch("no longer in the channel")
         vc = guild.voice_client if guild is not None else None
         if vc is not None and vc.is_connected():
             stuck_since = None
@@ -4725,6 +4833,15 @@ async def on_voice_state_update(member, before, after):
         before.channel is None or before.channel.id != after.channel.id)
     left = before.channel is not None and (
         after.channel is None or after.channel.id != before.channel.id)
+
+    # Whoever took the dispatch seat has left the channel, so the bot picks it
+    # back up rather than sitting silent with nobody dispatching.
+    if left and human_dispatch.get("uid") == getattr(member, "id", None):
+        was_here = bool(VOICE_CHANNEL_ID) and before.channel.id == VOICE_CHANNEL_ID
+        still_here = (after.channel is not None and bool(VOICE_CHANNEL_ID)
+                      and after.channel.id == VOICE_CHANNEL_ID)
+        if was_here and not still_here:
+            await release_dispatch("left the channel")
 
     if CALLSIGN_NICK and joined and member.id not in nick_original:
         await apply_duty_nick(member)
