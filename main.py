@@ -64,7 +64,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "memory-4"
+BUILD = "radio-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -163,7 +163,15 @@ client = discord.Client(intents=intents)
 command_tree = discord.app_commands.CommandTree(client)
 DISPATCH_GUILD = discord.Object(id=GUILD_ID)
 
-play_queue = asyncio.Queue()
+# Urgent traffic does not wait behind a routine readback, so the air queue is
+# ordered, not first-come. Items are (priority, sequence, path, transmission).
+play_queue = asyncio.PriorityQueue()
+PRIO_URGENT = 0
+PRIO_ROUTINE = 5
+_play_seq = 0         # keeps equal priorities in the order they were spoken
+_tx_seq = 0           # one id per transmission, so its tone and beep stay with it
+_interrupted = set()  # transmissions cut off; whatever is left of them is dead
+_now_playing = {"tx": None, "prio": PRIO_ROUTINE}
 seen_keys = set()
 boot_time = time.time()
 commands_synced = False
@@ -310,13 +318,64 @@ def autocorrect(text):
     return re.sub(r"[A-Za-z]+", lambda m: correct_word(m.group(0)), text)
 
 
+# Where the clock comes from when nobody set DISPATCH_TZ: the region the
+# customer picked on the dashboard. States that straddle a line take the zone
+# most of the state keeps.
+REGION_TZ = {
+    "alabama": "America/Chicago", "alaska": "America/Anchorage",
+    "arizona": "America/Phoenix", "arkansas": "America/Chicago",
+    "california": "America/Los_Angeles", "colorado": "America/Denver",
+    "connecticut": "America/New_York", "delaware": "America/New_York",
+    "florida": "America/New_York", "georgia": "America/New_York",
+    "hawaii": "Pacific/Honolulu", "idaho": "America/Boise",
+    "illinois": "America/Chicago", "indiana": "America/Indiana/Indianapolis",
+    "iowa": "America/Chicago", "kansas": "America/Chicago",
+    "kentucky": "America/New_York", "louisiana": "America/Chicago",
+    "maine": "America/New_York", "maryland": "America/New_York",
+    "massachusetts": "America/New_York", "michigan": "America/Detroit",
+    "minnesota": "America/Chicago", "mississippi": "America/Chicago",
+    "missouri": "America/Chicago", "montana": "America/Denver",
+    "nebraska": "America/Chicago", "nevada": "America/Los_Angeles",
+    "new hampshire": "America/New_York", "new jersey": "America/New_York",
+    "new mexico": "America/Denver", "new york": "America/New_York",
+    "north carolina": "America/New_York", "north dakota": "America/Chicago",
+    "ohio": "America/New_York", "oklahoma": "America/Chicago",
+    "oregon": "America/Los_Angeles", "pennsylvania": "America/New_York",
+    "rhode island": "America/New_York", "south carolina": "America/New_York",
+    "south dakota": "America/Chicago", "tennessee": "America/Chicago",
+    "texas": "America/Chicago", "utah": "America/Denver",
+    "vermont": "America/New_York", "virginia": "America/New_York",
+    "washington": "America/Los_Angeles", "west virginia": "America/New_York",
+    "wisconsin": "America/Chicago", "wyoming": "America/Denver",
+    "united states": "America/New_York", "united kingdom": "Europe/London",
+    "canada": "America/Toronto", "australia": "Australia/Sydney",
+    "germany": "Europe/Berlin", "mexico": "America/Mexico_City",
+}
+
+_tz_cache = {}   # zone name -> ZoneInfo, so the clock is not rebuilt per line
+
+
+def region_tz_name(region):
+    key = " ".join(str(region or "").split()).lower()
+    if key.startswith("the "):
+        key = key[4:]
+    return REGION_TZ.get(key, "")
+
+
 def _tz():
-    if ZoneInfo is not None and DISPATCH_TZ.upper() != "UTC":
+    """The zone the customer's department keeps time in: whatever they set
+    explicitly, otherwise whatever their region implies, otherwise UTC."""
+    if ZoneInfo is None:
+        return None
+    name = DISPATCH_TZ if DISPATCH_TZ.upper() != "UTC" else region_tz_name(DISPATCH_REGION)
+    if not name:
+        return None
+    if name not in _tz_cache:
         try:
-            return ZoneInfo(DISPATCH_TZ)
+            _tz_cache[name] = ZoneInfo(name)
         except Exception:
-            return None
-    return None
+            _tz_cache[name] = None
+    return _tz_cache[name]
 
 
 _ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
@@ -477,6 +536,54 @@ def build_call_line(call, nearest=""):
     return " ".join(parts)
 
 
+ALERT_TONE_DB = float(os.environ.get("ALERT_TONE_DB", "-15"))   # a shade above speech
+ROGER_DB = float(os.environ.get("ROGER_BEEP_DB", "-20"))        # a shade under it
+
+
+def _mean_db(path):
+    """The average level of a file, read back out of ffmpeg."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            [FFMPEG_EXE, "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True)
+        m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB", result.stderr.decode("utf-8", "replace"))
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def level_to(path, target_db, label="tone"):
+    """Gain a generated tone so it lands at a known level next to speech.
+    Measured rather than assumed, because ffmpeg's own sine is not full scale
+    and the speech level moves with the voice and the compressor."""
+    import subprocess
+    mean = _mean_db(path)
+    if mean is None:
+        return path
+    gain = max(-30.0, min(30.0, target_db - mean))
+    if abs(gain) < 0.5:
+        return path
+    try:
+        fd, out = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        result = subprocess.run(
+            [FFMPEG_EXE, "-y", "-hide_banner", "-v", "error", "-i", path,
+             "-filter:a", f"volume={gain:.1f}dB,alimiter=limit=0.95",
+             "-ac", "2", "-ar", "48000", out], capture_output=True)
+        if result.returncode == 0 and os.path.getsize(out) > 0:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            print(f"levelled {label} {mean:.1f} dB to {target_db:.1f} dB", flush=True)
+            return out
+        os.remove(out)
+    except Exception as exc:
+        print(f"tone levelling failed: {exc}", flush=True)
+    return path
+
+
 def make_roger():
     """The short courtesy beep a radio console sends at the end of a
     transmission, so units hear where one stops."""
@@ -486,13 +593,13 @@ def make_roger():
         args = [
             FFMPEG_EXE, "-y", "-f", "lavfi", "-i",
             "sine=frequency=1350:sample_rate=48000:duration=0.10",
-            "-filter:a", "volume=0.20,afade=t=in:st=0:d=0.008,afade=t=out:st=0.072:d=0.028",
+            "-filter:a", "afade=t=in:st=0:d=0.008,afade=t=out:st=0.072:d=0.028",
             "-ac", "2", "-ar", "48000", path,
         ]
         import subprocess
         result = subprocess.run(args, capture_output=True)
         if result.returncode == 0 and os.path.getsize(path) > 0:
-            return path
+            return level_to(path, ROGER_DB, "courtesy beep")
         print(f"roger beep failed: {result.stderr[:200]!r}", flush=True)
     except Exception as exc:
         print(f"roger beep error: {exc}", flush=True)
@@ -509,13 +616,13 @@ def make_tone():
             "-f", "lavfi", "-i",
             "sine=frequency=1270:sample_rate=48000:duration=0.4",
             "-filter_complex",
-            "[0:a][1:a]concat=n=2:v=0:a=1,volume=0.35,afade=t=out:st=0.75:d=0.05[a]",
+            "[0:a][1:a]concat=n=2:v=0:a=1,afade=t=out:st=0.75:d=0.05[a]",
             "-map", "[a]", "-ac", "2", "-ar", "48000", path,
         ]
         import subprocess
         result = subprocess.run(args, capture_output=True)
         if result.returncode == 0 and os.path.getsize(path) > 0:
-            return path
+            return level_to(path, ALERT_TONE_DB, "alert tone")
         print(f"tone generation failed: {result.stderr[:200]!r}", flush=True)
     except Exception as exc:
         print(f"tone generation error: {exc}", flush=True)
@@ -840,7 +947,46 @@ async def synthesize(text):
     return path
 
 
-async def announce(text, title="911 Call", tone=False):
+async def queue_audio(path, tone=False, urgent=False):
+    """Put one transmission on the air. Its alert tone, its words and its
+    courtesy beep travel together so nothing can be spliced between them."""
+    global _play_seq, _tx_seq
+    prio = PRIO_URGENT if urgent else PRIO_ROUTINE
+    _tx_seq += 1
+    tx = _tx_seq
+    parts = []
+    if tone and ALERT_TONES and tone_path:
+        parts.append(tone_path)
+    parts.append(path)
+    if ROGER_BEEP and roger_path:
+        parts.append(roger_path)
+    for part in parts:
+        _play_seq += 1
+        await play_queue.put((prio, _play_seq, part, tx))
+    if urgent:
+        cut_in()
+
+
+def cut_in():
+    """Urgent traffic is holding: stop a routine transmission mid-sentence and
+    throw away its tail, the way a dispatcher keys over a readback."""
+    cur = _now_playing.get("tx")
+    if cur is None or _now_playing.get("prio", PRIO_ROUTINE) <= PRIO_URGENT:
+        return
+    _interrupted.add(cur)
+    if len(_interrupted) > 200:
+        for old in sorted(_interrupted)[:100]:
+            _interrupted.discard(old)
+    try:
+        if voice_client is not None and voice_client.is_playing():
+            stopper = getattr(voice_client, "stop_playing", voice_client.stop)
+            stopper()
+            print("cut into a routine transmission for urgent traffic", flush=True)
+    except Exception as exc:
+        print(f"cut-in failed: {exc}", flush=True)
+
+
+async def announce(text, title="911 Call", tone=False, urgent=None):
     print(f"announce: {text[:80]}", flush=True)
 
     async def _log():
@@ -858,12 +1004,9 @@ async def announce(text, title="911 Call", tone=False):
     # The text log and the voice are produced at the same time.
     path, _ = await asyncio.gather(synthesize(text), _log())
     if path:
-        if tone and ALERT_TONES and tone_path:
-            await play_queue.put(tone_path)
-        await play_queue.put(path)
-        if ROGER_BEEP and roger_path:
-            await play_queue.put(roger_path)
-        print("audio queued for playback", flush=True)
+        hot = bool(tone) if urgent is None else bool(urgent)
+        await queue_audio(path, tone=tone, urgent=hot)
+        print(f"audio queued for playback{' (urgent)' if hot else ''}", flush=True)
 
 
 def pcm_to_wav(pcm):
@@ -1127,9 +1270,14 @@ CALL_SYSTEM = build_call_system(DISPATCH_REGION)
 
 def set_region(region):
     global DISPATCH_REGION, DISPATCH_SYSTEM, CALL_SYSTEM
+    was = DISPATCH_REGION
     DISPATCH_REGION = canonical_region(region)
     DISPATCH_SYSTEM = build_dispatch_system(DISPATCH_REGION)
     CALL_SYSTEM = build_call_system(DISPATCH_REGION)
+    if DISPATCH_REGION != was:
+        zone = region_tz_name(DISPATCH_REGION)
+        print(f"region: {DISPATCH_REGION} | clock: "
+              f"{DISPATCH_TZ if DISPATCH_TZ.upper() != 'UTC' else (zone or 'UTC')}", flush=True)
 
 
 async def safe_respond(interaction, text):
@@ -3642,7 +3790,7 @@ async def pursuit_track_loop():
             holder["track_street"] = street
             holder["track_call"] = now
             where = f"{street}, postal {postal}" if postal else street
-            await announce(f"Suspect{who} now on {where}.", title="Suspect Location")
+            await announce(f"Suspect{who} now on {where}.", title="Suspect Location", urgent=True)
         await asyncio.sleep(TRACK_POLL_SECONDS)
 
 
@@ -4161,16 +4309,19 @@ async def wait_for_clear_air(limit=None):
 
 async def playback_worker():
     while True:
-        path = await play_queue.get()
+        prio, _seq, path, tx = await play_queue.get()
         try:
+            if tx in _interrupted:
+                continue   # this transmission was keyed over; its tail is dead
             connected = await wait_for_voice()
             if connected and voice_client is not None:
                 # The courtesy beep is the tail of a transmission already on
-                # the air, so it never waits.
+                # the air, so it never waits. Urgent traffic barely waits.
                 if path != roger_path:
-                    held = await wait_for_clear_air()
+                    held = await wait_for_clear_air(1.5 if prio == PRIO_URGENT else None)
                     if held:
                         print(f"held transmission {held:.1f}s for a unit on the air", flush=True)
+                _now_playing.update({"tx": tx, "prio": prio})
                 if voice_client.is_playing():
                     stopper = getattr(voice_client, "stop_playing", voice_client.stop)
                     stopper()
@@ -4195,6 +4346,8 @@ async def playback_worker():
         except Exception as exc:
             print(f"playback failed: {exc}", flush=True)
         finally:
+            if _now_playing.get("tx") == tx:
+                _now_playing.update({"tx": None, "prio": PRIO_ROUTINE})
             if path not in _KEEP_AUDIO:
                 try:
                     os.remove(path)
@@ -4243,7 +4396,64 @@ async def poll_calls():
         line = await compose_dispatch(call, nearest)
         if len(open_calls) > 1:
             line = f"{line} Be advised, you now have {len(open_calls)} calls holding."
-        await announce(line, tone=is_priority(call))
+        hot = is_priority(call)
+        await announce(line, tone=hot)
+        num = call.get("CallNumber")
+        if hot and num is not None:
+            now = time.time()
+            priority_aired[num] = {"at": now, "first": now, "tries": 0}
+    await recheck_priority_calls()
+
+
+PRIORITY_RECALL = float(os.environ.get("PRIORITY_RECALL_SECONDS", "90"))
+PRIORITY_RECALL_MAX = int(os.environ.get("PRIORITY_RECALL_MAX", "2"))
+priority_aired = {}   # call number -> {"at", "first", "tries"}: priority jobs nobody has taken
+
+_TOOK_A_JOB = ("en route", "on scene", "on a call", "pursuit", "traffic stop",
+               "10-97", "10-23", "10-76", "attached")
+
+
+def unit_responded_since(when):
+    """True when any unit went from standing by to working since that moment."""
+    for v in status_board.values():
+        if float(v.get("time") or 0) < when:
+            continue
+        st = str(v.get("status") or "").lower()
+        if any(w in st for w in _TOOK_A_JOB):
+            return True
+    return False
+
+
+async def recheck_priority_calls():
+    """Real dispatch does not air a shooting once and let it sit. A priority
+    call nobody has taken goes back out, twice, then dispatch stops nagging."""
+    now = time.time()
+    for number in list(priority_aired):
+        rec = priority_aired.get(number)
+        if not rec:
+            continue
+        if number not in open_calls or number in cleared_calls:
+            priority_aired.pop(number, None)
+            continue
+        if now - rec["at"] < PRIORITY_RECALL:
+            continue
+        if unit_responded_since(rec["first"]):
+            priority_aired.pop(number, None)
+            print(f"call {number} taken, no re-air needed", flush=True)
+            continue
+        if rec["tries"] >= PRIORITY_RECALL_MAX:
+            priority_aired.pop(number, None)
+            print(f"call {number} still holding after {rec['tries']} re-airs, dispatch stopped calling",
+                  flush=True)
+            continue
+        rec["tries"] += 1
+        rec["at"] = now
+        waiting = human_ago(now - rec["first"])
+        line = (f"All units, call number {number} is still holding with no unit attached, "
+                f"received {waiting}. {build_call_line(open_calls[number])} "
+                f"Any available unit, advise.")
+        await announce(line, title="Call Holding", urgent=True)
+        print(f"re-aired priority call {number} (try {rec['tries']})", flush=True)
 
 
 async def config_refresh_loop():
@@ -4252,6 +4462,40 @@ async def config_refresh_loop():
         await asyncio.sleep(60)
         await refresh_runtime_config()
         await ensure_voice()
+
+
+LOOKUP_NUDGE = float(os.environ.get("LOOKUP_NUDGE_SECONDS", "14"))
+
+
+async def lookup_nudge_loop():
+    """A unit asks for a check, dispatch says go ahead, then they get pulled
+    into something else. Instead of the request dying in silence, dispatch
+    prompts once and then quietly drops it."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(2)
+        now = time.time()
+        for uid in list(_pending_lookup):
+            pend = _pending_lookup.get(uid)
+            if not pend:
+                continue
+            age = now - float(pend.get("at") or 0)
+            if age > LOOKUP_WINDOW:
+                _pending_lookup.pop(uid, None)
+                _lookup_buf.pop(uid, None)
+                print(f"{pend.get('kind') or 'lookup'} request from "
+                      f"{pend.get('callsign') or uid} expired unanswered", flush=True)
+                continue
+            if pend.get("nudged") or age < max(2.0, LOOKUP_WINDOW - LOOKUP_NUDGE):
+                continue
+            pend["nudged"] = True
+            if uid in _speaking_now or uid in _lookup_buf:
+                continue   # they are mid-sentence or already spelling it out
+            kind = pend.get("kind") or "plate"
+            cs = pend.get("callsign") or ""
+            ack = f"{cs}, " if cs else ""
+            await announce(f"{ack}dispatch is still standing by for that {kind}.",
+                           title="Plate Check" if kind == "plate" else "Name Check")
 
 
 async def voice_channel_watch_loop():
@@ -4430,12 +4674,15 @@ async def on_ready():
                        ("voice_channel_watch_loop", voice_channel_watch_loop),
                        ("identity_watch_loop", identity_watch_loop),
                        ("state_save_loop", state_save_loop),
+                       ("lookup_nudge_loop", lookup_nudge_loop),
                        ("pursuit_track_loop", pursuit_track_loop)):
         client.loop.create_task(_supervise(_name, _fn))
 
     async def _finish_startup():
         await refresh_runtime_config()
-        print(f"region: {DISPATCH_REGION}", flush=True)
+        print(f"region: {DISPATCH_REGION} | clock: "
+              f"{DISPATCH_TZ if DISPATCH_TZ.upper() != 'UTC' else (region_tz_name(DISPATCH_REGION) or 'UTC')}"
+              f" | local time {local_time_str()}", flush=True)
         load_links()
         await load_state()
         if not joined:
