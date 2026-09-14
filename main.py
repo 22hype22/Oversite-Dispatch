@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "drag-1"
+BUILD = "drag-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -3688,39 +3688,46 @@ def find_stop_channel(guild, number):
 
 
 async def drag_to(member, dest):
-    """Move somebody, and return the one line dispatch should say about it.
+    """Move somebody. Returns whether they moved, and what to say if they did not.
 
-    Every way this fails is a sentence a unit can act on, rather than silence
-    and a log line they will never read."""
+    Nothing is said when it works. Dispatch talks in one voice channel and the
+    unit is on their way out of it or was never in it, so an announcement about
+    a move is heard by everyone except the person it is for. They know it
+    worked: they are somewhere else.
+
+    A move that did NOT happen is the opposite. They are still sitting where
+    they were, usually the channel dispatch is in, wondering why nothing
+    happened, so every way this fails says so in a sentence they can act on."""
     if member is None:
-        return "I do not know which unit that is."
+        return False, "I do not know which unit that is."
     who = (member_callsign(member)
            or clean_name(getattr(member, "display_name", "")) or "that unit")
     if getattr(member, "voice", None) is None:
-        return f"{who} is not in a voice channel, so there is nothing to move."
+        return False, f"{who} is not in a voice channel, so there is nothing to move."
     guild = getattr(member, "guild", None)
     kind, number = dest
     if kind == "dispatch":
         if not VOICE_CHANNEL_ID:
-            return "no dispatch channel is set on the dashboard, so there is nowhere to go back to."
+            return False, ("no dispatch channel is set on the dashboard, so there is "
+                           "nowhere to go back to.")
         channel = guild.get_channel(VOICE_CHANNEL_ID) if guild is not None else None
         where = "the dispatch channel"
     else:
         channel = find_stop_channel(guild, number)
         where = f"traffic stop {number}" if number else "a free traffic stop channel"
     if channel is None:
-        return f"I cannot find {where}."
+        return False, f"I cannot find {where}."
     current = getattr(member.voice, "channel", None)
     if current is not None and current.id == channel.id:
-        return f"{who} is already in {channel.name}."
+        return False, f"{who} is already in {channel.name}."
     try:
         await member.move_to(channel)
     except Exception as exc:
         print(f"drag failed for {who}: {exc} — does the bot have Move Members "
               f"on {getattr(channel, 'name', '?')}?", flush=True)
-        return f"I could not move {who}, check my permissions on that channel."
+        return False, f"I could not move {who}, check my permissions on that channel."
     print(f"dragged {who} to {channel.name}", flush=True)
-    return f"10-4, moving {who} to {channel.name}."
+    return True, f"moved {who} to {channel.name}"
 
 
 async def officer_postal(member):
@@ -5478,8 +5485,12 @@ async def process_transmission(member, text, followup_only=False):
     # Moving somebody between channels either happened or it did not, so it is
     # answered from what happened rather than handed to the model.
     if wants_drag(text):
-        said = await drag_to(member, drag_destination(text))
-        await announce(f"{addr(callsign, member)}{said}", title="Channel Move")
+        moved, said = await drag_to(member, drag_destination(text))
+        # Silent when it worked. The unit is in another channel by the time
+        # dispatch could say anything, so the only people who would hear it are
+        # the ones it is not for.
+        if not moved:
+            await announce(f"{addr(callsign, member)}{said}", title="Channel Move")
         return
     if wants_repeat(text):
         if last_call is not None:
@@ -6779,7 +6790,10 @@ async def handle_game_command(player, text):
             print(f"drag from {who}: no linked Discord member, so there is "
                   f"nobody to move. They need to run /link.", flush=True)
             return
-        said = await drag_to(member, dest)
+        # Nothing is said either way. This unit typed it from in game, so they
+        # are not listening to dispatch, and airing it would only tell the
+        # channel about somebody else's channel move.
+        moved, said = await drag_to(member, dest)
         print(f"drag from {who}: {said}", flush=True)
         return
     if mentions_supervisor(body):
