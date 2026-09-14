@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "sup-1"
+BUILD = "pm-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -147,6 +147,11 @@ CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sh
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
+# Tell the player who made a call, in game, when a unit goes en route to it.
+# From the caller's side a call vanishes into nothing: they press the button and
+# stand there with no way of knowing whether anybody took it. One message when
+# somebody actually starts rolling answers that. PM_EN_ROUTE=0 turns it off.
+PM_EN_ROUTE = os.environ.get("PM_EN_ROUTE", "1").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
 # How long dispatch waits after a transmission that stopped mid-thought before
 # deciding the unit is done, so a stumble is never answered as if it were the
@@ -223,6 +228,10 @@ cleared_calls = set()
 # "how many units are attached" is answered from here rather than from a count
 # of everyone in game on a police team.
 call_units = {}
+# (call number, callsign) pairs whose caller has already been told that unit is
+# coming. ER:LC allows ":pm" sparingly and not as a chat channel, so a unit
+# restating its status does not put a second pop-up on the caller's screen.
+told_caller = set()
 callsign_links = {}
 active_stops = {}
 nick_original = {}
@@ -2504,7 +2513,62 @@ def mark_call_cleared(number):
     cleared_calls.add(number)
     open_calls.pop(number, None)
     call_units.pop(number, None)
+    for key in [k for k in told_caller if k[0] == number]:
+        told_caller.discard(key)
     return True
+
+
+async def player_name_for_id(user_id):
+    """The in-game name behind a Roblox user id, or "" when nobody has it.
+
+    An emergency call names its caller by id and by nothing else, and ":pm"
+    wants a name. Somebody who has left the server has no name to find, which
+    is the same answer as never having found them: there is nobody to tell."""
+    want = str(user_id or "").strip()
+    if not want.isdigit():
+        return ""
+    data = await erlc_get("/server?Players=true")
+    players = data.get("Players") if isinstance(data, dict) else None
+    if not isinstance(players, list):
+        return ""
+    for p in players:
+        entry = str(p.get("Player") or "")
+        if ":" in entry and entry.rsplit(":", 1)[1].strip() == want:
+            return entry.split(":")[0].strip()
+    return ""
+
+
+async def tell_caller_en_route(number, callsign):
+    """Tell the player who made a call that a unit is on its way to them.
+
+    Dispatch answers on the radio, which the caller is not on. In game the call
+    simply disappears, and the caller is left guessing whether it went anywhere
+    at all. One message when a unit actually goes en route closes that gap.
+
+    Sent once per unit per call, and never as a running commentary: PRC allows
+    ":pm" sparingly and prohibits using it in place of the in game radio, and a
+    pop-up on every status update is exactly what that rule is about."""
+    if not PM_EN_ROUTE or number is None or not callsign:
+        return
+    key = (number, callsign)
+    if key in told_caller:
+        return
+    call = open_calls.get(number)
+    if not isinstance(call, dict):
+        return
+    who = await player_name_for_id(call.get("Caller"))
+    if not who:
+        print(f"call {number}: caller is not in the server, nobody to tell", flush=True)
+        return
+    # Booked before sending, not after. A send that fails somewhere in the
+    # middle should not leave the door open for the next status update to try
+    # again and keep trying.
+    told_caller.add(key)
+    if len(told_caller) > 500:
+        told_caller.clear()
+    ok = await erlc_command(f":pm {who} Unit {callsign} is en route to your location")
+    print(f"call {number}: told {who} that {callsign} is en route"
+          f"{'' if ok else ' (the message did not send)'}", flush=True)
 
 
 def read_calls_holding(callsign="", member=None):
@@ -5128,8 +5192,12 @@ async def process_transmission(member, text, followup_only=False):
             number = call_for_status(text)
             if status in ("en route", "on a call", "on scene") and number is not None:
                 attached_to = number
-                attach_to_call(number, callsign,
-                               "on scene" if status == "on scene" else "en route")
+                mark = "on scene" if status == "on scene" else "en route"
+                attach_to_call(number, callsign, mark)
+                # A unit already standing there does not need to tell the
+                # caller it is coming, so only the en route side sends.
+                if mark == "en route":
+                    await tell_caller_en_route(number, callsign)
             else:
                 if status.startswith("10-8") or "available" in status or "clear" in status:
                     detach_from_call(callsign)
