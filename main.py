@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-9"
+BUILD = "assist-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1963,26 +1963,79 @@ _SUPERVISOR = re.compile(
     r"out here|on scene|please)\b")
 
 
+# What a unit can ask dispatch to send. Departments call the same thing
+# different names, so the request is read back in the words the unit used
+# rather than mapped to one house term: an RA stays an RA, a sergeant stays a
+# sergeant. Only these are treated as a request to send something, so asking
+# for a plate or a records check is still a lookup and not a dispatch.
+_RESOURCE_WORDS = (
+    "supervisor", "sergeant", "sarge", "lieutenant", "watch commander",
+    "shift lead", "white shirt", "supe", "ra", "rescue", "ambulance", "ems",
+    "medic", "paramedic", "fire", "engine", "tow", "wrecker", "k9", "canine",
+    "air unit", "helicopter", "chopper", "coroner", "detective", "backup",
+    "back up", "another unit", "second unit", "more units",
+)
+# The verb, then optionally "me", then optionally an article, then the thing.
+_ASKING_FOR = re.compile(
+    r"\b(?:request(?:ing)?|need(?:ing)?|send|get|want(?:ing)?|start|call(?:ing)?)\b"
+    # "an" before "a", and a word boundary after, or "an RA" is read as the
+    # article "a" followed by "n RA".
+    r"\s+(?:me\s+)?(?:for\s+)?(?:\b(?:an|a|the)\s+)?([A-Za-z0-9][A-Za-z0-9 \-]{1,38})",
+    re.I)
+# Tails that describe where or how, not what.
+_ASK_TAIL = re.compile(
+    r"\s*\b(?:to|at|out|over|on|for|in|right)?\s*\b(?:my|the|this)?\s*"
+    r"\b(?:location|twenty|20|position|scene|here|there|now|please|asap|"
+    r"immediately|code \d|step it up|when you can|if available)\b.*$", re.I)
+
+
+def requested_resource(text):
+    """What the unit is asking dispatch to send, in their own words, or ""."""
+    match = _ASKING_FOR.search(str(text or ""))
+    if not match:
+        return ""
+    thing = _ASK_TAIL.sub("", match.group(1)).strip(" ,.-")
+    thing = re.sub(r"\s+", " ", thing)
+    if not thing:
+        return ""
+    low = thing.lower()
+    if not any(w in low for w in _RESOURCE_WORDS):
+        return ""
+    return thing
+
+
 def wants_supervisor(text):
-    """'request supervisor', 'I need a sergeant out here', ';request supervisor'."""
-    return bool(_SUPERVISOR.search(_flat(text)))
+    """A unit asking dispatch to send something or someone."""
+    return bool(requested_resource(text)) or bool(_SUPERVISOR.search(_flat(text)))
+
+
+def _with_article(thing):
+    """'a supervisor', 'an RA'. An all-caps acronym takes the article its first
+    letter sounds like, so it is an RA and an EMS unit, not a RA."""
+    low = thing.lower()
+    if re.match(r"^(?:a|an|the)\b", low):
+        return thing
+    letter_sounds_vowel = thing[:1].upper() in "AEFHILMNORSX"
+    acronym = thing.split()[0].isupper() and len(thing.split()[0]) <= 4
+    vowel = low[0] in "aeiou" or (acronym and letter_sounds_vowel)
+    return ("an " if vowel else "a ") + thing
 
 
 SUPERVISOR_ROLE_IDS = [r.strip() for r in
                        os.environ.get("SUPERVISOR_ROLE_IDS", "").split(",") if r.strip()]
 
 
-async def unit_location_phrase(member, callsign=""):
-    """' at postal 43, Main Street' for the unit asking, when the game knows.
+async def unit_place(member, callsign=""):
+    """Where the unit asking is: (spoken phrase, position), from the game.
 
-    A supervisor who is told where to go is worth more than one who is only
-    told somebody wants them."""
+    Somebody told where to go is worth more than somebody told only that they
+    are wanted, and the position is what lets dispatch name whoever is nearest."""
     try:
         positions = await player_positions()
     except Exception:
-        return ""
+        return "", None
     if not positions:
-        return ""
+        return "", None
     key = None
     spoken = norm_callsign(callsign)
     if spoken and spoken in positions:
@@ -1990,21 +2043,43 @@ async def unit_location_phrase(member, callsign=""):
     if key is None and member is not None:
         key = next((c for c in name_match_keys(member) if c in positions), None)
     if key is None:
-        return ""
+        return "", None
     entry = positions[key]
+    pos = entry[0] if entry else None
     street = entry[1] if len(entry) > 1 else ""
     postal = entry[3] if len(entry) > 3 else ""
     if postal and street:
-        return f" at postal {postal}, {street}"
+        return f" at postal {postal}, {street}", pos
     if postal:
-        return f" at postal {postal}"
+        return f" at postal {postal}", pos
     if street:
-        return f" on {street}"
-    return ""
+        return f" on {street}", pos
+    return "", pos
 
 
-async def ping_supervisors(who, where):
-    """Put it in the text channel with a role ping, so a supervisor who is not
+async def nearest_other_unit(pos, asking):
+    """The unit closest to that spot, other than the one asking for help."""
+    if not pos:
+        return ""
+    try:
+        units = await duty_units()
+    except Exception:
+        return ""
+    mine = norm_callsign(asking)
+    others = [(cs, p) for cs, p in units if p and norm_callsign(cs) != mine]
+    if not others:
+        return ""
+    closest = min(others, key=lambda u: (u[1][0] - pos[0]) ** 2 + (u[1][1] - pos[1]) ** 2)
+    return closest[0]
+
+
+async def unit_location_phrase(member, callsign=""):
+    phrase, _pos = await unit_place(member, callsign)
+    return phrase
+
+
+async def ping_supervisors(who, where, thing="a supervisor"):
+    """Put it in the text channel with a role ping, so somebody who is not
     listening to the radio still sees it. Silent when no role is configured."""
     if not (SUPERVISOR_ROLE_IDS and TEXT_CHANNEL_ID):
         return
@@ -2014,24 +2089,27 @@ async def ping_supervisors(who, where):
     mentions = " ".join(f"<@&{r}>" for r in SUPERVISOR_ROLE_IDS)
     try:
         await channel.send(
-            f"{mentions} {who} is requesting a supervisor{where}.",
+            f"{mentions} {who} is requesting {_with_article(thing)}{where}.",
             allowed_mentions=discord.AllowedMentions(roles=True))
     except Exception as exc:
-        print(f"supervisor ping failed: {exc}", flush=True)
+        print(f"assistance ping failed: {exc}", flush=True)
 
 
-async def request_supervisor(member, callsign):
+async def request_supervisor(member, callsign, what=""):
     """Air it, and ping the role. The same whether it was said on the radio or
     typed in game."""
-    who = (callsign or member_callsign(member)
-           or clean_name(getattr(member, "display_name", "")) or "a unit")
-    where = await unit_location_phrase(member, callsign)
-    await announce(
-        f"All units, {who} is requesting a supervisor{where}. "
-        f"Any supervisor available, respond.",
-        title="Supervisor Requested", urgent=True)
-    await ping_supervisors(who, where)
-    print(f"supervisor requested by {who}{where}", flush=True)
+    cs = callsign or member_callsign(member)
+    who = f"Unit {cs}" if cs else (clean_name(getattr(member, "display_name", "")) or "A unit")
+    thing = what or "a supervisor"
+    where, pos = await unit_place(member, cs)
+    closest = await nearest_other_unit(pos, cs)
+    tail = (f"{closest}, you are the closest unit."
+            if closest else f"Any {thing} available, respond.")
+    await announce(f"All units, {who} is requesting {_with_article(thing)}{where}. {tail}",
+                   title="Assistance Requested", urgent=True)
+    await ping_supervisors(who, where, thing)
+    print(f"{thing} requested by {who}{where}"
+          f"{', closest ' + closest if closest else ''}", flush=True)
 
 
 def wants_backup(text):
@@ -4843,7 +4921,7 @@ async def process_transmission(member, text, followup_only=False):
     # Before anything that could hand this to the model, so the wording is the
     # same every time and a supervisor is actually told.
     if wants_supervisor(text):
-        await request_supervisor(member, callsign)
+        await request_supervisor(member, callsign, requested_resource(text))
         return
     if wants_repeat(text):
         if last_call is not None:
@@ -5086,12 +5164,23 @@ def start_listening():
 
 
 async def wait_for_voice(timeout=20):
-    waited = 0
+    """Wait for the voice connection, asking for one only when there is not
+    already an attempt in flight. Asking again every second is what turned one
+    slow handshake into a pile of competing ones."""
+    if voice_client is not None and voice_client.is_connected():
+        return True
+    waited = 0.0
+    asked = 0.0
     while waited < timeout:
-        if await ensure_voice() and voice_client is not None and voice_client.is_connected():
+        if voice_client is not None and voice_client.is_connected():
             return True
-        await asyncio.sleep(1)
-        waited += 1
+        # Ask at most every five seconds, and never while a connect is running.
+        if (waited == 0 or waited - asked >= 5) and not _voice_lock.locked():
+            asked = waited
+            if await ensure_voice() and voice_client is not None and voice_client.is_connected():
+                return True
+        await asyncio.sleep(0.5)
+        waited += 0.5
     return False
 
 
@@ -5533,7 +5622,21 @@ async def dispatch_loop():
         await asyncio.sleep(max(POLL_SECONDS, 15) if active_stops else POLL_SECONDS)
 
 
+# One connection attempt at a time. wait_for_voice used to call this once a
+# second while a transmission waited, the watchdog calls it every fifteen and
+# the config refresh every sixty, so a slow handshake had several more started
+# on top of it. Discord answers duelling handshakes with close code 4006, which
+# is the bot leaving and rejoining on its own, and audio queued in the middle
+# of it is dropped.
+_voice_lock = asyncio.Lock()
+
+
 async def ensure_voice():
+    async with _voice_lock:
+        return await _ensure_voice_locked()
+
+
+async def _ensure_voice_locked():
     global voice_client
     if not client.guilds:
         print("no server yet — add the dispatch bot to your Discord server", flush=True)
@@ -5985,6 +6088,29 @@ def member_for_player(name):
     return None
 
 
+async def name_for_roblox_id(who):
+    """Turn the Roblox user id ER:LC sends into the name it belongs to.
+
+    A CustomCommand names its sender by id, and an id matches nothing: not a
+    Discord nickname, not a callsign. Every player the game reports is written
+    "Name:UserId", so the id is looked up there and the name used from then on."""
+    raw = str(who or "").strip()
+    if not raw.isdigit():
+        return raw
+    try:
+        data = await erlc_get("/server?Players=true")
+    except Exception:
+        return raw
+    players = data.get("Players") if isinstance(data, dict) else None
+    if not isinstance(players, list):
+        return raw
+    for p in players:
+        entry = str(p.get("Player") or "")
+        if ":" in entry and entry.rsplit(":", 1)[1].strip() == raw:
+            return entry.split(":")[0].strip() or raw
+    return raw
+
+
 async def handle_game_command(player, text):
     """Somebody typed ";something" in game.
 
@@ -5994,6 +6120,7 @@ async def handle_game_command(player, text):
     body = str(text or "").lstrip(";").strip()   # already stripped, harmless twice
     if not body:
         return
+    player = await name_for_roblox_id(player)
     member = member_for_player(player)
     who = str(player or "").split(":")[0].strip() or "a unit"
     print(f"in-game command from {who}: {body!r}"
@@ -6003,9 +6130,14 @@ async def handle_game_command(player, text):
         # dispatch, which is exactly what typing it in game means.
         await process_transmission(member, f"dispatch {body}")
         return
-    # Nobody linked. Still answer, using the in-game name as the callsign, so a
-    # unit who never ran /link is not simply ignored.
+    # Nobody linked. The request is still a real request, so it is handled the
+    # same way rather than echoed back. Repeating it verbatim is not dispatch
+    # doing anything, and it is what a unit heard when the sender could not be
+    # matched to a Discord member.
     callsign = resolve_callsign(who) or who
+    if wants_supervisor(body):
+        await request_supervisor(None, callsign, requested_resource(body))
+        return
     await announce(f"{callsign}, {body}. Dispatch copies.", title="In-Game Request")
 
 
