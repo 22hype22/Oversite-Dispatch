@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-2"
+BUILD = "pm-3"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -232,6 +232,11 @@ call_units = {}
 # coming. ER:LC allows ":pm" sparingly and not as a chat channel, so a unit
 # restating its status does not put a second pop-up on the caller's screen.
 told_caller = set()
+# Units who have asked for help and not been answered yet: callsign -> the
+# name to reach them by in game and when they asked. A supervisor request is
+# not an emergency call and has no caller, but the unit who made it is waiting
+# on exactly the same answer, so it is tracked the same way.
+help_requests = {}
 callsign_links = {}
 active_stops = {}
 nick_original = {}
@@ -2124,7 +2129,7 @@ async def ping_supervisors(who, where, thing="a supervisor"):
         print(f"assistance ping failed: {exc}", flush=True)
 
 
-async def request_supervisor(member, callsign, what=""):
+async def request_supervisor(member, callsign, what="", game_name=""):
     """Air it, and ping the role. The same whether it was said on the radio or
     typed in game."""
     cs = callsign or member_callsign(member)
@@ -2141,6 +2146,12 @@ async def request_supervisor(member, callsign, what=""):
     await announce(f"All units, {who} is requesting {_with_article(thing)}{where}. {tail}",
                    title="Assistance Requested", urgent=True)
     await ping_supervisors(who, where, thing)
+    # Remembered so that when a unit answers this, the one who asked hears
+    # about it in game rather than only on a radio they may not be on. This is
+    # the whole reason a unit types it instead of saying it.
+    if cs:
+        help_requests[norm_callsign(cs)] = {"callsign": cs, "name": game_name,
+                                            "thing": thing, "at": time.time()}
     print(f"{thing} requested by {who}{where}"
           f"{', closest ' + closest if closest else ''}", flush=True)
 
@@ -2582,6 +2593,65 @@ async def tell_caller_en_route(number, callsign):
     ok = await erlc_command(f":pm {who} Unit {callsign} is en route to your location")
     print(f"call {number}: told {who} that {callsign} is en route"
           f"{'' if ok else ' (the message did not send)'}", flush=True)
+
+
+async def player_name_for_callsign(cs):
+    """The in-game name of whoever is running this callsign, or "".
+
+    A request made on the radio knows the callsign and nothing else, and ":pm"
+    wants a name. Looked up fresh rather than remembered, because the point is
+    to reach whoever is running it now."""
+    want = norm_callsign(cs)
+    if not want:
+        return ""
+    data = await erlc_get("/server?Players=true")
+    players = data.get("Players") if isinstance(data, dict) else None
+    if not isinstance(players, list):
+        return ""
+    for p in players:
+        if norm_callsign(str(p.get("Callsign") or "")) == want:
+            return str(p.get("Player") or "").split(":")[0].strip()
+    return ""
+
+
+# How long a unit that asked for help is still waiting on an answer. Past this
+# somebody going en route is going somewhere else.
+HELP_RECENT = float(os.environ.get("HELP_REQUEST_RECENT", "600"))   # 10 minutes
+
+
+async def tell_requester_en_route(responder):
+    """Tell a unit that asked for help that somebody is on their way.
+
+    A supervisor request has no emergency call behind it, so there is no caller
+    to notify, but the unit who asked is waiting on the same answer and is
+    usually the one person who cannot hear the radio. That is why they typed it
+    in the first place.
+
+    Answered once, and only when there is exactly one outstanding request to
+    answer. Two units waiting and it stays quiet, because telling the wrong one
+    help is coming is worse than telling neither."""
+    if not PM_EN_ROUTE or not responder:
+        return
+    now = time.time()
+    for key in [k for k, v in help_requests.items() if now - float(v.get("at") or 0) > HELP_RECENT]:
+        help_requests.pop(key, None)
+    waiting = [(k, v) for k, v in help_requests.items() if k != norm_callsign(responder)]
+    if len(waiting) != 1:
+        if waiting:
+            print(f"{len(waiting)} units waiting on help, not guessing which one "
+                  f"{responder} is going to", flush=True)
+        return
+    key, req = waiting[0]
+    who = req.get("name") or await player_name_for_callsign(req.get("callsign"))
+    if not who:
+        print(f"{req.get('callsign')} asked for help but is not in the server, nobody to tell",
+              flush=True)
+        return
+    help_requests.pop(key, None)
+    ok = await erlc_command(f":pm {who} Unit {responder} is en route to your location")
+    print(f"told {who} that {responder} is en route to their "
+          f"{req.get('thing') or 'request'}{'' if ok else ' (the message did not send)'}",
+          flush=True)
 
 
 def read_calls_holding(callsign="", member=None):
@@ -5222,6 +5292,10 @@ async def process_transmission(member, text, followup_only=False):
                     # line is the whole answer.
                     live = [n for n in open_calls if n not in cleared_calls]
                     note = f" (not attached, {len(live)} call(s) open)"
+                    # No call does not mean nobody is waiting. A unit that asked
+                    # for a supervisor is waiting on exactly this.
+                    if status == "en route":
+                        await tell_requester_en_route(callsign)
                 print(f"status board: {callsign} -> {status}{note}", flush=True)
         if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
@@ -6390,10 +6464,11 @@ async def handle_game_command(player, text):
         # However they said it, it goes out as a supervisor. A sarge, a white
         # shirt and the brass are the same request, and the channel should hear
         # the same words every time rather than whatever that unit types.
-        await request_supervisor(member, callsign or who, "supervisor")
+        await request_supervisor(member, callsign or who, "supervisor", game_name=player)
         return
     if wants_supervisor(body):
-        await request_supervisor(member, callsign or who, requested_resource(body))
+        await request_supervisor(member, callsign or who, requested_resource(body),
+                                 game_name=player)
         return
     if member is not None:
         # Prefixed with the wake word so it reads as radio traffic aimed at
