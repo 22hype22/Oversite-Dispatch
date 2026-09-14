@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "radio-3"
+BUILD = "cmds-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -193,7 +193,7 @@ _now_playing = {"tx": None, "prio": PRIO_ROUTINE}
 seen_keys = set()
 boot_time = time.time()
 commands_synced = False
-command_fp = ""       # the command set Discord was last given globally
+globals_cleared = False   # the old global duplicates have been removed
 voice_client = None
 http = None
 last_call = None
@@ -1353,7 +1353,7 @@ async def region_autocomplete(interaction, current: str):
 )
 @discord.app_commands.describe(area="Pick a state or country — for example Texas, California, United Kingdom")
 @discord.app_commands.autocomplete(area=region_autocomplete)
-@discord.app_commands.default_permissions(manage_guild=True)
+@discord.app_commands.default_permissions(administrator=True)
 async def region_command(interaction, area: str):
     area = " ".join(area.split()).strip()
     if not area:
@@ -1393,18 +1393,6 @@ async def link_command(interaction, callsign: str, roblox: str = ""):
     await safe_respond(interaction,
         f"Linked. Callsign **{callsign}**{extra}. When you call a traffic stop, dispatch "
         f"will pull you back automatically if the subject flees.")
-
-
-@command_tree.command(
-    name="clear",
-    description="Clear from your traffic stop and return to the main channel",
-    guild=DISPATCH_GUILD,
-)
-async def clear_command(interaction):
-    active_stops.pop(interaction.user.id, None)
-    moved = await move_member(interaction.user, VOICE_CHANNEL_ID)
-    note = " and returned you to the main channel" if moved else ""
-    await safe_respond(interaction, f"10-4, showing you clear{note}.")
 
 
 async def anthropic_call(system, user_msg, max_tokens=200):
@@ -2230,7 +2218,7 @@ def _state_snapshot():
         "air_manual_until": air_manual_until,
         "human_dispatch": dict(human_dispatch),
         "code_board": dict(code_board),
-        "command_fp": command_fp,
+        "globals_cleared": globals_cleared,
         "saved_at": time.time(),
     }
 
@@ -2312,7 +2300,7 @@ async def load_state():
                 stop_channel_original[int(k)] = v
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
-        globals()["command_fp"] = str(st.get("command_fp") or "")
+        globals()["globals_cleared"] = bool(st.get("globals_cleared"))
         cb = st.get("code_board")
         if isinstance(cb, dict) and cb.get("message_id"):
             code_board.clear()
@@ -5079,60 +5067,43 @@ async def voice_guard():
         await asyncio.sleep(15)
 
 
-def tree_fingerprint():
-    """A stable hash of the command set, so a boot can tell whether Discord
-    already has this exact one. Any failure returns a value that cannot match
-    what was stored, so a broken fingerprint forces a sync rather than
-    skipping one forever."""
-    import hashlib
-    cmds = command_tree.get_commands()
-    payload = []
-    for c in cmds:
-        try:
-            payload.append(c.to_dict(command_tree))
-        except Exception as exc:
-            print(f"command fingerprint failed for {getattr(c, 'name', '?')}: {exc}", flush=True)
-            return f"error:{time.time()}"
-    try:
-        raw = json.dumps({"count": len(cmds), "commands": payload}, sort_keys=True, default=str)
-    except Exception:
-        return f"error:{time.time()}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
 async def sync_commands():
     """Guild first: it lands instantly and Discord does not ration it. The
     global set is only pushed when the commands actually changed, because that
     call is capped per day and a bot that redeploys often will hit it."""
-    global commands_synced, command_fp
+    global commands_synced, globals_cleared
     if commands_synced:
         return
-    guild = dispatch_guild()
-    fp = tree_fingerprint()
-    # Each step says so as it lands. A global sync can sit in a rate limit for
-    # a long time, and that must not hide the fact that the commands are
-    # already live in the customer's server.
-    if guild is not None:
+    # Commands are registered per guild ONLY. Registering them globally as
+    # well put two of everything in the picker, because Discord shows the guild
+    # copy and the global copy side by side. Per guild is also instant and not
+    # rationed, so there is no reason to keep both.
+    guilds = list(client.guilds)
+    if not guilds:
+        print("command sync: bot is not in a server yet", flush=True)
+        return
+    for g in guilds:
         try:
-            command_tree.copy_global_to(guild=guild)
-            synced = await command_tree.sync(guild=guild)
+            command_tree.copy_global_to(guild=g)
+            synced = await command_tree.sync(guild=g)
             commands_synced = True
-            print(f"slash commands live in {guild.name}: "
+            print(f"slash commands live in {g.name}: "
                   f"{', '.join('/' + c.name for c in synced) or 'none'}", flush=True)
         except Exception as exc:
-            print(f"guild command sync failed: {exc}", flush=True)
-    else:
-        print("command sync: bot is not in a server yet", flush=True)
-    if fp == command_fp:
-        print("global command set unchanged, not re-syncing", flush=True)
-        return
-    try:
-        synced = await command_tree.sync()
-        command_fp = fp
-        commands_synced = True
-        print(f"global command set updated: {len(synced)} command(s)", flush=True)
-    except Exception as exc:
-        print(f"global command sync failed: {exc}", flush=True)
+            print(f"command sync failed for {g.name}: {exc}", flush=True)
+    # Anything previously published globally is a duplicate of what we just
+    # registered per guild. Clear it once and remember, rather than spending a
+    # rationed global call on every boot.
+    if not globals_cleared:
+        try:
+            route = discord.http.Route("PUT", "/applications/{application_id}/commands",
+                                       application_id=client.application_id)
+            await client.http.request(route, json=[])
+            globals_cleared = True
+            print("cleared the duplicate global command set", flush=True)
+            await save_state()
+        except Exception as exc:
+            print(f"could not clear the global commands: {exc}", flush=True)
 
 
 @client.event
