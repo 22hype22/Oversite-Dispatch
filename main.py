@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "voice-1"
+BUILD = "voice-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -83,7 +83,13 @@ VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWW03F9")
 # Turbo v2.5 measured both better and faster than Flash on this voice, so it
 # is the default. v3 is more expressive again but adds ~1.8s per transmission,
 # which is too long for radio traffic.
-XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+# The lowest-latency model ElevenLabs offers. A dispatcher that answers a
+# second late is no use in a pursuit, and the difference in the voice itself is
+# not audible once the radio filter is on it.
+XI_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+# Radio audio, not a podcast. A smaller file is a shorter download, which is
+# time the unit spends waiting for an answer.
+XI_FORMAT = os.environ.get("ELEVENLABS_FORMAT", "mp3_22050_32")
 # Lower stability and a little style let the delivery move; at stability 0.65
 # with style 0 every line came out identically flat.
 XI_STABILITY = float(os.environ.get("ELEVENLABS_STABILITY", "0.45"))
@@ -106,6 +112,7 @@ TRANSMIT_GAP = float(os.environ.get("TRANSMIT_GAP_SECONDS", "0.45"))
 ROGER_BEEP = os.environ.get("ROGER_BEEP", "1").lower() not in ("0", "false", "no", "off")
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
 STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
+STT_LANG = os.environ.get("ELEVENLABS_STT_LANGUAGE", "eng").strip()
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL = os.environ.get("DISPATCH_AI_MODEL", "claude-haiku-4-5")
 AI_ENABLED = bool(ANTHROPIC_KEY)
@@ -972,7 +979,8 @@ async def erlc_command(command):
 
 
 async def synthesize(text):
-    url = f"{XI_BASE}/text-to-speech/{VOICE_ID}"
+    url = (f"{XI_BASE}/text-to-speech/{VOICE_ID}/stream"
+           f"?optimize_streaming_latency=3&output_format={XI_FORMAT}")
     payload = {
         "text": speech_text(text),
         "model_id": XI_MODEL,
@@ -1087,6 +1095,10 @@ def pcm_to_wav(pcm):
 async def transcribe(wav_bytes):
     form = aiohttp.FormData()
     form.add_field("model_id", STT_MODEL)
+    # Say what language it is rather than letting the model work it out from a
+    # two second burst of radio, which it sometimes gets wrong.
+    if STT_LANG:
+        form.add_field("language_code", STT_LANG)
     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
     try:
         async with http.post(f"{XI_BASE}/speech-to-text", headers={"xi-api-key": XI_KEY}, data=form) as resp:
@@ -2407,6 +2419,7 @@ citations = {}         # normalised name -> [{"kind", "reason", "callsign", "at"
 last_subject = {}      # Discord member id -> {"name", "plate", "at"}: who they just ran
 _subject_any = {}      # the last person anyone ran, so any unit can follow up on it
 _open_mic = {}         # member id -> until when a follow-up needs no wake word
+_hailed = {}           # member id -> until when dispatch is waiting on them to go ahead
 air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
 manual_tracks = {}     # normalised player name -> {"name", "callsign", "since", "street", "last_call"}
 _last_state_blob = None
@@ -2483,6 +2496,10 @@ def prune_memory():
     for cs in [c for c, v in status_board.items()
                if now - float((v or {}).get("time") or 0) > STATUS_KEEP]:
         status_board.pop(cs, None)
+    for uid in [u for u, t in list(_open_mic.items()) if t <= now]:
+        _open_mic.pop(uid, None)
+    for uid in [u for u, t in list(_hailed.items()) if t <= now]:
+        _hailed.pop(uid, None)
     while len(response_cache) > CACHE_KEEP:
         response_cache.pop(next(iter(response_cache)), None)
     if len(plate_memory) > PLATE_KEEP:
@@ -3865,6 +3882,37 @@ SUBJECT_WINDOW = float(os.environ.get("SUBJECT_WINDOW", "420"))  # 7 minutes
 # that, a question about them is obviously still aimed at dispatch, so it does
 # not have to be prefixed with the wake word all over again.
 OPEN_MIC = float(os.environ.get("OPEN_MIC_SECONDS", "60"))
+# Dispatch has told a unit to go ahead, or to stand by. Whatever that unit says
+# next is the traffic dispatch is waiting for, wake word or not.
+HAIL_WINDOW = float(os.environ.get("HAIL_WINDOW_SECONDS", "45"))
+
+
+def just_hailing(text):
+    """"471 to dispatch" and nothing else.
+
+    A unit calling in and waiting to be acknowledged before it says what it
+    needs. Held as an unfinished thought and then dropped, which is why a unit
+    could call dispatch properly and get nothing back at all."""
+    low = _flat(text)
+    if "dispatch" not in low:
+        return False
+    words = re.findall(r"[a-z0-9'-]+", low)
+    rest = [w for w in words
+            if w != "dispatch" and w not in _TO_DISPATCH and not is_callsign_token(w)]
+    return not rest
+
+
+def hail_open(member):
+    uid = getattr(member, "id", None)
+    if uid is not None:
+        _hailed[uid] = time.time() + HAIL_WINDOW
+
+
+def hail_is_open(uid):
+    if _hailed.get(uid, 0) > time.time():
+        return True
+    _hailed.pop(uid, None)
+    return False
 
 
 def looks_like_followup(text):
@@ -4544,14 +4592,21 @@ async def handle_utterance(member, pcm):
     # question about the subject, so ordinary radio traffic is still ignored.
     followup = False
     if not is_for_dispatch(text):
-        if mic_is_open(uid) and looks_like_followup(text):
+        if hail_is_open(uid):
+            # Dispatch told this unit to go ahead. Whatever came next is what it
+            # was waiting for, and making them say the wake word again is what
+            # made a simple request take three transmissions.
+            _hailed.pop(uid, None)
+            if LOG_HEARD:
+                print(f"taking {who}'s traffic, dispatch told them to go ahead", flush=True)
+        elif mic_is_open(uid) and looks_like_followup(text):
             followup = True
             if LOG_HEARD:
                 print(f"open mic: taking {who}'s follow-up without the wake word", flush=True)
         else:
             return
 
-    if looks_unfinished(text):
+    if looks_unfinished(text) and not just_hailing(text) and not says_stand_by(text):
         # The unit stopped mid-thought. Say nothing; wait for them to start over
         # or pick up where they were. If they never do, the fragment is used
         # only when dispatch can act on it, otherwise it is dropped quietly.
@@ -4661,12 +4716,18 @@ async def process_transmission(member, text, followup_only=False):
         await take_dispatch(member, callsign)
         return
 
+    if just_hailing(text):
+        ack = addr(callsign, member)
+        hail_open(member)
+        await announce(f"{ack}go ahead." if ack else "Go ahead.", title="Go Ahead")
+        return
     if await handle_special(member, text, callsign):
         return
     if says_stand_by(text):
         kind = stand_by_kind(text)
         if kind:
             _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
+        hail_open(member)
         await announce(f"{addr(callsign, member)}standing by.", title="Stand By")
         return
     if followup_only:
