@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "calls-3"
+BUILD = "quiet-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -197,6 +197,7 @@ globals_cleared = False   # the old global duplicates have been removed
 voice_client = None
 http = None
 last_call = None
+last_call_at = 0.0     # when that call went out, so a stale one stops counting
 response_cache = {}
 tone_path = None
 roger_path = None
@@ -1795,8 +1796,21 @@ def _flat(text):
     return text.lower().replace("’", "").replace("'", "")
 
 
+# A question about somebody else is not a status report. "Who is responding
+# to that call" contains the word responding, and taking that as the asking
+# unit going en route is how dispatch ends up announcing an attachment nobody
+# made.
+_NOT_MY_STATUS = re.compile(
+    r"\b(?:who|whos|whose|whom|anyone|anybody|somebody|someone"
+    r"|any\s+(?:other\s+)?units?|how\s+many|which\s+units?|what\s+units?"
+    r"|is\s+there|are\s+there|is\s+any|are\s+any|do\s+we\s+have"
+    r"|does\s+anyone|did\s+anyone)\b")
+
+
 def detect_status(text):
     low = _flat(text)
+    if _NOT_MY_STATUS.search(low) or low.strip().endswith("?"):
+        return None
     for phrase, label in STATUS_MAP:
         if phrase in low:
             return label
@@ -2092,6 +2106,63 @@ def read_call_details(callsign="", member=None, number=None):
     else:
         line += " No units attached."
     return line
+
+
+# How long after a call goes out a bare "show me en route" still counts as
+# being en route to THAT call. Past this it is a unit going somewhere else,
+# and attaching it to a stale call is a lie on the board.
+CALL_ATTACH_RECENT = float(os.environ.get("CALL_ATTACH_RECENT", "600"))  # 10 minutes
+
+
+def call_for_status(text):
+    """The call a unit is talking about when it reports a status, or None.
+
+    An explicit number always wins. Otherwise the last call that went out
+    counts, but only while it is still open, still uncleared and still
+    recent."""
+    number = extract_call_number(text)
+    if number is not None:
+        return number
+    if not isinstance(last_call, dict):
+        return None
+    number = last_call.get("CallNumber")
+    if number is None or number not in open_calls or number in cleared_calls:
+        return None
+    if last_call_at and time.time() - last_call_at > CALL_ATTACH_RECENT:
+        return None
+    return number
+
+
+# Words that carry no meaning of their own in a status report, so what is left
+# after them decides whether the unit said anything else worth answering.
+_STATUS_FILLER = {
+    "a", "am", "an", "and", "are", "at", "back", "be", "copy", "for", "go", "going",
+    "i", "il", "ill", "im", "in", "is", "it", "its", "ive", "just", "let", "let's",
+    "lets", "mark", "me", "my", "now", "number", "of", "off", "ok", "okay", "on",
+    "one", "our", "out", "over", "put", "radio", "show", "showing", "signal", "start",
+    "that", "the", "then", "there", "this", "to", "up", "us", "we", "were", "will",
+    "with", "you", "youre",
+}
+
+
+def only_a_status(text, callsign):
+    """Nothing in this transmission but a unit reporting its own status.
+
+    Used to answer it with a fixed acknowledgement instead of sending it to the
+    model, which is where dispatch picks up the habit of volunteering things
+    nobody asked about."""
+    if any(f(text) for f in (wants_repeat, wants_roster, wants_status_board,
+                             wants_calls_holding, wants_call_units, wants_call_details,
+                             wants_backup, wants_call_cleared, looks_like_followup)):
+        return False
+    if extract_bolo(text):
+        return False
+    low = normalize_intent(text, callsign)
+    for phrase, _label in STATUS_MAP:
+        low = low.replace(phrase, " ")
+    left = [w for w in re.sub(r"\s+", " ", low).strip().split()
+            if w not in _STATUS_FILLER]
+    return len(left) <= 2
 
 
 def wants_call_units(text):
@@ -4594,17 +4665,17 @@ async def process_transmission(member, text, followup_only=False):
             detach_from_call(callsign)
             status_board[callsign] = {"status": "10-8, in service", "time": time.time()}
         return
+    attached_to = None
     if status:
         if callsign:
             # Responding to, attaching to or arriving at a call puts the unit ON
             # that call, and the board says which one. Anything else is just a
             # status.
-            number = extract_call_number(text)
-            if number is None and isinstance(last_call, dict):
-                number = last_call.get("CallNumber")
-            on_call = status in ("en route", "on a call", "on scene") and number is not None
-            if on_call:
-                attach_to_call(number, callsign, "on scene" if status == "on scene" else "en route")
+            number = call_for_status(text)
+            if status in ("en route", "on a call", "on scene") and number is not None:
+                attached_to = number
+                attach_to_call(number, callsign,
+                               "on scene" if status == "on scene" else "en route")
             else:
                 if status.startswith("10-8") or "available" in status or "clear" in status:
                     detach_from_call(callsign)
@@ -4612,6 +4683,18 @@ async def process_transmission(member, text, followup_only=False):
                 print(f"status board: {callsign} -> {status}", flush=True)
         if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
+        elif only_a_status(text, callsign):
+            # A plain status report gets a plain acknowledgement, and that is
+            # the whole reply. Handing it to the model instead is what produced
+            # remarks nobody asked for.
+            ack = addr(callsign, member)
+            if attached_to is not None:
+                said = "on scene at" if status == "on scene" else "en route to"
+                await announce(f"{ack}10-4, showing you {said} call number {attached_to}.",
+                               title="Status")
+            else:
+                await announce(f"{ack}10-4, showing you {status}.", title="Status")
+            return
     if not status and not normalize_intent(text, callsign):
         ack = addr(callsign, member)
         await announce(f"{ack}you are unreadable, say again.", title="Say Again")
@@ -4814,7 +4897,7 @@ async def playback_worker():
 
 
 async def poll_calls():
-    global last_call, _call_debugged
+    global last_call, last_call_at, _call_debugged
     data = await erlc_get("/server?EmergencyCalls=true")
     if not isinstance(data, dict):
         return
@@ -4849,6 +4932,7 @@ async def poll_calls():
     units = await duty_units() if pending else []
     for call in pending:
         last_call = call
+        last_call_at = time.time()
         nearest = pick_nearest_units(call, units, 2)
         line = await compose_dispatch(call, nearest)
         if len(open_calls) > 1:
