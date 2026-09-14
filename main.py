@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "addr-1"
+BUILD = "drag-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -3563,6 +3563,166 @@ def channel_humans(channel):
     return [m for m in getattr(channel, "members", []) if not getattr(m, "bot", False)]
 
 
+# ------------------------------------------------------------------ dragging
+#
+# Moving a unit between voice channels by asking for it, instead of hunting for
+# the channel and dragging a name across it while driving. Units say it out loud
+# to each other already, so dispatch may as well be the one doing it.
+
+_DRAG_VERB = (r"(?:drag|move|pull|put|send|shift|bring|transfer|stick|throw|toss"
+              r"|yank|slide|switch)")
+_DRAG_RE = re.compile(rf"\b{_DRAG_VERB}\b")
+
+# How a unit asks to go back where it started. "RTO" is what actually gets said,
+# and a transcriber will happily render it "r t o" or "are tee oh".
+_RTO_RE = re.compile(
+    r"\b(?:rto|r\s*t\s*o|are\s*tee\s*oh|return\s+to\s+(?:office|original|dispatch|base)"
+    r"|back\s+to\s+(?:the\s+)?(?:dispatch|main|office|base)"
+    r"|(?:main|dispatch)\s+(?:channel|vc))\b")
+
+# Everything a traffic stop channel gets called at speed, abbreviations first,
+# because that is what a unit says with one hand on the wheel. "TS1" arrives
+# with no space, "TS 1" with one, "traffic stop one" spelled out.
+# A destination is somewhere a unit is being SENT. Without one of these the
+# verb is just a verb: "pull over that vehicle", "move in on the suspect".
+_DEST_LEAD = re.compile(r"\b(?:to|into|over to)\b")
+# "drag me back" and "pull us back" name no channel but mean exactly one.
+_ME_BACK_RE = re.compile(rf"\b{_DRAG_VERB}\s+(?:me|us)\s+back\b")
+_VC_RE = re.compile(r"\b(?:to|into)\s+(?:the\s+)?vc\b")
+
+_STOP_DEST_RE = re.compile(
+    r"\b(?:traffic\s*stop|vehicle\s*stop|tstop|t\s+s|ts)\s*"
+    r"(?:number\s+|no\s+|#\s*)?([a-z0-9]+)?")
+
+
+def spoken_int(word):
+    """A small number however it was said or transcribed."""
+    w = str(word or "").strip().lower()
+    if not w:
+        return None
+    if w.isdigit():
+        return int(w)
+    if w in _NUM_ONES:
+        return int(_NUM_ONES[w])
+    if w in _NUM_TEEN:
+        return int(_NUM_TEEN[w])
+    if w in _NUM_TENS:
+        return _NUM_TENS[w]
+    return None
+
+
+def drag_destination(text, terse=False):
+    """Where this asks somebody to go, as (kind, number), or None.
+
+    ("stop", n) is Traffic Stop n, ("stop", 0) whichever one is free, and
+    ("dispatch", 0) the channel dispatch itself sits in, which is what a unit
+    means by RTO and by asking to be put back.
+
+    Said out loud, a channel has to be somewhere a unit is being sent, not just
+    a phrase in the sentence: "move in on the traffic stop" is radio traffic and
+    "move me to traffic stop two" is a request, and the difference is a "to" and
+    a number. Typed in game both are usually dropped, so ";drag ts1" is read off
+    the whole line instead."""
+    low = _flat(text)
+    if _RTO_RE.search(low) or _ME_BACK_RE.search(low) or _VC_RE.search(low):
+        return ("dispatch", 0)
+    where = low
+    if not terse:
+        lead = _DEST_LEAD.search(low)
+        if not lead:
+            return None
+        where = low[lead.end():]
+    match = _STOP_DEST_RE.search(where)
+    if not match:
+        return None
+    number = spoken_int(match.group(1))
+    if number is None:
+        # "to my traffic stop" and "to the traffic stop at Main" are places in
+        # the world, not channels. Spoken, a channel gets a number. Typed, the
+        # unit meant a channel or they would not have typed it.
+        return ("stop", 0) if terse else None
+    return ("stop", number)
+
+
+def wants_drag(text):
+    """Whether this is asking for somebody to be moved between channels.
+
+    The verb alone is not enough. "Move in on the suspect" and "pull over that
+    vehicle" are radio traffic, so somewhere to be moved to has to be named
+    too."""
+    low = _flat(text)
+    if not _DRAG_RE.search(low):
+        return False
+    return drag_destination(text) is not None
+
+
+def stop_channel_number(name):
+    """The 1 in "Traffic Stop 1", whatever decoration is around it."""
+    flat = re.sub(r"[^\w ]+", " ", str(name or "").lower())
+    flat = re.sub(r"\s+", " ", flat).strip()
+    match = re.search(r"(?:traffic stop|vehicle stop|tstop|ts)\s*#?\s*(\d+)", flat)
+    return int(match.group(1)) if match else None
+
+
+def find_stop_channel(guild, number):
+    """The traffic stop channel that was asked for, or a free one when no number
+    was given. A number never falls back to a different channel: answering "TS
+    2" with TS 3 puts a unit somewhere nobody is looking for them."""
+    if guild is None:
+        return None
+    stops = [c for c in getattr(guild, "voice_channels", [])
+             if is_traffic_stop_channel(getattr(c, "name", ""))]
+    if not stops:
+        return None
+    stops.sort(key=lambda c: (stop_channel_number(c.name) is None,
+                              stop_channel_number(c.name) or 0, str(c.name)))
+    if number:
+        for channel in stops:
+            if stop_channel_number(channel.name) == number:
+                return channel
+        return None
+    for channel in stops:
+        if not channel_humans(channel):
+            return channel
+    return stops[0]
+
+
+async def drag_to(member, dest):
+    """Move somebody, and return the one line dispatch should say about it.
+
+    Every way this fails is a sentence a unit can act on, rather than silence
+    and a log line they will never read."""
+    if member is None:
+        return "I do not know which unit that is."
+    who = (member_callsign(member)
+           or clean_name(getattr(member, "display_name", "")) or "that unit")
+    if getattr(member, "voice", None) is None:
+        return f"{who} is not in a voice channel, so there is nothing to move."
+    guild = getattr(member, "guild", None)
+    kind, number = dest
+    if kind == "dispatch":
+        if not VOICE_CHANNEL_ID:
+            return "no dispatch channel is set on the dashboard, so there is nowhere to go back to."
+        channel = guild.get_channel(VOICE_CHANNEL_ID) if guild is not None else None
+        where = "the dispatch channel"
+    else:
+        channel = find_stop_channel(guild, number)
+        where = f"traffic stop {number}" if number else "a free traffic stop channel"
+    if channel is None:
+        return f"I cannot find {where}."
+    current = getattr(member.voice, "channel", None)
+    if current is not None and current.id == channel.id:
+        return f"{who} is already in {channel.name}."
+    try:
+        await member.move_to(channel)
+    except Exception as exc:
+        print(f"drag failed for {who}: {exc} — does the bot have Move Members "
+              f"on {getattr(channel, 'name', '?')}?", flush=True)
+        return f"I could not move {who}, check my permissions on that channel."
+    print(f"dragged {who} to {channel.name}", flush=True)
+    return f"10-4, moving {who} to {channel.name}."
+
+
 async def officer_postal(member):
     positions = await player_positions()
     for ident in duty_idents(member):
@@ -5315,6 +5475,12 @@ async def process_transmission(member, text, followup_only=False):
     if wants_supervisor(text):
         await request_supervisor(member, callsign, requested_resource(text))
         return
+    # Moving somebody between channels either happened or it did not, so it is
+    # answered from what happened rather than handed to the model.
+    if wants_drag(text):
+        said = await drag_to(member, drag_destination(text))
+        await announce(f"{addr(callsign, member)}{said}", title="Channel Move")
+        return
     if wants_repeat(text):
         if last_call is not None:
             ack = addr(callsign, member) or "Copy. "
@@ -6599,6 +6765,23 @@ async def handle_game_command(player, text):
     #
     # Anything that so much as mentions a supervisor counts, because that is
     # what it means when a unit types it.
+    # ";drag ts1", ";drag rto", ";drag me to traffic stop two". Typed rather
+    # than said because a unit sitting in a stop channel cannot reach dispatch
+    # on the radio, which is the whole reason for wanting to be moved out of it.
+    # Gated on an actual destination, not on the verb. "send" is a way of
+    # asking to be moved and also the first word of ";send a supervisor", and
+    # taking the second one as a channel request swallows it.
+    drag_dest = (drag_destination(body, terse=True)
+                 if _DRAG_RE.search(_flat(body)) else None)
+    if drag_dest is not None:
+        dest = drag_dest
+        if member is None:
+            print(f"drag from {who}: no linked Discord member, so there is "
+                  f"nobody to move. They need to run /link.", flush=True)
+            return
+        said = await drag_to(member, dest)
+        print(f"drag from {who}: {said}", flush=True)
+        return
     if mentions_supervisor(body):
         # However they said it, it goes out as a supervisor. A sarge, a white
         # shirt and the brass are the same request, and the channel should hear
