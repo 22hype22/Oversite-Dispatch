@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-3"
+BUILD = "pm-4"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -152,6 +152,11 @@ CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false",
 # stand there with no way of knowing whether anybody took it. One message when
 # somebody actually starts rolling answers that. PM_EN_ROUTE=0 turns it off.
 PM_EN_ROUTE = os.environ.get("PM_EN_ROUTE", "1").lower() not in ("0", "false", "no", "off")
+# Normally a unit does not answer its own request for help: telling 1S-032 that
+# 1S-032 is on the way to it is nonsense, and on a real shift it is always
+# somebody else going. PM_ALLOW_SELF=1 lets it through anyway, which is the only
+# way to see the message on your own screen with nobody else in the server.
+PM_ALLOW_SELF = os.environ.get("PM_ALLOW_SELF", "0").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
 # How long dispatch waits after a transmission that stopped mid-thought before
 # deciding the unit is done, so a stumble is never answered as if it were the
@@ -2635,7 +2640,8 @@ async def tell_requester_en_route(responder):
     now = time.time()
     for key in [k for k, v in help_requests.items() if now - float(v.get("at") or 0) > HELP_RECENT]:
         help_requests.pop(key, None)
-    waiting = [(k, v) for k, v in help_requests.items() if k != norm_callsign(responder)]
+    waiting = [(k, v) for k, v in help_requests.items()
+               if PM_ALLOW_SELF or k != norm_callsign(responder)]
     if len(waiting) != 1:
         if waiting:
             print(f"{len(waiting)} units waiting on help, not guessing which one "
@@ -6691,6 +6697,10 @@ async def start_webhook_server():
               f"service has NO PUBLIC URL, so the game cannot reach it and nothing will "
               f"ever arrive. Generate a domain for this service, then paste it with "
               f"{WEBHOOK_PATH} on the end into the Event Webhook box.", flush=True)
+    if PM_ALLOW_SELF:
+        print("PM_ALLOW_SELF is ON: a unit can answer its own request for help. "
+              "This exists for testing with nobody else in the server. Turn it off "
+              "before anybody uses this for real.", flush=True)
 
 
 async def _supervise(name, factory):
