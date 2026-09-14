@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-7"
+BUILD = "ingame-8"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -138,7 +138,10 @@ PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
 PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 PURSUIT_CALLOUT_SECONDS = float(os.environ.get("PURSUIT_CALLOUT_SECONDS", "25"))
 CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
-LOG_HEARD = os.environ.get("LOG_HEARD", "1").lower() not in ("0", "false", "no", "off")
+# Off by default. This prints a transcript of everything said in the voice
+# channel, which is a private conversation ending up in a deploy log that gets
+# copied around. Set LOG_HEARD=1 to turn it on while chasing a problem.
+LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
@@ -5898,6 +5901,52 @@ def _dig(payload, *names):
     return None
 
 
+def _all_strings(node, depth=0):
+    """Every string anywhere in an event."""
+    if depth > 6:
+        return
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _all_strings(value, depth + 1)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _all_strings(value, depth + 1)
+
+
+def command_text(event):
+    """The ";" command in this event, whatever ER:LC decided to call the field.
+
+    The field names are not published, and guessing at them is how a working
+    delivery gets thrown away for the sake of a spelling. A command is found by
+    its shape instead: it is the string that starts with a semicolon."""
+    for value in _all_strings(event):
+        if value.strip().startswith(";") and len(value.strip()) > 1:
+            return value.strip()
+    return ""
+
+
+# ER:LC writes a player as "Name:UserId" nearly everywhere it names one.
+_PLAYER_ID = re.compile(r"^[A-Za-z0-9_]{3,20}:\d{3,}$")
+
+
+def player_name(event):
+    """Who sent it. The named fields first, then anything shaped like a player."""
+    named = _dig(event, "player", "playername", "caller", "author", "user",
+                 "sender", "from", "username")
+    if isinstance(named, str) and named.strip():
+        return named.strip()
+    if isinstance(named, dict):
+        inner = _dig(named, "name", "player", "username")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    for value in _all_strings(event):
+        if _PLAYER_ID.match(value.strip()):
+            return value.strip()
+    return ""
+
+
 def member_for_player(name):
     """The Discord member behind an in-game player name, when we know them.
 
@@ -5987,10 +6036,9 @@ async def handle_webhook_event(payload):
     print(f"webhook event: {kind!r}, fields "
           f"{sorted(data)[:16] if isinstance(data, dict) else type(data).__name__}",
           flush=True)
-    text = _dig(payload, "message", "content", "text", "command", "body")
-    if isinstance(text, str) and text.strip().startswith(";"):
-        player = _dig(payload, "player", "playername", "caller", "author", "user", "sender")
-        await handle_game_command(player, text)
+    text = command_text(payload)
+    if text:
+        await handle_game_command(player_name(payload), text)
         return
     # Emergency calls arrive here too. The poller already airs those, and
     # duplicating that would risk the most important thing the bot does, so for
