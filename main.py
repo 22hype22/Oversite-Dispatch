@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-3"
+BUILD = "ingame-4"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5962,12 +5962,28 @@ async def start_webhook_server():
     key = _verify_key()
     if key is None:
         return
+    async def health(request):
+        # Logged so a visit can be told apart from ER:LC validating the URL,
+        # and from the game actually delivering an event. When nothing happens
+        # in game, knowing which of the three occurred is the whole answer.
+        agent = (request.headers.get("User-Agent") or "none")[:60]
+        print(f"webhook health check from {request.remote} (user agent: {agent})", flush=True)
+        return aioweb.Response(text="dispatch ok")
+
     app = aioweb.Application()
     app["verify_key"] = key
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
     # ER:LC validates a URL before saving it, and a health check is useful.
-    app.router.add_get("/", lambda _r: aioweb.Response(text="dispatch ok"))
-    app.router.add_get(WEBHOOK_PATH, lambda _r: aioweb.Response(text="dispatch ok"))
+    app.router.add_get("/", health)
+    app.router.add_get(WEBHOOK_PATH, health)
+    # Anything else at all, so a wrong path in the settings box shows up as a
+    # wrong path rather than as silence.
+    async def stray(request):
+        print(f"webhook: {request.method} to {request.path} from {request.remote} "
+              f"— nothing is listening there, the path is {WEBHOOK_PATH}", flush=True)
+        return aioweb.Response(status=404, text=f"try {WEBHOOK_PATH}")
+
+    app.router.add_route("*", "/{tail:.*}", stray)
     runner = aioweb.AppRunner(app)
     await runner.setup()
     await aioweb.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
