@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "calls-1"
+BUILD = "calls-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2002,12 +2002,19 @@ def attach_to_call(number, callsign, status):
 
 
 def detach_from_call(callsign):
-    """A unit clearing comes off whatever call it was on."""
+    """A unit clearing comes off whatever call it was on.
+
+    Its line on the board is cleared of that call too. Leaving "en route to
+    call 12" up after the unit has cleared would keep reading as somebody
+    working it when nobody is."""
     if not callsign:
         return
     for number, units in list(call_units.items()):
         if units.pop(callsign, None) is not None:
             print(f"call {number}: {callsign} cleared", flush=True)
+            board = status_board.get(callsign) or {}
+            if f"call {number}" in str(board.get("status") or ""):
+                status_board[callsign] = {"status": "10-8, in service", "time": time.time()}
         if not units:
             call_units.pop(number, None)
 
@@ -4797,7 +4804,11 @@ _TOOK_A_JOB = ("en route", "on scene", "on a call", "pursuit", "traffic stop",
 
 
 def unit_responded_since(when):
-    """True when any unit went from standing by to working since that moment."""
+    """True when any unit went from standing by to working since that moment.
+
+    A blunt fallback for a unit whose callsign dispatch never caught, so it
+    could not be attached to the call by name. Whether anyone is actually ON
+    the call is answered by units_on_call, which is checked first."""
     for v in status_board.values():
         if float(v.get("time") or 0) < when:
             continue
@@ -4819,6 +4830,13 @@ async def recheck_priority_calls():
             priority_aired.pop(number, None)
             continue
         if now - rec["at"] < PRIORITY_RECALL:
+            continue
+        # Somebody said they were going. Never tell the channel a call has no
+        # unit attached when a unit is attached to it.
+        working = units_on_call(number)
+        if working:
+            priority_aired.pop(number, None)
+            print(f"call {number} taken by {', '.join(working)}, no re-air needed", flush=True)
             continue
         if unit_responded_since(rec["first"]):
             priority_aired.pop(number, None)
