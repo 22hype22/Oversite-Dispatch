@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "board-2"
+BUILD = "radio-3"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1957,9 +1957,29 @@ def read_status_board(callsign="", member=None):
     return ", ".join(bits) + "."
 
 
+_CUSTODY = re.compile(r"\bcustod\w*\b", re.I)
+
+
+def says_custody(text):
+    """'one in custody', however the transcript mangled it.
+
+    Custody comes back as customidy, custidy, custardy and worse, and a unit
+    saying it has just finished a pursuit, so failing to hear it is expensive."""
+    low = _flat(text)
+    if _CUSTODY.search(low):
+        return True
+    for tok in re.split(r"[^a-z]+", low):
+        # Seven characters and a close match: custody is seven, so this clears
+        # "custom", "customs" and "customer", which are ordinary words and must
+        # never end somebody's pursuit.
+        if len(tok) >= 7 and difflib.SequenceMatcher(None, tok, "custody").ratio() >= 0.75:
+            return True
+    return False
+
+
 def wants_call_cleared(text):
     low = _flat(text)
-    if "in custody" in low:
+    if says_custody(text):
         return True
     if "call" not in low:
         return False
@@ -2095,6 +2115,7 @@ wanted_persons = {}    # normalised name -> {"name", "reason", "callsign", "at"}
 citations = {}         # normalised name -> [{"kind", "reason", "callsign", "at"}]: tickets and warnings
 last_subject = {}      # Discord member id -> {"name", "plate", "at"}: who they just ran
 _subject_any = {}      # the last person anyone ran, so any unit can follow up on it
+_open_mic = {}         # member id -> until when a follow-up needs no wake word
 air_manual_until = 0.0  # a unit said the air unit is up; real-time pursuit callouts until then
 manual_tracks = {}     # normalised player name -> {"name", "callsign", "since", "street", "last_call"}
 _last_state_blob = None
@@ -3003,12 +3024,10 @@ async def stop_watch_loop():
                                 f"All units, the pursuit involving {stop['callsign']} "
                                 f"is terminated. Resume normal traffic.", title="Pursuit Over")
                             print(f"pursuit ended for {stop['callsign']}", flush=True)
-                    if uid in active_stops and now - stop.get("last_callout", 0) >= PURSUIT_CALLOUT_SECONDS:
-                        stop["last_callout"] = now
-                        where = f", {street}" if street else ""
-                        await announce(
-                            f"{stop['callsign']} still in active pursuit{where}. "
-                            f"Available units continue to assist, Code 3.", title="Pursuit")
+                    # No standing reminder. The pursuit was called when it
+                    # started and the suspect's road is put out turn by turn
+                    # while it runs, so repeating "still in pursuit" every
+                    # half minute only talks over the units working it.
                     continue
                 if speed >= 3:
                     print(f"stop {stop['callsign']}: {speed:.0f} units/sec (flee at {FLEE_SPEED})", flush=True)
@@ -3472,14 +3491,41 @@ def citation_phrase(name, subject=""):
     return "be advised, " + ", ".join(out)
 
 
-def wanted_phrase(name):
-    """'wanted for armed robbery, per Unit 1S-032' — the line that leads a return."""
-    rec = wanted_entry(name)
-    if not rec:
+def ingame_stars(player):
+    """The wanted level the game itself is showing for a player, 0 when clear.
+
+    This is the answer to "is this person wanted", and it is the one that was
+    missing: a unit could be lit up in game and dispatch would still read back
+    clear, because it only knew about warrants units had called in over the
+    radio."""
+    if not isinstance(player, dict):
+        return 0
+    try:
+        return max(0, int(player.get("WantedStars") or 0))
+    except Exception:
+        return 0
+
+
+def stars_phrase(stars):
+    if stars <= 0:
         return ""
-    reason = rec.get("reason") or "an outstanding warrant"
-    who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
-    return f"wanted for {reason}{who}"
+    return f"wanted in game at {stars} star{'s' if stars != 1 else ''}"
+
+
+def wanted_phrase(name, ingame=None):
+    """'wanted for armed robbery, per Unit 1S-032' — the line that leads a
+    return. The game's own wanted level comes first when there is one, with any
+    warrant a unit called in after it."""
+    bits = []
+    stars = ingame_stars(ingame)
+    if stars:
+        bits.append(stars_phrase(stars))
+    rec = wanted_entry(name)
+    if rec:
+        reason = rec.get("reason") or "an outstanding warrant"
+        who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
+        bits.append(f"wanted for {reason}{who}")
+    return ", and ".join(bits)
 
 
 def remember_vehicles(vehicles):
@@ -3520,6 +3566,30 @@ def bolo_matches(needle):
 
 
 SUBJECT_WINDOW = float(os.environ.get("SUBJECT_WINDOW", "420"))  # 7 minutes
+# Dispatch has just read somebody back to this unit. For a short while after
+# that, a question about them is obviously still aimed at dispatch, so it does
+# not have to be prefixed with the wake word all over again.
+OPEN_MIC = float(os.environ.get("OPEN_MIC_SECONDS", "60"))
+
+
+def looks_like_followup(text):
+    """A question about the person dispatch just ran, rather than radio chatter."""
+    low = _flat(text)
+    return bool(_Q_WANTS.search(low) or _Q_CITE.search(low)
+                or _Q_VEHICLE.search(low) or _Q_WHERE.search(low))
+
+
+def open_mic_for(member):
+    uid = getattr(member, "id", None)
+    if uid is not None:
+        _open_mic[uid] = time.time() + OPEN_MIC
+
+
+def mic_is_open(uid):
+    if _open_mic.get(uid, 0) > time.time():
+        return True
+    _open_mic.pop(uid, None)
+    return False
 
 # Words that carry a question rather than name somebody, so what is left over
 # tells us whether a unit named a new subject or is still on the last one.
@@ -3535,7 +3605,9 @@ anybody anyone pulled stopped stop my mine guy girl
 ticket tickets citation citations warning warnings cited ticketed issued issue""".split())
 _Q_WANTS = re.compile(r"\b(wants?|warrants?|wanted|10-?29|ten twenty ?nine|priors|criminal history|record)\b", re.I)
 _Q_VEHICLE = re.compile(r"\b(driving|drive|drives|vehicle|car|plate|tag|10-?28|ten twenty ?eight)\b", re.I)
-_Q_WHERE = re.compile(r"\b(where|location|last seen|what.{0,8}20\b|his 20|her 20|their 20)\b", re.I)
+# Spoken, a twenty is said not written, so both spellings have to match.
+_Q_WHERE = re.compile(r"\b(where|location|last seen|what.{0,8}(?:20|twenty)\b|"
+                      r"(?:his|her|their) (?:20|twenty))\b", re.I)
 # "I have a plate for you" / "run a name" — a fresh check, not a follow-up.
 _OFFER_LOOKUP = re.compile(r"\b(?:i(?:'ve)? (?:have|got)|have a|got a|run a|running a|need a|do a|get a)\b"
                            r"[^.]{0,16}\b(plate|tag|name|username|record)\b", re.I)
@@ -3561,6 +3633,7 @@ def remember_subject(member, name, plate=""):
     rec = {"name": name, "plate": plate or "", "at": time.time()}
     if member is not None:
         last_subject[member.id] = rec
+        open_mic_for(member)
     _subject_any.clear()
     _subject_any.update(rec)
 
@@ -3592,7 +3665,7 @@ def person_lines(real, ingame, vehicles, lead="", known_plate=""):
     (the one the plate was run on) is not described twice."""
     out = []
     subject = lead or real
-    want = wanted_phrase(real)
+    want = wanted_phrase(real, ingame)
     if want:
         out.append(f"be advised, {subject} is {want}")
     if ingame is not None:
@@ -3675,10 +3748,16 @@ async def answer_followup(member, text, callsign):
             await announce(line, title="Citations")
             print(f"follow-up by {callsign or getattr(member, 'display_name', '?')} on {real}: citations", flush=True)
             return True
-        if rec:
-            reason = rec.get("reason") or "an outstanding warrant"
-            who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
-            line = f"{ack}{real} is wanted for {reason}{who}, use caution."
+        stars = ingame_stars(ingame)
+        if stars or rec:
+            said = []
+            if stars:
+                said.append(stars_phrase(stars))
+            if rec:
+                reason = rec.get("reason") or "an outstanding warrant"
+                who = f", per Unit {rec['callsign']}" if rec.get("callsign") else ""
+                said.append(f"wanted for {reason}{who}")
+            line = f"{ack}{real} is {', and '.join(said)}, use caution."
         else:
             line = f"{ack}{real} shows clear, no current wants or warrants."
         flags = bolo_matches(real)
@@ -4158,8 +4237,18 @@ async def handle_utterance(member, pcm):
             text = merge_fragments(held["text"], text)
         elif not is_for_dispatch(text):
             text = held["text"] if is_for_dispatch(held["text"]) else text
+    # A follow-up straight after dispatch answered this unit does not need the
+    # wake word again: "any wants or warrants on that user" is plainly still
+    # talking to dispatch. Kept narrow on purpose — a short window, and only a
+    # question about the subject, so ordinary radio traffic is still ignored.
+    followup = False
     if not is_for_dispatch(text):
-        return
+        if mic_is_open(uid) and looks_like_followup(text):
+            followup = True
+            if LOG_HEARD:
+                print(f"open mic: taking {who}'s follow-up without the wake word", flush=True)
+        else:
+            return
 
     if looks_unfinished(text):
         # The unit stopped mid-thought. Say nothing; wait for them to start over
@@ -4174,14 +4263,14 @@ async def handle_utterance(member, pcm):
                     break
             h = _held.pop(uid, None)
             if h and has_intent(h["text"]):
-                await process_transmission(member, h["text"])
+                await process_transmission(member, h["text"], followup_only=followup)
             elif h:
                 print(f"dropped an unfinished transmission from {who}: {h['text']!r}", flush=True)
         _held[uid] = {"text": text, "at": now, "task": asyncio.ensure_future(_later())}
         print(f"holding for {who}: {text!r}", flush=True)
         return
 
-    await process_transmission(member, text)
+    await process_transmission(member, text, followup_only=followup)
 
 
 # "I'll take over as dispatch", "I'm running dispatch", "let me take dispatch".
@@ -4256,7 +4345,7 @@ async def release_dispatch(reason="handed back"):
     print(f"human dispatch: {who} released the seat ({reason})", flush=True)
 
 
-async def process_transmission(member, text):
+async def process_transmission(member, text, followup_only=False):
     spoken = extract_callsign(text)
     callsign = resolve_callsign(spoken, member)
     await learn_voice_callsign(member, spoken, callsign)
@@ -4272,6 +4361,14 @@ async def process_transmission(member, text):
         return
 
     if await handle_special(member, text, callsign):
+        return
+    if followup_only:
+        # This came in without the wake word only because it read as a
+        # follow-up. Nothing took it, so it was unit-to-unit traffic after all
+        # and dispatch stays off the air rather than answering a question it
+        # was never asked.
+        if LOG_HEARD:
+            print(f"open mic: nothing to answer in {text[:60]!r}, staying quiet", flush=True)
         return
     if wants_repeat(text):
         if last_call is not None:
@@ -4307,6 +4404,21 @@ async def process_transmission(member, text):
     if wants_call_cleared(text):
         ack = addr(callsign, member)
         low = _flat(text)
+        # "One in custody" during a stop or a pursuit is about THAT, not a 911
+        # call. Close what the unit is actually on; only fall through to the
+        # call list when they are not on anything.
+        if says_custody(text) and member.id in active_stops:
+            stop = active_stops.get(member.id) or {}
+            was_pursuit = bool(stop.get("pursuit"))
+            await clear_traffic_stop(member, callsign)
+            if callsign:
+                status_board[callsign] = {"status": "10-8, in service", "time": time.time()}
+            if was_pursuit:
+                await announce(
+                    f"All units, the pursuit involving {stop.get('callsign') or callsign} "
+                    f"is terminated, one in custody. Resume normal traffic.",
+                    title="Pursuit Over")
+            return True
         if "all call" in low or "all calls" in low or "clear all" in low:
             had = list(open_calls.keys())
             for n in had:
