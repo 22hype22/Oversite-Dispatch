@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "assist-1"
+BUILD = "assist-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2099,7 +2099,11 @@ async def request_supervisor(member, callsign, what=""):
     """Air it, and ping the role. The same whether it was said on the radio or
     typed in game."""
     cs = callsign or member_callsign(member)
-    who = f"Unit {cs}" if cs else (clean_name(getattr(member, "display_name", "")) or "A unit")
+    # "Unit 1S-32" reads right. "Unit 22HYPE22" does not, so the word only goes
+    # in front of something shaped like a callsign.
+    looks_like_callsign = bool(cs) and len(cs) <= 8 and any(ch.isdigit() for ch in cs)
+    who = (f"Unit {cs}" if looks_like_callsign
+           else (cs or clean_name(getattr(member, "display_name", "")) or "A unit"))
     thing = what or "a supervisor"
     where, pos = await unit_place(member, cs)
     closest = await nearest_other_unit(pos, cs)
@@ -6088,27 +6092,34 @@ def member_for_player(name):
     return None
 
 
-async def name_for_roblox_id(who):
-    """Turn the Roblox user id ER:LC sends into the name it belongs to.
+async def player_identity(who):
+    """The in-game name and the callsign the unit is actually running.
 
-    A CustomCommand names its sender by id, and an id matches nothing: not a
-    Discord nickname, not a callsign. Every player the game reports is written
-    "Name:UserId", so the id is looked up there and the name used from then on."""
+    ER:LC names the sender of a command by Roblox user id, and the callsign is
+    on their player record, which is the only place it exists: Discord cannot
+    see it and a username is not it. Dispatch should call a unit by its
+    callsign, so it is read from there rather than falling back to a name."""
     raw = str(who or "").strip()
-    if not raw.isdigit():
-        return raw
+    name = raw.split(":")[0].strip()
     try:
         data = await erlc_get("/server?Players=true")
     except Exception:
-        return raw
+        return name, ""
     players = data.get("Players") if isinstance(data, dict) else None
     if not isinstance(players, list):
-        return raw
+        return name, ""
+    want_id = raw if raw.isdigit() else (raw.rsplit(":", 1)[1].strip() if ":" in raw else "")
+    want_name = norm_callsign(name)
     for p in players:
         entry = str(p.get("Player") or "")
-        if ":" in entry and entry.rsplit(":", 1)[1].strip() == raw:
-            return entry.split(":")[0].strip() or raw
-    return raw
+        pid = entry.rsplit(":", 1)[1].strip() if ":" in entry else ""
+        pname = entry.split(":")[0].strip()
+        if (want_id and pid == want_id) or (want_name and norm_callsign(pname) == want_name):
+            cs = str(p.get("Callsign") or "").strip()
+            if cs:
+                remember_callsign(cs)
+            return (pname or name), cs
+    return name, ""
 
 
 async def handle_game_command(player, text):
@@ -6120,25 +6131,31 @@ async def handle_game_command(player, text):
     body = str(text or "").lstrip(";").strip()   # already stripped, harmless twice
     if not body:
         return
-    player = await name_for_roblox_id(player)
+    player, game_cs = await player_identity(player)
     member = member_for_player(player)
     who = str(player or "").split(":")[0].strip() or "a unit"
-    print(f"in-game command from {who}: {body!r}"
+    callsign = game_cs or (member_callsign(member) if member is not None else "")
+    print(f"in-game command from {who}"
+          f"{' (' + callsign + ')' if callsign else ''}: {body!r}"
           f"{'' if member else ' (no linked Discord member)'}", flush=True)
+    # Handled here with the callsign the game reports, so the unit is named by
+    # the callsign it is running rather than by its username. Going through the
+    # normal path would re-derive it from Discord, which does not know it.
+    if wants_supervisor(body):
+        await request_supervisor(member, callsign or who, requested_resource(body))
+        return
     if member is not None:
         # Prefixed with the wake word so it reads as radio traffic aimed at
-        # dispatch, which is exactly what typing it in game means.
-        await process_transmission(member, f"dispatch {body}")
+        # dispatch, which is exactly what typing it in game means. The callsign
+        # rides along so the rest of dispatch names them the same way.
+        lead = f"{callsign} " if callsign else ""
+        await process_transmission(member, f"dispatch {lead}{body}")
         return
     # Nobody linked. The request is still a real request, so it is handled the
     # same way rather than echoed back. Repeating it verbatim is not dispatch
     # doing anything, and it is what a unit heard when the sender could not be
     # matched to a Discord member.
-    callsign = resolve_callsign(who) or who
-    if wants_supervisor(body):
-        await request_supervisor(None, callsign, requested_resource(body))
-        return
-    await announce(f"{callsign}, {body}. Dispatch copies.", title="In-Game Request")
+    await announce(f"{callsign or who}, {body}. Dispatch copies.", title="In-Game Request")
 
 
 def iter_events(payload):
