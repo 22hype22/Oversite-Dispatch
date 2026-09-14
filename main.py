@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-1"
+BUILD = "ingame-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1930,6 +1930,90 @@ def wants_clear_stop(text):
                 "wrapping up", "wrap up", "resuming patrol", "back in service",
                 "in service", "available", "10-8", "ten eight")
     return any(t in low for t in triggers)
+
+
+# Asking for a supervisor is its own thing, not a flavour of backup. Left to
+# the model it came out differently every time, and a reply that happened to
+# start "stand by" was being mistaken for a lookup, so the unit got asked
+# whether that was a plate or a name.
+_SUPERVISOR = re.compile(
+    r"\b(?:request(?:ing)?|need(?:ing)?|send|get me|want|call|start)\b[^.]{0,24}?"
+    r"\b(?:supervisor|sergeant|sarge|lieutenant|watch commander|shift lead|"
+    r"white ?shirt|supe)\b"
+    r"|\b(?:supervisor|sergeant|sarge|lieutenant)\b[^.]{0,24}?"
+    r"\b(?:to my|my location|my twenty|needed|required|requested|en route to me|"
+    r"out here|on scene|please)\b")
+
+
+def wants_supervisor(text):
+    """'request supervisor', 'I need a sergeant out here', ';request supervisor'."""
+    return bool(_SUPERVISOR.search(_flat(text)))
+
+
+SUPERVISOR_ROLE_IDS = [r.strip() for r in
+                       os.environ.get("SUPERVISOR_ROLE_IDS", "").split(",") if r.strip()]
+
+
+async def unit_location_phrase(member, callsign=""):
+    """' at postal 43, Main Street' for the unit asking, when the game knows.
+
+    A supervisor who is told where to go is worth more than one who is only
+    told somebody wants them."""
+    try:
+        positions = await player_positions()
+    except Exception:
+        return ""
+    if not positions:
+        return ""
+    key = None
+    spoken = norm_callsign(callsign)
+    if spoken and spoken in positions:
+        key = spoken
+    if key is None and member is not None:
+        key = next((c for c in name_match_keys(member) if c in positions), None)
+    if key is None:
+        return ""
+    entry = positions[key]
+    street = entry[1] if len(entry) > 1 else ""
+    postal = entry[3] if len(entry) > 3 else ""
+    if postal and street:
+        return f" at postal {postal}, {street}"
+    if postal:
+        return f" at postal {postal}"
+    if street:
+        return f" on {street}"
+    return ""
+
+
+async def ping_supervisors(who, where):
+    """Put it in the text channel with a role ping, so a supervisor who is not
+    listening to the radio still sees it. Silent when no role is configured."""
+    if not (SUPERVISOR_ROLE_IDS and TEXT_CHANNEL_ID):
+        return
+    channel = client.get_channel(TEXT_CHANNEL_ID)
+    if channel is None:
+        return
+    mentions = " ".join(f"<@&{r}>" for r in SUPERVISOR_ROLE_IDS)
+    try:
+        await channel.send(
+            f"{mentions} {who} is requesting a supervisor{where}.",
+            allowed_mentions=discord.AllowedMentions(roles=True))
+    except Exception as exc:
+        print(f"supervisor ping failed: {exc}", flush=True)
+
+
+async def request_supervisor(member, callsign):
+    """Air it, and ping the role. The same whether it was said on the radio or
+    typed in game."""
+    who = (callsign or member_callsign(member)
+           or clean_name(getattr(member, "display_name", "")) or "a unit")
+    where = await unit_location_phrase(member, callsign)
+    await announce(
+        f"All units, {who} is requesting a supervisor{where}. "
+        f"Any supervisor available, respond.",
+        title="Supervisor Requested", urgent=True)
+    await ping_supervisors(who, where)
+    print(f"supervisor requested by {who}{where}", flush=True)
 
 
 def wants_backup(text):
@@ -4738,6 +4822,11 @@ async def process_transmission(member, text, followup_only=False):
         if LOG_HEARD:
             print(f"open mic: nothing to answer in {text[:60]!r}, staying quiet", flush=True)
         return
+    # Before anything that could hand this to the model, so the wording is the
+    # same every time and a supervisor is actually told.
+    if wants_supervisor(text):
+        await request_supervisor(member, callsign)
+        return
     if wants_repeat(text):
         if last_call is not None:
             ack = addr(callsign, member) or "Copy. "
@@ -4876,16 +4965,22 @@ async def process_transmission(member, text, followup_only=False):
                 kind = "plate"
             elif re.search(r"\b(name|username|person|subject|records?|warrants?|wants|10-?29)\b", low):
                 kind = "name"
+            elif lookup_request_kind(text):
+                kind = "ask"  # a lookup, but they never said which — ask
             else:
-                kind = "ask"  # they never said which — ask, do not guess
-            _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
-            ack = addr(callsign, member)
-            if kind == "ask":
-                await announce(f"{ack}is that a plate or a name?", title="Check")
-            else:
-                await announce(f"{ack}go ahead with that {kind}.",
-                               title="Plate Check" if kind == "plate" else "Name Check")
-            return
+                # The reply merely began "stand by" and the unit never asked for
+                # anything to be looked up. Asking them whether that was a plate
+                # or a name answers a question nobody put.
+                kind = ""
+            if kind:
+                _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
+                ack = addr(callsign, member)
+                if kind == "ask":
+                    await announce(f"{ack}is that a plate or a name?", title="Check")
+                else:
+                    await announce(f"{ack}go ahead with that {kind}.",
+                                   title="Plate Check" if kind == "plate" else "Name Check")
+                return
         if callsign:
             await announce(addr(callsign, member) + strip_callsign_echo(body), title="Dispatch")
         else:
