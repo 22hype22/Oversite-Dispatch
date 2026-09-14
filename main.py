@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-8"
+BUILD = "ingame-9"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5916,14 +5916,23 @@ def _all_strings(node, depth=0):
 
 
 def command_text(event):
-    """The ";" command in this event, whatever ER:LC decided to call the field.
+    """What the unit typed, minus the semicolon.
 
-    The field names are not published, and guessing at them is how a working
-    delivery gets thrown away for the sake of a spelling. A command is found by
-    its shape instead: it is the string that starts with a semicolon."""
+    ER:LC sends these as a CustomCommand event and does the parsing itself: the
+    semicolon is stripped and the rest is split in two, so ";request supervisor"
+    arrives as command="request", argument="supervisor". Putting the two back
+    together is what dispatch reads.
+
+    Anything that does still carry a semicolon is taken as it is, so a change of
+    heart at their end does not silently break this."""
+    name = _dig(event, "command")
+    if isinstance(name, str) and name.strip():
+        arg = _dig(event, "argument", "arguments", "args", "parameters")
+        arg = arg.strip() if isinstance(arg, str) else ""
+        return f"{name.strip().lstrip(';').strip()} {arg}".strip()
     for value in _all_strings(event):
         if value.strip().startswith(";") and len(value.strip()) > 1:
-            return value.strip()
+            return value.strip().lstrip(";").strip()
     return ""
 
 
@@ -5933,14 +5942,21 @@ _PLAYER_ID = re.compile(r"^[A-Za-z0-9_]{3,20}:\d{3,}$")
 
 def player_name(event):
     """Who sent it. The named fields first, then anything shaped like a player."""
-    named = _dig(event, "player", "playername", "caller", "author", "user",
-                 "sender", "from", "username")
-    if isinstance(named, str) and named.strip():
-        return named.strip()
-    if isinstance(named, dict):
-        inner = _dig(named, "name", "player", "username")
-        if isinstance(inner, str) and inner.strip():
-            return inner.strip()
+    # A name field wherever it sits, BEFORE falling back to origin. _dig tries
+    # each name across the whole event before moving to the next, so including
+    # origin here would let a top-level origin of "game" beat the player named
+    # one level down in data.
+    for names in (("player", "playername", "caller", "author", "user",
+                   "sender", "from", "username", "executor", "sentby"),
+                  ("origin",)):
+        named = _dig(event, *names)
+        if isinstance(named, str) and named.strip() and named.strip().lower() not in (
+                "game", "server", "system", "unknown"):
+            return named.strip()
+        if isinstance(named, dict):
+            inner = _dig(named, "name", "player", "username")
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
     for value in _all_strings(event):
         if _PLAYER_ID.match(value.strip()):
             return value.strip()
@@ -5975,7 +5991,7 @@ async def handle_game_command(player, text):
     The text is handed to the same dispatch handling the radio uses, so every
     command that works on the air works here too, with no second set of phrases
     to keep in step."""
-    body = str(text or "").lstrip(";").strip()
+    body = str(text or "").lstrip(";").strip()   # already stripped, harmless twice
     if not body:
         return
     member = member_for_player(player)
@@ -6034,8 +6050,8 @@ async def handle_webhook_event(payload):
     kind = payload.get("event") or payload.get("type") or "?"
     data = payload.get("data")
     print(f"webhook event: {kind!r}, fields "
-          f"{sorted(data)[:16] if isinstance(data, dict) else type(data).__name__}",
-          flush=True)
+          f"{sorted(data)[:16] if isinstance(data, dict) else type(data).__name__}"
+          f", origin {str(payload.get('origin'))[:40]!r}", flush=True)
     text = command_text(payload)
     if text:
         await handle_game_command(player_name(payload), text)
