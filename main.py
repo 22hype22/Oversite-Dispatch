@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "notice-2"
+BUILD = "sup-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -109,7 +109,10 @@ AIR_WAIT = float(os.environ.get("AIR_WAIT_SECONDS", "6"))
 # The beat of dead air between one transmission and the next.
 TRANSMIT_GAP = float(os.environ.get("TRANSMIT_GAP_SECONDS", "0.45"))
 # The courtesy beep at the end of a transmission.
-ROGER_BEEP = os.environ.get("ROGER_BEEP", "1").lower() not in ("0", "false", "no", "off")
+# The courtesy beep at the end of a transmission. Off by default: it is a nice
+# touch on the first dozen and wearing by the hundredth, and dispatch already
+# sounds like dispatch without it. ROGER_BEEP=1 puts it back.
+ROGER_BEEP = os.environ.get("ROGER_BEEP", "0").lower() not in ("0", "false", "no", "off")
 VOICE_COMMANDS = os.environ.get("VOICE_COMMANDS", "1").lower() not in ("0", "false", "no", "off")
 STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
 STT_LANG = os.environ.get("ELEVENLABS_STT_LANGUAGE", "eng").strip()
@@ -1987,6 +1990,23 @@ _ASK_TAIL = re.compile(
     r"\s*\b(?:to|at|out|over|on|for|in|right)?\s*\b(?:my|the|this)?\s*"
     r"\b(?:location|twenty|20|position|scene|here|there|now|please|asap|"
     r"immediately|code \d|step it up|when you can|if available)\b.*$", re.I)
+
+
+# Typed in game, anything that mentions a supervisor is asking for one. There
+# is no reason to type ";sergeant" in the middle of a pursuit except to get one,
+# and making a unit phrase it correctly while somebody is fighting them is the
+# opposite of useful. Held to the in-game path on purpose: on the radio "the
+# supervisor already cleared" is a statement, not a request.
+_SUPERVISOR_WORDS = ("supervisor", "supervisors", "sergeant", "sergeants", "sarge",
+                     "lieutenant", "watch commander", "shift lead", "shift lieutenant",
+                     "white shirt", "whiteshirt", "supe", "sup", "brass", "sgt", "lt")
+_SUPERVISOR_ANY = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _SUPERVISOR_WORDS) + r")\b")
+
+
+def mentions_supervisor(text):
+    """Whether this says anything at all about a supervisor."""
+    return bool(_SUPERVISOR_ANY.search(_flat(text)))
 
 
 def requested_resource(text):
@@ -6206,22 +6226,35 @@ def member_for_player(name):
     return None
 
 
+def is_law_enforcement(team):
+    """Whether this in-game team is one dispatch works for.
+
+    A civilian typing ";request supervisor" is not a unit asking for help, and
+    airing it would let anybody in the server put traffic on the police radio.
+    The teams that count are the same ones calls are dispatched to, so a
+    department that runs its own list only sets it once."""
+    low = str(team or "").strip().lower()
+    if not low:
+        return False
+    return any(t in low for t in CALL_TEAMS)
+
+
 async def player_identity(who):
-    """The in-game name and the callsign the unit is actually running.
+    """The in-game name, the callsign being run, and the team, or ("", "", "").
 
     ER:LC names the sender of a command by Roblox user id, and the callsign is
     on their player record, which is the only place it exists: Discord cannot
-    see it and a username is not it. Dispatch should call a unit by its
-    callsign, so it is read from there rather than falling back to a name."""
+    see it and a username is not it. The team is there too, and it is what says
+    whether this is a unit at all."""
     raw = str(who or "").strip()
     name = raw.split(":")[0].strip()
     try:
         data = await erlc_get("/server?Players=true")
     except Exception:
-        return name, ""
+        return name, "", ""
     players = data.get("Players") if isinstance(data, dict) else None
     if not isinstance(players, list):
-        return name, ""
+        return name, "", ""
     want_id = raw if raw.isdigit() else (raw.rsplit(":", 1)[1].strip() if ":" in raw else "")
     want_name = norm_callsign(name)
     for p in players:
@@ -6232,8 +6265,8 @@ async def player_identity(who):
             cs = str(p.get("Callsign") or "").strip()
             if cs:
                 remember_callsign(cs)
-            return (pname or name), cs
-    return name, ""
+            return (pname or name), cs, str(p.get("Team") or "").strip()
+    return name, "", ""
 
 
 async def handle_game_command(player, text):
@@ -6245,16 +6278,32 @@ async def handle_game_command(player, text):
     body = str(text or "").lstrip(";").strip()   # already stripped, harmless twice
     if not body:
         return
-    player, game_cs = await player_identity(player)
+    player, game_cs, team = await player_identity(player)
     member = member_for_player(player)
     who = str(player or "").split(":")[0].strip() or "a unit"
     callsign = game_cs or (member_callsign(member) if member is not None else "")
     print(f"in-game command from {who}"
-          f"{' (' + callsign + ')' if callsign else ''}: {body!r}"
+          f"{' (' + callsign + ')' if callsign else ''}"
+          f"{' [' + team + ']' if team else ''}: {body!r}"
           f"{'' if member else ' (no linked Discord member)'}", flush=True)
+    # This is the police radio. Somebody who is not on it does not get to put
+    # traffic on it, however they phrase it.
+    if not is_law_enforcement(team):
+        print(f"ignored: {who} is not on a law enforcement team"
+              f"{' (' + team + ')' if team else ' (team unknown)'}", flush=True)
+        return
     # Handled here with the callsign the game reports, so the unit is named by
     # the callsign it is running rather than by its username. Going through the
     # normal path would re-derive it from Discord, which does not know it.
+    #
+    # Anything that so much as mentions a supervisor counts, because that is
+    # what it means when a unit types it.
+    if mentions_supervisor(body):
+        # However they said it, it goes out as a supervisor. A sarge, a white
+        # shirt and the brass are the same request, and the channel should hear
+        # the same words every time rather than whatever that unit types.
+        await request_supervisor(member, callsign or who, "supervisor")
+        return
     if wants_supervisor(body):
         await request_supervisor(member, callsign or who, requested_resource(body))
         return
