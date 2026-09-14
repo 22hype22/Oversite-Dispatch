@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import wave
 import time
 import random
@@ -28,7 +29,7 @@ import aiohttp
 import discord
 import imageio_ffmpeg
 
-from state_codes import STATE_CODES, state_code_block
+from state_codes import STATE_CODES, state_code_block, ten_code_text
 
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
@@ -66,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "handover-1"
+BUILD = "board-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -904,6 +905,31 @@ async def refresh_runtime_config():
             print(f"could not parse voice channel id: {vc!r}", flush=True)
 
 
+def _worker_headers():
+    return {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "x-worker-token": WORKER_TOKEN, "Content-Type": "application/json"}
+
+
+async def config_get(feature):
+    """One of this bot's own dashboard config rows. The worker token is what
+    lets the row through; a bot can only ever see its own."""
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        return {}
+    url = (f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}"
+           f"&feature=eq.{feature}&select=config")
+    try:
+        async with http.get(url, headers=_worker_headers()) as resp:
+            if resp.status != 200:
+                print(f"config read {feature} -> {resp.status}", flush=True)
+                return {}
+            rows = await resp.json()
+            if rows:
+                return rows[0].get("config") or {}
+    except Exception as exc:
+        print(f"config read {feature} failed: {exc}", flush=True)
+    return {}
+
+
 async def erlc_get(path):
     if not ERLC_KEY:
         return None
@@ -1340,6 +1366,9 @@ async def region_command(interaction, area: str):
     await safe_respond(interaction,
         f"Dispatch is now running as **{DISPATCH_REGION}**. New calls and radio "
         f"replies will use that area's real codes and style.")
+    # The posted code board is now out of date, so redraw it straight away
+    # instead of leaving the wrong codes up until the next config refresh.
+    await sync_code_board()
 
 
 @command_tree.command(
@@ -2179,6 +2208,7 @@ def _state_snapshot():
         "manual_tracks": dict(manual_tracks),
         "air_manual_until": air_manual_until,
         "human_dispatch": dict(human_dispatch),
+        "code_board": dict(code_board),
         "command_fp": command_fp,
         "saved_at": time.time(),
     }
@@ -2262,6 +2292,10 @@ async def load_state():
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
         globals()["command_fp"] = str(st.get("command_fp") or "")
+        cb = st.get("code_board")
+        if isinstance(cb, dict) and cb.get("message_id"):
+            code_board.clear()
+            code_board.update(cb)
         hd = st.get("human_dispatch")
         if isinstance(hd, dict) and hd.get("uid"):
             human_dispatch.clear()
@@ -4615,11 +4649,181 @@ async def recheck_priority_calls():
         print(f"re-aired priority call {number} (try {rec['tries']})", flush=True)
 
 
+# ── The radio-code board ──────────────────────────────────────────────────
+# A dashboard block designs a message and picks a channel; the bot posts it with
+# {10 code} filled in from the region, then EDITS that same message whenever the
+# region changes, so the board on the wall is never out of date.
+
+CODE_BLOCK_FEATURE = "dispatch-codes"
+code_board = {}   # {"channel_id", "message_id", "fingerprint"}
+
+# The token, spelled every way somebody might reasonably type it.
+_CODE_TOKEN = re.compile(
+    r"\{\s*(?:10[\s_-]*codes?|ten[\s_-]*codes?|radio[\s_-]*codes?|codes)\s*\}", re.I)
+_REGION_TOKEN = re.compile(r"\{\s*region\s*\}", re.I)
+_AGENCY_TOKEN = re.compile(r"\{\s*agency\s*\}", re.I)
+
+
+def board_text(text):
+    """Fill the board's tokens. {10 code} becomes the whole sheet for whatever
+    region the dashboard is set to."""
+    if not isinstance(text, str) or "{" not in text:
+        return text
+    entry = STATE_CODES.get(DISPATCH_REGION) or {}
+    out = _CODE_TOKEN.sub(lambda _m: ten_code_text(DISPATCH_REGION, heading=False), text)
+    out = _REGION_TOKEN.sub(DISPATCH_REGION, out)
+    out = _AGENCY_TOKEN.sub(entry.get("agency") or "your agency", out)
+    guild = dispatch_guild()
+    if guild is not None:
+        out = out.replace("{server}", guild.name).replace("{server_name}", guild.name)
+    return out
+
+
+def _board_button(b):
+    """Only link buttons belong on a reference board — nothing to click through
+    to a handler, so anything interactive is dropped rather than posted dead."""
+    url = b.get("url") or ""
+    label = board_text(b.get("label") or "")
+    if not (label and str(url).startswith("http")):
+        return None
+    return {"type": 2, "style": 5, "label": label[:80], "url": url}
+
+
+def build_board_component(comp):
+    """One dashboard design item to a raw Components V2 object. Display types
+    only: a code board has nothing to interact with."""
+    ctype = comp.get("type", "")
+    if ctype in ("text", "text_display"):
+        text = comp.get("text") or comp.get("content", "")
+        title = comp.get("title", "")
+        if title:
+            text = f"**{title}**\n{text}" if text else f"**{title}**"
+        text = board_text(text)
+        return {"type": 10, "content": text[:3900]} if text else None
+    if ctype == "container":
+        accent = comp.get("accentColor") or comp.get("accent_color", "")
+        try:
+            accent_int = int(str(accent).lstrip("#"), 16) if accent else None
+        except Exception:
+            accent_int = None
+        children = [c for c in (build_board_component(x) for x in comp.get("children", [])) if c]
+        if not children:
+            return None
+        obj = {"type": 17, "components": children}
+        if accent_int is not None:
+            obj["accent_color"] = accent_int
+        return obj
+    if ctype == "separator":
+        large = comp.get("spacing", "small") == "large"
+        return {"type": 14, "divider": bool(comp.get("divider", True)), "spacing": 2 if large else 1}
+    if ctype in ("gallery", "media_gallery", "media"):
+        urls = comp.get("images") or comp.get("image_urls", [])
+        items = [{"media": {"url": u}} for u in urls if u and str(u).startswith("http")]
+        return {"type": 12, "items": items} if items else None
+    if ctype == "section":
+        text = comp.get("text") or comp.get("content", "")
+        title = comp.get("title", "")
+        if title:
+            text = f"**{title}**\n{text}" if text else f"**{title}**"
+        if not text:
+            return None
+        text = board_text(text)[:3900]
+        thumb = comp.get("thumbnailUrl") or comp.get("thumbnail_url")
+        accessory = None
+        if thumb and str(thumb).startswith("http"):
+            accessory = {"type": 11, "media": {"url": thumb}}
+        else:
+            btn = comp.get("button")
+            if isinstance(btn, dict):
+                accessory = _board_button(btn)
+        # A section without an accessory is rejected outright, so it falls back
+        # to plain text rather than taking the whole message down with it.
+        if accessory is None:
+            return {"type": 10, "content": text}
+        return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": accessory}
+    if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
+        buttons = [b for b in (_board_button(x) for x in comp.get("buttons", [])) if b]
+        return {"type": 1, "components": buttons} if buttons else None
+    return None
+
+
+def build_board_payload(components):
+    built = [c for c in (build_board_component(c) for c in components) if c]
+    if not built:
+        return None
+    allowed_top = {1, 9, 10, 12, 14, 17}
+    if not {c.get("type") for c in built}.issubset(allowed_top):
+        built = [{"type": 17, "components": built}]
+    return {"components": built, "flags": 1 << 15}
+
+
+async def _board_send(channel_id, payload):
+    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=int(channel_id))
+    try:
+        resp = await client.http.request(route, json=payload)
+        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
+    except Exception as exc:
+        print(f"code board post failed: {exc}", flush=True)
+        return None
+
+
+async def _board_edit(channel_id, message_id, payload):
+    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
+                               channel_id=int(channel_id), message_id=int(message_id))
+    try:
+        await client.http.request(route, json=payload)
+        return True
+    except Exception as exc:
+        print(f"code board edit failed: {exc}", flush=True)
+        return False
+
+
+async def sync_code_board():
+    """Post the board, or edit the one already up when the design or the region
+    has moved. Does nothing at all when neither has."""
+    cfg = await config_get(CODE_BLOCK_FEATURE)
+    messages = cfg.get("messages") if isinstance(cfg, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return
+    entry = next((m for m in messages if isinstance(m, dict) and m.get("channel_id")), None)
+    if not entry:
+        return
+    channel_id = str(entry.get("channel_id"))
+    components = entry.get("components") or []
+    payload = build_board_payload(components)
+    if payload is None:
+        return
+
+    fingerprint = hashlib.sha256(
+        json.dumps({"c": channel_id, "d": components, "r": DISPATCH_REGION},
+                   sort_keys=True, default=str).encode()).hexdigest()[:32]
+    same_channel = code_board.get("channel_id") == channel_id
+    if same_channel and code_board.get("fingerprint") == fingerprint and code_board.get("message_id"):
+        return
+
+    if same_channel and code_board.get("message_id"):
+        if await _board_edit(channel_id, code_board["message_id"], payload):
+            code_board["fingerprint"] = fingerprint
+            print(f"code board updated for {DISPATCH_REGION}", flush=True)
+            await save_state()
+            return
+        # The message is gone (deleted by hand), so fall through and post again.
+        code_board.pop("message_id", None)
+
+    mid = await _board_send(channel_id, payload)
+    if mid:
+        code_board.clear()
+        code_board.update({"channel_id": channel_id, "message_id": mid, "fingerprint": fingerprint})
+        print(f"code board posted for {DISPATCH_REGION} in {channel_id}", flush=True)
+        await save_state()
+
+
 async def config_refresh_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         await asyncio.sleep(60)
         await refresh_runtime_config()
+        await sync_code_board()
         await ensure_voice()
 
 

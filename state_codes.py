@@ -1001,3 +1001,81 @@ def audit():
 def states_using_codes():
     """Handy for a quick audit of the table."""
     return {s: e["system"] for s, e in STATE_CODES.items()}
+
+
+# The baseline every "apco" state falls back to, and the floor for anything a
+# state's own sheet does not name. Same set the AI is handed, kept in one place
+# so the posted list and the radio never disagree.
+COMMON_CODES = {
+    "10-4": "acknowledged",
+    "10-6": "busy",
+    "10-7": "out of service",
+    "10-8": "in service, available",
+    "10-9": "say again",
+    "10-19": "return to station",
+    "10-20": "location",
+    "10-23": "on scene, stand by",
+    "10-27": "license check",
+    "10-28": "registration check",
+    "10-29": "wants and warrants check",
+    "10-32": "person with a gun",
+    "10-50": "traffic accident",
+    "10-76": "en route",
+    "10-97": "arrived",
+    "10-98": "assignment complete",
+    "10-99": "officer needs emergency help",
+    "Code 4": "no further assistance needed",
+    "Signal 100": "hold the air for emergency traffic",
+}
+
+RESPONSE_CODES = {
+    "Code 1": "routine, no lights or siren",
+    "Code 2": "urgent, no siren",
+    "Code 3": "emergency, lights and siren",
+}
+
+
+def ten_code_text(region, heading=True):
+    """The posted radio-code sheet for a region, in Discord markdown.
+
+    A state that runs its own system gets only that system. The two are never
+    mixed, because a state's number and the common number for it often mean
+    different things and showing both would put a contradiction on the board.
+    """
+    entry = STATE_CODES.get(region)
+    out = []
+    if entry is None:
+        if heading:
+            out.append(f"## Radio codes — {region}")
+        out.append("")
+        out += [f"`{k}` {v}" for k, v in COMMON_CODES.items()]
+        out.append("")
+        out += [f"`{k}` {v}" for k, v in RESPONSE_CODES.items()]
+        return "\n".join(out).strip()
+
+    codes = entry.get("codes") or {}
+    system = entry["system"]
+    if heading:
+        out.append(f"## Radio codes — {region}")
+        out.append(f"-# {entry['agency']}")
+    out.append("")
+
+    if codes:
+        out += [f"`{k}` {v}" for k, v in codes.items()]
+    elif system == "plain":
+        # This agency dropped codes. Handing them the common list back would
+        # contradict the very note underneath it.
+        out.append("This agency speaks plain language on the air.")
+    else:
+        out += [f"`{k}` {v}" for k, v in COMMON_CODES.items()]
+    out.append("")
+    out += [f"`{k}` {v}" for k, v in RESPONSE_CODES.items()]
+
+    if entry.get("note"):
+        out.append("")
+        out.append(f"-# {entry['note']}")
+    if system == "ten" and codes:
+        out.append("-# Anything not listed follows the common ten-codes.")
+    elif system in ("signal", "plain"):
+        out.append("-# This agency does not use standard ten-codes.")
+    return "\n".join(out).strip()
