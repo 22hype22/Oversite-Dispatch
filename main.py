@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-7"
+BUILD = "addr-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1741,8 +1741,61 @@ REQUEST_WORDS = ("requesting", "request", "repeat", "say", "come", "can", "could
                  "need", "asking", "asks", "please", "give", "what")
 
 
+# What follows "dispatch" when a unit is talking ABOUT dispatch rather than TO
+# it. In every one of these dispatch is the subject of a sentence aimed at
+# another unit, and answering is dispatch talking over a conversation it was
+# never in.
+_ABOUT_AFTER = frozenset((
+    "said", "says", "told", "tells", "telling", "advised", "advises", "asked",
+    "asks", "wants", "wanted", "gave", "gives", "is", "isnt", "was", "wasnt",
+    "has", "hasnt", "had", "already", "never", "cleared", "clears", "sent",
+    "sends", "put", "puts", "hasn", "keeps", "kept", "aint", "aired", "marked",
+))
+
+# What comes before "dispatch" when it is being talked about. The word after
+# these is a third party, not the person being spoken to. The hail connectors
+# ("471 to dispatch", "471 calling dispatch") are deliberately absent: those
+# are a unit announcing itself, which is the most common way of all.
+_ABOUT_BEFORE = frozenset((
+    "tell", "telling", "told", "ask", "asking", "asked", "per", "from", "about",
+    "heard", "hearing", "contact", "contacted", "notify", "notified", "advise",
+    "advised", "inform", "informed", "update", "updated", "with", "did", "does",
+    "when", "why", "where", "whether", "if", "unless", "since", "because",
+))
+
+
+def _addressing_dispatch(low):
+    """Whether any use of the word is aimed at dispatch.
+
+    A transmission can name dispatch twice, once in passing and once for real:
+    "dispatch already gave me that, dispatch can you run another". One genuine
+    address is enough, so every occurrence is judged on its own."""
+    words = re.findall(r"[a-z0-9'-]+", low)
+    for i, word in enumerate(words):
+        if word != "dispatch":
+            continue
+        after = words[i + 1] if i + 1 < len(words) else ""
+        before = words[i - 1] if i else ""
+        if after in _ABOUT_AFTER or before in _ABOUT_BEFORE:
+            continue
+        return True
+    return False
+
+
 def is_for_dispatch(text):
-    return "dispatch" in text.lower()
+    """Whether this transmission is talking to dispatch.
+
+    Saying the word is not the same as addressing it. Units say "dispatch
+    already cleared us" and "I will let dispatch know" to each other all shift,
+    and dispatch answering those is the bot butting into a conversation.
+
+    Leans towards answering when it is unsure. Missing a unit that genuinely
+    called is far worse on the air than one reply nobody wanted, so only the
+    unmistakable mentions are passed over."""
+    low = _flat(text)
+    if "dispatch" not in low:
+        return False
+    return _addressing_dispatch(low)
 
 
 def wants_repeat(text):
