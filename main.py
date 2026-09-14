@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-5"
+BUILD = "ingame-6"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5826,6 +5826,34 @@ def _signature_ok(key, timestamp, signature, body):
         return False
 
 
+def _which_scheme(key, timestamp, signature, body):
+    """Which way of building the signed message this signature matches, if any.
+
+    ER:LC documents timestamp + raw body. When that fails, knowing whether the
+    signature is over the body alone, or over some other arrangement, turns a
+    guess into a fix."""
+    if key is None:
+        return "no key to check against"
+    try:
+        sig = bytes.fromhex(signature)
+    except Exception:
+        return "the signature is not hex"
+    candidates = {
+        "body only": body,
+        "timestamp + body (documented)": timestamp.encode() + body,
+        "body + timestamp": body + timestamp.encode(),
+        "timestamp . body": timestamp.encode() + b"." + body,
+    }
+    for name, message in candidates.items():
+        try:
+            key.verify(message, sig)
+            return f"it DOES match {name}"
+        except Exception:
+            continue
+    return ("it matches none of the arrangements tried, so this is a different "
+            "signer or a different key")
+
+
 def _webhook_fresh(timestamp, signature):
     """Reject a stale delivery, and any delivery we have already handled."""
     try:
@@ -5859,6 +5887,14 @@ def _dig(payload, *names):
             found = _dig(value, *names)
             if found is not None:
                 return found
+        elif isinstance(value, list):
+            # ER:LC batches events in a list. Recursing only into dicts meant
+            # the message was sat one level inside a list the whole time and
+            # never found.
+            for item in value:
+                found = _dig(item, *names)
+                if found is not None:
+                    return found
     return None
 
 
@@ -5908,14 +5944,38 @@ async def handle_game_command(player, text):
     await announce(f"{callsign}, {body}. Dispatch copies.", title="In-Game Request")
 
 
+def iter_events(payload):
+    """Every event in one delivery.
+
+    ER:LC batches them: {"events": [...], "server": {...}}. A delivery can
+    carry several, and handling only the outer object meant handling none."""
+    if not isinstance(payload, dict):
+        return
+    events = payload.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict):
+                yield event
+    else:
+        yield payload
+
+
 async def handle_webhook_payload(payload):
-    """One delivery from the game: a ";" message, or an emergency call."""
+    """One delivery from the game, carrying any number of events."""
     global _shape_logged
+    events = list(iter_events(payload))
     if not _shape_logged:
         # ER:LC does not document the payload, so record its shape once. Keys
-        # only, never the values, which carry player names.
-        print(f"webhook payload keys: {sorted(payload)[:20]}", flush=True)
+        # only, never the values, which carry what people typed.
+        print(f"webhook shape: outer {sorted(payload)[:10]}, {len(events)} event(s), "
+              f"first event keys {sorted(events[0])[:14] if events else '-'}", flush=True)
         _shape_logged = True
+    for event in events:
+        await handle_webhook_event(event)
+
+
+async def handle_webhook_event(payload):
+    """A single event: a ";" message, or an emergency call."""
     text = _dig(payload, "message", "content", "text", "command", "body")
     if isinstance(text, str) and text.strip().startswith(";"):
         player = _dig(payload, "player", "playername", "caller", "author", "user", "sender")
@@ -5944,7 +6004,12 @@ async def webhook_handler(request):
           f"timestamp={'yes' if timestamp else 'MISSING'}, "
           f"signature={'yes' if signature else 'MISSING'}", flush=True)
     if not _signature_ok(request.app["verify_key"], timestamp, signature, body):
-        print("webhook REFUSED: the signature did not check out against ER:LC's key",
+        # Some deliveries verify and some do not, which means either a second
+        # signer or a different construction. Say which one WOULD have matched
+        # rather than guessing at it. Only the name of the scheme is logged,
+        # never the body, which is unverified at this point.
+        print(f"webhook REFUSED: signature did not check out. "
+              f"{_which_scheme(request.app['verify_key'], timestamp, signature, body)}",
               flush=True)
         return aioweb.Response(status=401, text="bad signature")
     if not _webhook_fresh(timestamp, signature):
