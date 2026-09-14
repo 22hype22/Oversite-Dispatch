@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "assist-3"
+BUILD = "assist-4"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5643,6 +5643,32 @@ async def dispatch_loop():
         await asyncio.sleep(max(POLL_SECONDS, 15) if active_stops else POLL_SECONDS)
 
 
+# How long a fresh process waits before taking the channel.
+#
+# A redeploy starts the new container while the old one is still running and
+# still holding the voice session. Whichever joins second evicts the other, and
+# the one that loses sits in a reconnect backoff for around half a minute. So a
+# bot that joined at three seconds was off the air from three to thirty five,
+# which is worse than not joining for ten.
+#
+# Waiting lets the old process get its SIGTERM and leave first, so the channel
+# is free when this one arrives and it joins once and stays. Only the first
+# join waits; a reconnect later on does not.
+VOICE_JOIN_DELAY = float(os.environ.get("VOICE_JOIN_DELAY", "10"))
+_first_join_done = False
+
+
+async def settle_before_first_join():
+    global _first_join_done
+    if _first_join_done:
+        return
+    _first_join_done = True
+    if VOICE_JOIN_DELAY > 0:
+        print(f"waiting {VOICE_JOIN_DELAY:.0f}s for the previous process to leave the "
+              f"channel before joining", flush=True)
+        await asyncio.sleep(VOICE_JOIN_DELAY)
+
+
 # One connection attempt at a time. wait_for_voice used to call this once a
 # second while a transmission waited, the watchdog calls it every fifteen and
 # the config refresh every sixty, so a slow handshake had several more started
@@ -5653,6 +5679,7 @@ _voice_lock = asyncio.Lock()
 
 
 async def ensure_voice():
+    await settle_before_first_join()
     async with _voice_lock:
         return await _ensure_voice_locked()
 
