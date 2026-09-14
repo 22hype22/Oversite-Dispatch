@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-4"
+BUILD = "ingame-5"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -900,17 +900,32 @@ async def identity_watch_loop():
         await asyncio.sleep(15)
 
 
+_config_said = {}   # what the last refresh reported, so a quiet one stays quiet
+
+
 async def refresh_runtime_config():
+    """Re-read the dashboard's settings.
+
+    This runs every minute for the life of the process. It used to narrate all
+    four steps every time, which buried anything worth reading under a few
+    hundred lines an hour. It now speaks on the first pass and whenever
+    something actually changes."""
     global ERLC_KEY, VOICE_CHANNEL_ID
-    _key_fingerprint("WORKER_TOKEN", WORKER_TOKEN)
-    key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=True)
+    first = not _config_said
+    if first:
+        _key_fingerprint("WORKER_TOKEN", WORKER_TOKEN)
+    key = await fetch_bot_secret("ERLC_SERVER_KEY", diag=first)
     if key:
         ERLC_KEY = key
     # Adopt the dashboard-chosen region (state/country) on startup + each refresh.
     await load_region_from_dashboard()
-    vc = await fetch_dispatch_voice_channel(diag=True)
-    print(f"config refresh: ERLC_secret={'read' if key else 'env/none'} "
-          f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}", flush=True)
+    vc = await fetch_dispatch_voice_channel(diag=first)
+    state = (bool(key), str(vc or ""))
+    if first or state != _config_said.get("state"):
+        print(f"config refresh: ERLC_secret={'read' if key else 'env/none'} "
+              f"DISPATCH_VOICE_CHANNEL_ID={vc!r} -> VOICE_CHANNEL_ID={VOICE_CHANNEL_ID}",
+              flush=True)
+    _config_said["state"] = state
     if vc:
         try:
             VOICE_CHANNEL_ID = int(vc)
