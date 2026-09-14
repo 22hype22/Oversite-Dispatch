@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-2"
+BUILD = "ingame-3"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5922,9 +5922,18 @@ async def webhook_handler(request):
     body = await request.read()
     timestamp = request.headers.get("X-Signature-Timestamp", "")
     signature = request.headers.get("X-Signature-Ed25519", "")
+    # Every delivery says so, pass or fail. Without this a rejected request and
+    # a request that never arrived look exactly the same from the log, and the
+    # first question when nothing happens in game is which of the two it was.
+    print(f"webhook hit from {request.remote}: {len(body)} bytes, "
+          f"timestamp={'yes' if timestamp else 'MISSING'}, "
+          f"signature={'yes' if signature else 'MISSING'}", flush=True)
     if not _signature_ok(request.app["verify_key"], timestamp, signature, body):
+        print("webhook REFUSED: the signature did not check out against ER:LC's key",
+              flush=True)
         return aioweb.Response(status=401, text="bad signature")
     if not _webhook_fresh(timestamp, signature):
+        print("webhook: already handled, ignoring the repeat", flush=True)
         return aioweb.Response(status=200, text="already handled")
     try:
         payload = json.loads(body.decode() or "{}")
@@ -5962,8 +5971,10 @@ async def start_webhook_server():
     runner = aioweb.AppRunner(app)
     await runner.setup()
     await aioweb.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
-    print(f"in-game commands: ON — paste your service's public URL with {WEBHOOK_PATH} "
-          f"on the end into the Event Webhook box in your private server settings", flush=True)
+    print(f"in-game commands: ON, listening on port {WEBHOOK_PORT} at {WEBHOOK_PATH}. "
+          f"Paste this service's public URL with {WEBHOOK_PATH} on the end into the "
+          f"Event Webhook box in your private server settings. Nothing will arrive "
+          f"until that is saved.", flush=True)
 
 
 async def _supervise(name, factory):
