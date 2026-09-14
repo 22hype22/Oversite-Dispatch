@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "ingame-6"
+BUILD = "ingame-7"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5975,7 +5975,18 @@ async def handle_webhook_payload(payload):
 
 
 async def handle_webhook_event(payload):
-    """A single event: a ";" message, or an emergency call."""
+    """A single event: a ";" message, or an emergency call.
+
+    ER:LC wraps each one as {"event": <type>, "data": {...}, "origin", "timestamp"}.
+    """
+    # The type and the field names inside it, every time. Names only, never
+    # values, so what a player typed never lands in the log. Without this,
+    # working out why an event was not acted on is guesswork.
+    kind = payload.get("event") or payload.get("type") or "?"
+    data = payload.get("data")
+    print(f"webhook event: {kind!r}, fields "
+          f"{sorted(data)[:16] if isinstance(data, dict) else type(data).__name__}",
+          flush=True)
     text = _dig(payload, "message", "content", "text", "command", "body")
     if isinstance(text, str) and text.strip().startswith(";"):
         player = _dig(payload, "player", "playername", "caller", "author", "user", "sender")
@@ -5990,7 +6001,7 @@ async def handle_webhook_event(payload):
             isinstance(payload, dict) and payload.get("CallNumber") is not None):
         print("webhook: emergency call received, leaving it to the poller", flush=True)
         return
-    print(f"webhook: nothing to do with this delivery ({sorted(payload)[:12]})", flush=True)
+    print(f"webhook: {kind!r} is not something dispatch acts on", flush=True)
 
 
 async def webhook_handler(request):
