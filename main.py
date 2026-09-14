@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "calls-2"
+BUILD = "calls-3"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2029,6 +2029,69 @@ def units_on_call(number):
     else:
         call_units.pop(number, None)
     return live
+
+
+def call_gist(call):
+    """The few words that identify a call on the air, "the robbery at river
+    city bank". Enough for a unit to know which call is meant without dispatch
+    reading the whole thing out again."""
+    if not isinstance(call, dict):
+        return ""
+    desc = autocorrect((call.get("Description") or "").strip()).strip(" .")
+    desc = re.sub(r"^(?:a|an|the)\s+", "", desc, flags=re.I)
+    loc = (call.get("PositionDescriptor") or "").strip().strip(" .")
+    if desc and loc:
+        return f"the {desc} at {loc}"
+    if desc:
+        return f"the {desc}"
+    if loc:
+        return f"the incident at {loc}"
+    return ""
+
+
+def wants_call_details(text):
+    """'expand on that call', 'give me details on that call'. The long version
+    of a call, asked for rather than read out every time."""
+    low = _flat(text)
+    if "call" not in low:
+        return False
+    # "repeat that call" is deliberately not here. wants_repeat already reads
+    # the whole call back out, which is exactly what that asks for.
+    return any(t in low for t in ("expand", "detail", "more on that", "more on the",
+                                  "more information", "more info", "what do we have on"))
+
+
+def read_call_details(callsign="", member=None, number=None):
+    ack = addr(callsign, member)
+    if number is None:
+        number = last_call.get("CallNumber") if isinstance(last_call, dict) else None
+    call = open_calls.get(number)
+    if not call and isinstance(last_call, dict) and last_call.get("CallNumber") == number:
+        call = last_call
+    if not call:
+        return f"{ack}there is no call to expand on."
+    desc = autocorrect((call.get("Description") or "").strip()).strip(" .")
+    loc = (call.get("PositionDescriptor") or "").strip().strip(" .")
+    team = (call.get("Team") or "").strip()
+    bits = [f"{ack}call number {number}"]
+    if desc:
+        bits.append(desc)
+    if loc:
+        bits.append(f"at {loc}")
+    when = stamp_time(call.get("StartedAt"))
+    if when:
+        bits.append(f"received {when}")
+    if team:
+        bits.append(f"{team} assignment")
+    line = ", ".join(bits) + "."
+    live = units_on_call(number)
+    if live:
+        word = "unit" if len(live) == 1 else "units"
+        said = ", ".join(f"{cs} {v['status']}" for cs, v in list(live.items())[:4])
+        line += f" {num_words(len(live)).capitalize()} {word} attached, {said}."
+    else:
+        line += " No units attached."
+    return line
 
 
 def wants_call_units(text):
@@ -4458,6 +4521,10 @@ async def process_transmission(member, text, followup_only=False):
         await announce(read_call_units(callsign, member, extract_call_number(text)),
                        title="Call Units")
         return
+    if wants_call_details(text):
+        await announce(read_call_details(callsign, member, extract_call_number(text)),
+                       title="Call Details")
+        return
     if wants_roster(text):
         await announce(await read_roster(callsign, member), title="Roster")
         return
@@ -4849,10 +4916,14 @@ async def recheck_priority_calls():
             continue
         rec["tries"] += 1
         rec["at"] = now
-        waiting = human_ago(now - rec["first"])
-        line = (f"All units, call number {number} is still holding with no unit attached, "
-                f"received {waiting}. {build_call_line(open_calls[number])} "
-                f"Any available unit, advise.")
+        # Short on purpose. A re-air is a nudge, not the whole call read out
+        # again, and a unit that wants the rest can ask to expand on it.
+        call = open_calls[number]
+        gist = call_gist(call)
+        about = f" involving {gist}" if gist else ""
+        when = stamp_time(call.get("StartedAt"))
+        since = f" from {when}" if when else f", received {human_ago(now - rec['first'])}"
+        line = f"All units, call number {number}{about} is still holding{since}."
         await announce(line, title="Call Holding", urgent=True)
         print(f"re-aired priority call {number} (try {rec['tries']})", flush=True)
 
