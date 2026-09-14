@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "assist-2"
+BUILD = "assist-3"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2853,8 +2853,25 @@ async def state_save_loop():
 
 
 async def _graceful_shutdown():
-    """Railway sends SIGTERM before a redeploy: save first, then go."""
-    print("shutdown: saving dispatch memory before the redeploy", flush=True)
+    """Railway sends SIGTERM before a redeploy: leave the channel properly,
+    save, then go.
+
+    Leaving properly matters more than it looks. A process that dies still
+    holding a voice session leaves Discord with a ghost of it for up to a
+    minute, and the container replacing it collides with that ghost when it
+    joins the same channel. That collision is the flapping in and out that
+    follows a redeploy. Saying we are leaving clears it at once, so the new
+    process joins once and stays.
+
+    Voice goes first because it takes a moment and the save can take eight."""
+    print("shutdown: leaving voice before the redeploy", flush=True)
+    try:
+        if voice_client is not None and voice_client.is_connected():
+            await asyncio.wait_for(voice_client.disconnect(force=False), 5)
+            print("shutdown: left the voice channel cleanly", flush=True)
+    except Exception as exc:
+        print(f"shutdown: could not leave voice cleanly: {exc}", flush=True)
+    print("shutdown: saving dispatch memory", flush=True)
     try:
         await asyncio.wait_for(save_state(force=True, reason="shutdown"), 8)
     except Exception as exc:
