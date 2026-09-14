@@ -4432,6 +4432,12 @@ async def process_transmission(member, text, followup_only=False):
         if number is not None:
             mark_call_cleared(number)
             await announce(f"{ack}10-4, call number {number} is concluded. All units, disregard.", title="Call Concluded")
+        elif says_custody(text):
+            # Somebody reporting an arrest is not asking about the call list.
+            # Their stop or pursuit has usually just ended on its own, so
+            # answering "there are no active calls to clear" reads as dispatch
+            # arguing with them. Acknowledge the arrest and leave it there.
+            await announce(f"{ack}10-4, show one in custody.", title="In Custody")
         else:
             await announce(f"{ack}there are no active calls to clear.", title="Call Concluded")
         return
