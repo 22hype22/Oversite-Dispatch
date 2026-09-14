@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-1"
+BUILD = "pm-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2394,18 +2394,31 @@ def call_for_status(text):
 
     An explicit number always wins. Otherwise the last call that went out
     counts, but only while it is still open, still uncleared and still
-    recent."""
+    recent. Only when there is no announcement to judge by at all does a
+    single open call stand in for one."""
     number = extract_call_number(text)
     if number is not None:
         return number
-    if not isinstance(last_call, dict):
-        return None
-    number = last_call.get("CallNumber")
-    if number is None or number not in open_calls or number in cleared_calls:
-        return None
-    if last_call_at and time.time() - last_call_at > CALL_ATTACH_RECENT:
-        return None
-    return number
+    if isinstance(last_call, dict):
+        number = last_call.get("CallNumber")
+        if number is not None and number in open_calls and number not in cleared_calls:
+            # Dispatch put this call out and it is still holding, so the only
+            # question left is how long ago. Past the window the unit is going
+            # somewhere else, and saying otherwise would put a lie on the board
+            # and tell that caller somebody is coming who is not.
+            if last_call_at and time.time() - last_call_at > CALL_ATTACH_RECENT:
+                return None
+            return number
+    # Nothing has been announced, or what was announced has since closed, so
+    # there is no recency to judge by at all. A call that was already holding
+    # when the bot restarted is exactly this: it sits on the board with nobody
+    # attached, and a unit going en route was attaching to nothing. One open
+    # call is unambiguous. Two or more stays a plain status, because attaching
+    # a unit to the wrong call would also tell the wrong caller.
+    live = [n for n in open_calls if n not in cleared_calls]
+    if len(live) == 1:
+        return live[0]
+    return None
 
 
 # Words that carry no meaning of their own in a status report, so what is left
@@ -5202,7 +5215,14 @@ async def process_transmission(member, text, followup_only=False):
                 if status.startswith("10-8") or "available" in status or "clear" in status:
                     detach_from_call(callsign)
                 status_board[callsign] = {"status": status, "time": time.time()}
-                print(f"status board: {callsign} -> {status}", flush=True)
+                note = ""
+                if status in ("en route", "on a call", "on scene"):
+                    # Worth saying out loud. A unit going en route to nothing is
+                    # how "why did the caller never hear back" starts, and this
+                    # line is the whole answer.
+                    live = [n for n in open_calls if n not in cleared_calls]
+                    note = f" (not attached, {len(live)} call(s) open)"
+                print(f"status board: {callsign} -> {status}{note}", flush=True)
         if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
         elif only_a_status(text, callsign):
