@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "drag-2"
+BUILD = "info-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -7052,6 +7052,59 @@ async def _supervise(name, factory):
             print(f"{name} crashed, restarting in 5s: {exc!r}", flush=True)
             traceback.print_exc()
             await asyncio.sleep(5)
+
+
+# ------------------------------------------------------------------ /info
+#
+# Who made this bot, what it is, and where to get one. Every Oversite bot
+# answers /info with the same card, so somebody who meets one in any server
+# sees the same thing and knows where it came from.
+#
+# The version is read from the commit Railway built, rather than a constant
+# somebody has to remember to bump, so it is never quietly wrong.
+INFO_NAME = "Oversite Dispatch"
+INFO_WHAT = ("AI radio dispatch for ER:LC. It takes 911 calls, runs the radio "
+             "in voice, keeps the status board, and answers units by callsign.")
+INFO_SITE = "https://www.oversite.shop"
+INFO_SUPPORT = "https://discord.gg/ovs"
+INFO_COLOR = 0x3B82F6
+_info_started = int(time.time())
+
+
+def info_version():
+    """What is actually running, or "" when there is nothing trustworthy."""
+    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
+    return f"{BUILD} {sha[:7]}" if sha else BUILD
+
+
+def info_embed(me=None):
+    embed = discord.Embed(title=INFO_NAME, description=INFO_WHAT, color=INFO_COLOR)
+    embed.add_field(name="Made by", value="Oversite" + chr(10) + INFO_SITE, inline=True)
+    embed.add_field(name="Support", value=INFO_SUPPORT, inline=True)
+    version = info_version()
+    if version:
+        embed.add_field(name="Version", value=f"`{version}`", inline=True)
+    embed.add_field(name="Online since", value=f"<t:{_info_started}:R>", inline=True)
+    if me is not None:
+        try:
+            embed.set_thumbnail(url=me.display_avatar.url)
+        except Exception:
+            pass
+    embed.set_footer(text="Built and hosted by Oversite")
+    return embed
+
+
+@command_tree.command(
+    name="info",
+    description="Who made this bot and where it came from",
+    guild=DISPATCH_GUILD,
+)
+async def info_command(interaction):
+    try:
+        await interaction.response.send_message(
+            embed=info_embed(getattr(interaction.client, "user", None)))
+    except Exception as exc:
+        print(f"/info failed: {exc}", flush=True)
 
 
 client.run(TOKEN)
