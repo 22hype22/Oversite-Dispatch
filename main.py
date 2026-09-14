@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "board-1"
+BUILD = "board-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -3345,7 +3345,10 @@ def vehicle_for(vehicles, owner_name):
 
 
 async def roblox_profile(name):
-    """Public Roblox profile for a username: display name, id, account age."""
+    """Public Roblox profile for a username: display name, id, ban status.
+
+    Deliberately not account age. A dispatcher reading a name back has no use
+    for how long the account has existed, and it made every return longer."""
     try:
         async with http.post("https://users.roblox.com/v1/usernames/users",
                              json={"usernames": [name], "excludeBannedUsers": False}) as resp:
@@ -3359,22 +3362,9 @@ async def roblox_profile(name):
             if resp.status != 200:
                 return {"name": hit.get("name"), "display": hit.get("displayName"), "id": hit.get("id")}
             user = await resp.json()
-        created = str(user.get("created") or "")
-        age = ""
-        try:
-            from datetime import datetime, timezone
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            days = (datetime.now(timezone.utc) - dt).days
-            if days >= 365:
-                age = f"{days // 365} year{'s' if days // 365 != 1 else ''}"
-            elif days >= 30:
-                age = f"{days // 30} month{'s' if days // 30 != 1 else ''}"
-            else:
-                age = f"{days} day{'s' if days != 1 else ''}"
-        except Exception:
-            pass
-        return {"name": user.get("name") or hit.get("name"), "display": user.get("displayName") or hit.get("displayName"),
-                "id": user.get("id") or hit.get("id"), "age": age, "banned": bool(user.get("isBanned"))}
+        return {"name": user.get("name") or hit.get("name"),
+                "display": user.get("displayName") or hit.get("displayName"),
+                "id": user.get("id") or hit.get("id"), "banned": bool(user.get("isBanned"))}
     except Exception as exc:
         print(f"roblox lookup failed: {exc}", flush=True)
         return None
@@ -3789,8 +3779,6 @@ async def run_lookup(member, pend, text):
     remember_subject(member, real, plate_for_owner(vehicles, real))
     profile = await roblox_profile(real)
     if profile:
-        if profile.get("age"):
-            parts.append(f"Roblox account is {profile['age']} old")
         if profile.get("banned"):
             parts.append("the account is banned on Roblox")
     else:
