@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "quiet-1"
+BUILD = "voice-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1647,14 +1647,63 @@ CALLSIGN_PHON = {
 
 
 def is_callsign_token(tok):
-    t = tok.lower().strip(",.-'")
+    t = tok.lower().strip(",.'")
     if not t:
         return False
+    if "-" in t or "/" in t:
+        # 1S-032 is a callsign. 10-8 is a ten code, and reading it as a unit
+        # number is how dispatch ends up answering a unit that does not exist,
+        # so a hyphenated token has to carry a letter as well as a digit.
+        core = t.replace("-", "").replace("/", "")
+        return (core.isalnum() and len(core) <= 6
+                and any(c.isdigit() for c in core) and any(c.isalpha() for c in core))
     if t.isalnum() and any(c.isdigit() for c in t) and len(t) <= 6:
         return True
     if t.isalpha() and len(t) <= 2:
         return True
     return t in CALLSIGN_NUMS or t in CALLSIGN_PHON
+
+
+def _finish_callsign(parts):
+    has_number = any(any(c.isdigit() for c in p) or p.lower() in CALLSIGN_NUMS for p in parts)
+    callsign = " ".join(parts).strip(" ,.-")
+    if not callsign or len(callsign) > 24 or not has_number:
+        return ""
+    return callsign
+
+
+# Words that sit between a unit and the wake word in "471 to dispatch".
+_TO_DISPATCH = ("to", "for", "calling", "callin")
+# A number straight after one of these is a code, not a unit.
+_NOT_A_UNIT = ("code", "signal", "priority", "channel", "chan", "call", "number", "10")
+
+
+def callsign_before(text, upto):
+    """The 471 in "471 to dispatch".
+
+    Half the radio traffic puts the unit first, and reading only what came
+    after the wake word is why a unit that announced itself properly got
+    answered by somebody else's number."""
+    head = text[:upto].strip(" ,.-")
+    if not head:
+        return ""
+    tokens = [t for t in re.split(r"\s+", head) if t]
+    while tokens and tokens[-1].lower().strip(",.-") in _TO_DISPATCH:
+        tokens.pop()
+    parts = []
+    for tok in reversed(tokens):
+        t = tok.strip(",.-")
+        if not t or not is_callsign_token(t):
+            break
+        parts.append(t)
+        if len(tokens) > len(parts) and \
+                tokens[len(tokens) - len(parts) - 1].lower().strip(",.-") in _NOT_A_UNIT:
+            parts = []
+            break
+        if len(parts) >= 6:
+            break
+    parts.reverse()
+    return _finish_callsign(parts)
 
 
 def extract_callsign(text):
@@ -1665,18 +1714,15 @@ def extract_callsign(text):
     tokens = re.split(r"\s+", rest)
     parts = []
     for tok in tokens:
-        if tok.lower().strip(",.-") in REQUEST_WORDS:
+        low = tok.lower().strip(",.-")
+        if low in REQUEST_WORDS or low in _TO_DISPATCH or low in _NOT_A_UNIT:
             break
         if not is_callsign_token(tok):
             break
         parts.append(tok.strip(",.-"))
         if len(parts) >= 6 or tok[-1:] in ".?!":
             break
-    has_number = any(any(c.isdigit() for c in p) or p.lower() in CALLSIGN_NUMS for p in parts)
-    callsign = " ".join(parts).strip(" ,.-")
-    if not callsign or len(callsign) > 24 or not has_number:
-        return ""
-    return callsign
+    return _finish_callsign(parts) or callsign_before(text, match.start())
 
 
 _NUM_ONES = {"zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3",
@@ -1748,7 +1794,11 @@ def resolve_callsign(spoken, member=None):
             r += 0.08  # a unit on the map right now is the likelier match
         if r > best_r:
             best_r, best = r, disp
-    if own and best_r < 0.9 and difflib.SequenceMatcher(None, target, norm_callsign(own)).ratio() >= 0.45:
+    # Nothing matched exactly, so something was misheard. A unit on the radio
+    # is naming itself far more often than somebody else, so the speaker's own
+    # callsign beats a fuzzy match on another unit's unless that match is all
+    # but certain. "301" transcribed as "EMS 311" answers 301.
+    if own and best_r < 0.9 and difflib.SequenceMatcher(None, target, norm_callsign(own)).ratio() >= 0.34:
         return own
     if best is not None and best_r >= 0.6:
         if norm_callsign(best) != target:
@@ -2163,6 +2213,46 @@ def only_a_status(text, callsign):
     left = [w for w in re.sub(r"\s+", " ", low).strip().split()
             if w not in _STATUS_FILLER]
     return len(left) <= 2
+
+
+# "Hold for plate", "stand by", "give me a second". The unit is telling
+# dispatch to wait, not reading it a plate, and answering "dispatch did not
+# catch that plate" to somebody who has not said one yet is how a simple stop
+# turns into an argument.
+_STAND_BY = re.compile(
+    r"\b(?:hold(?:ing)?\s+(?:on|for|one|up|please|tight|there)"
+    r"|stand(?:ing)?\s*by"
+    r"|standby"
+    r"|wait\s+(?:one|up|a\s+(?:sec|second|moment|minute))"
+    r"|one\s+(?:sec|second|moment|minute)"
+    r"|give\s+me\s+(?:a\s+)?(?:sec|second|moment|minute)"
+    r"|just\s+a\s+(?:sec|second|moment|minute))\b")
+
+# Words that carry nothing once the stand-by itself has been taken out, so what
+# is left decides whether the unit also gave dispatch something to work with.
+_STAND_BY_FILLER = re.compile(
+    r"\b(?:a|the|for|on|to|me|my|im|is|it|that|this|one|please|ok|okay|yeah|yes"
+    r"|dispatch|plate|tag|registration|name|username|person|subject|check|got"
+    r"|sec|second|moment|minute|got\s+it)\b")
+
+
+def says_stand_by(text):
+    """Nothing in this transmission but the unit asking dispatch to wait."""
+    low = _flat(text)
+    if not _STAND_BY.search(low):
+        return False
+    rest = _STAND_BY_FILLER.sub(" ", _STAND_BY.sub(" ", low))
+    return not re.sub(r"[^a-z0-9]", "", rest)
+
+
+def stand_by_kind(text):
+    """What the unit is about to give dispatch, when it said."""
+    low = _flat(text)
+    if re.search(r"\b(plate|tag|registration)\b", low):
+        return "plate"
+    if re.search(r"\b(name|username|person|subject)\b", low):
+        return "name"
+    return ""
 
 
 def wants_call_units(text):
@@ -4425,6 +4515,12 @@ async def handle_utterance(member, pcm):
     # A lookup in progress: this transmission is the plate or the name.
     pend = _pending_lookup.get(uid)
     if pend and now - pend["at"] <= LOOKUP_WINDOW and not lookup_request_kind(text):
+        if says_stand_by(text):
+            # They are getting the plate, not reading it out. Keep holding the
+            # channel for them instead of telling them it was not understood.
+            _pending_lookup[uid] = {**pend, "at": now}
+            await announce(f"{addr(pend.get('callsign'), member)}standing by.", title="Stand By")
+            return
         await collect_lookup(member, pend, text)
         return
 
@@ -4566,6 +4662,12 @@ async def process_transmission(member, text, followup_only=False):
         return
 
     if await handle_special(member, text, callsign):
+        return
+    if says_stand_by(text):
+        kind = stand_by_kind(text)
+        if kind:
+            _pending_lookup[member.id] = {"kind": kind, "callsign": callsign, "at": time.time()}
+        await announce(f"{addr(callsign, member)}standing by.", title="Stand By")
         return
     if followup_only:
         # This came in without the wake word only because it read as a
