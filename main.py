@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "assist-4"
+BUILD = "assist-5"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5837,7 +5837,7 @@ async def on_voice_state_update(member, before, after):
 
 @client.event
 async def on_ready():
-    global http, tone_path, VOICE_CHANNEL_ID
+    global http, VOICE_CHANNEL_ID
     if http is None:
         http = aiohttp.ClientSession()
     print(f"dispatch online as {client.user}", flush=True)
@@ -6335,10 +6335,22 @@ async def start_webhook_server():
     runner = aioweb.AppRunner(app)
     await runner.setup()
     await aioweb.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
-    print(f"in-game commands: ON, listening on port {WEBHOOK_PORT} at {WEBHOOK_PATH}. "
-          f"Paste this service's public URL with {WEBHOOK_PATH} on the end into the "
-          f"Event Webhook box in your private server settings. Nothing will arrive "
-          f"until that is saved.", flush=True)
+    # Listening is not the same as reachable. A service with no public URL is
+    # bound to a port nobody outside can dial, and saying ON there sends
+    # somebody looking for a fault in the game settings instead of the one
+    # thing that is actually missing.
+    domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+              or os.environ.get("PUBLIC_DOMAIN") or "").strip()
+    if domain:
+        print(f"in-game commands: ON. Paste this into the Event Webhook box in your "
+              f"private server settings, then ;request supervisor works in game:\n"
+              f"    https://{domain}{WEBHOOK_PATH}\n"
+              f"Nothing arrives until that is saved.", flush=True)
+    else:
+        print(f"in-game commands: listening on port {WEBHOOK_PORT}{WEBHOOK_PATH}, but this "
+              f"service has NO PUBLIC URL, so the game cannot reach it and nothing will "
+              f"ever arrive. Generate a domain for this service, then paste it with "
+              f"{WEBHOOK_PATH} on the end into the Event Webhook box.", flush=True)
 
 
 async def _supervise(name, factory):
