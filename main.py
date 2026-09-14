@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "voice-2"
+BUILD = "ingame-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -5639,6 +5639,7 @@ async def on_ready():
             print("on-duty callsign nicknames: ON (needs Manage Nicknames perm)", flush=True)
         if TS_CHANNEL_LABELS:
             print("traffic-stop VC labels: ON (needs Manage Channels perm)", flush=True)
+        await start_webhook_server()
         if ALERT_TONES and tone_path is None:
             globals()["tone_path"] = await client.loop.run_in_executor(None, make_tone)
             if tone_path:
@@ -5656,6 +5657,218 @@ async def on_ready():
         print(f"startup complete {time.time() - _BOOT_T0:.1f}s after start", flush=True)
 
     client.loop.create_task(_supervise("startup", _finish_startup))
+
+
+# ── In-game commands ──────────────────────────────────────────────────────
+# A unit sitting in a Traffic Stop voice channel cannot reach dispatch: the bot
+# holds one voice connection and Discord allows no more. Typing in game is the
+# way in. ER:LC pushes every chat message starting with ";" to an HTTPS endpoint
+# of our choosing, so ";request supervisor" lands here and goes through exactly
+# the same dispatch handling as saying it on the radio would.
+#
+# The same webhook also carries emergency calls, which arrive the moment they
+# are made rather than whenever the next poll comes round.
+
+# ER:LC signs every delivery. Published at apidocs.erlc.gg/event-webhooks.
+from aiohttp import web as aioweb
+
+ERLC_WEBHOOK_KEY = os.environ.get(
+    "ERLC_WEBHOOK_PUBKEY",
+    "MCowBQYDK2VwAyEAjSICb9pp0kHizGQtdG8ySWsDChfGqi+gyFCttigBNOA=")
+WEBHOOK_PORT = int(os.environ.get("PORT", "0") or "0")
+WEBHOOK_PATH = os.environ.get("ERLC_WEBHOOK_PATH", "/erlc")
+# A delivery older than this is a replay of one we already handled.
+WEBHOOK_MAX_AGE = float(os.environ.get("ERLC_WEBHOOK_MAX_AGE", "300"))
+_webhook_seen = set()
+_shape_logged = False
+
+
+def _verify_key():
+    """The Ed25519 verifier, or None when the signing library is missing.
+
+    PyNaCl ships with discord.py's voice extra, so it is already here. If that
+    ever changes, the endpoint refuses everything rather than trusting an
+    unsigned request."""
+    try:
+        import base64
+        from nacl.signing import VerifyKey
+        raw = base64.b64decode(ERLC_WEBHOOK_KEY)
+        # A SubjectPublicKeyInfo wrapper is 12 bytes of header then the 32-byte
+        # key; a bare key is the 32 bytes on their own. Accept either.
+        if len(raw) > 32:
+            raw = raw[-32:]
+        return VerifyKey(raw)
+    except Exception as exc:
+        print(f"webhook: cannot build the verify key ({exc}); in-game commands are off",
+              flush=True)
+        return None
+
+
+def _signature_ok(key, timestamp, signature, body):
+    """ER:LC signs timestamp + the raw body. The body must be the bytes as they
+    arrived, never a re-serialised copy of the parsed JSON."""
+    if key is None or not timestamp or not signature:
+        return False
+    try:
+        key.verify(timestamp.encode() + body, bytes.fromhex(signature))
+        return True
+    except Exception:
+        return False
+
+
+def _webhook_fresh(timestamp, signature):
+    """Reject a stale delivery, and any delivery we have already handled."""
+    try:
+        age = time.time() - float(timestamp)
+    except Exception:
+        return False
+    if abs(age) > WEBHOOK_MAX_AGE:
+        print(f"webhook: ignoring a delivery {age:.0f}s old", flush=True)
+        return False
+    if signature in _webhook_seen:
+        return False
+    _webhook_seen.add(signature)
+    if len(_webhook_seen) > 500:
+        for old in list(_webhook_seen)[:250]:
+            _webhook_seen.discard(old)
+    return True
+
+
+def _dig(payload, *names):
+    """The first of these keys that carries a value, at the top level or one
+    level down. ER:LC does not publish the payload shape, so the names it might
+    use are all tried rather than guessed at."""
+    if not isinstance(payload, dict):
+        return None
+    for name in names:
+        for key, value in payload.items():
+            if key.lower() == name.lower() and value not in (None, "", [], {}):
+                return value
+    for value in payload.values():
+        if isinstance(value, dict):
+            found = _dig(value, *names)
+            if found is not None:
+                return found
+    return None
+
+
+def member_for_player(name):
+    """The Discord member behind an in-game player name, when we know them.
+
+    Reuses the matching the traffic-stop code already relies on, so a unit who
+    has run /link is recognised, and so is one whose Discord name simply
+    contains their Roblox name."""
+    raw = str(name or "").split(":")[0].strip()
+    if not raw:
+        return None
+    want = norm_callsign(clean_name(raw))
+    if not want:
+        return None
+    guild = dispatch_guild()
+    if guild is None:
+        return None
+    for member in guild.members:
+        for key in name_match_keys(member):
+            if key and norm_callsign(key) == want:
+                return member
+    return None
+
+
+async def handle_game_command(player, text):
+    """Somebody typed ";something" in game.
+
+    The text is handed to the same dispatch handling the radio uses, so every
+    command that works on the air works here too, with no second set of phrases
+    to keep in step."""
+    body = str(text or "").lstrip(";").strip()
+    if not body:
+        return
+    member = member_for_player(player)
+    who = str(player or "").split(":")[0].strip() or "a unit"
+    print(f"in-game command from {who}: {body!r}"
+          f"{'' if member else ' (no linked Discord member)'}", flush=True)
+    if member is not None:
+        # Prefixed with the wake word so it reads as radio traffic aimed at
+        # dispatch, which is exactly what typing it in game means.
+        await process_transmission(member, f"dispatch {body}")
+        return
+    # Nobody linked. Still answer, using the in-game name as the callsign, so a
+    # unit who never ran /link is not simply ignored.
+    callsign = resolve_callsign(who) or who
+    await announce(f"{callsign}, {body}. Dispatch copies.", title="In-Game Request")
+
+
+async def handle_webhook_payload(payload):
+    """One delivery from the game: a ";" message, or an emergency call."""
+    global _shape_logged
+    if not _shape_logged:
+        # ER:LC does not document the payload, so record its shape once. Keys
+        # only, never the values, which carry player names.
+        print(f"webhook payload keys: {sorted(payload)[:20]}", flush=True)
+        _shape_logged = True
+    text = _dig(payload, "message", "content", "text", "command", "body")
+    if isinstance(text, str) and text.strip().startswith(";"):
+        player = _dig(payload, "player", "playername", "caller", "author", "user", "sender")
+        await handle_game_command(player, text)
+        return
+    # Emergency calls arrive here too. The poller already airs those, and
+    # duplicating that would risk the most important thing the bot does, so for
+    # now note the shape and let the poller handle it. Airing them straight from
+    # here is a follow-up, once a real delivery has shown what it looks like.
+    call = _dig(payload, "emergencycall", "call")
+    if (isinstance(call, dict) and call.get("CallNumber") is not None) or (
+            isinstance(payload, dict) and payload.get("CallNumber") is not None):
+        print("webhook: emergency call received, leaving it to the poller", flush=True)
+        return
+    print(f"webhook: nothing to do with this delivery ({sorted(payload)[:12]})", flush=True)
+
+
+async def webhook_handler(request):
+    body = await request.read()
+    timestamp = request.headers.get("X-Signature-Timestamp", "")
+    signature = request.headers.get("X-Signature-Ed25519", "")
+    if not _signature_ok(request.app["verify_key"], timestamp, signature, body):
+        return aioweb.Response(status=401, text="bad signature")
+    if not _webhook_fresh(timestamp, signature):
+        return aioweb.Response(status=200, text="already handled")
+    try:
+        payload = json.loads(body.decode() or "{}")
+    except Exception:
+        return aioweb.Response(status=400, text="bad json")
+    # Answer first, work after: ER:LC only needs to know the signature checked
+    # out, and dispatch may spend a few seconds talking.
+    client.loop.create_task(_handle_payload_safely(payload))
+    return aioweb.Response(status=200, text="ok")
+
+
+async def _handle_payload_safely(payload):
+    try:
+        await handle_webhook_payload(payload)
+    except Exception as exc:
+        print(f"webhook handling failed: {exc!r}", flush=True)
+        traceback.print_exc()
+
+
+async def start_webhook_server():
+    """Listen for in-game events, when this service has a port to listen on."""
+    if not WEBHOOK_PORT:
+        print("in-game commands: OFF (no PORT set — give this service a public "
+              "domain on Railway to receive them)", flush=True)
+        return
+    key = _verify_key()
+    if key is None:
+        return
+    app = aioweb.Application()
+    app["verify_key"] = key
+    app.router.add_post(WEBHOOK_PATH, webhook_handler)
+    # ER:LC validates a URL before saving it, and a health check is useful.
+    app.router.add_get("/", lambda _r: aioweb.Response(text="dispatch ok"))
+    app.router.add_get(WEBHOOK_PATH, lambda _r: aioweb.Response(text="dispatch ok"))
+    runner = aioweb.AppRunner(app)
+    await runner.setup()
+    await aioweb.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+    print(f"in-game commands: ON — paste your service's public URL with {WEBHOOK_PATH} "
+          f"on the end into the Event Webhook box in your private server settings", flush=True)
 
 
 async def _supervise(name, factory):
