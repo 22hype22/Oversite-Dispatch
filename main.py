@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "assist-5"
+BUILD = "notice-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2724,6 +2724,7 @@ def _state_snapshot():
         "call_units": {str(k): v for k, v in call_units.items()},
         "code_board": dict(code_board),
         "globals_cleared": globals_cleared,
+        "restart_notice": _restart_notice,
         "saved_at": time.time(),
     }
 
@@ -2806,6 +2807,7 @@ async def load_state():
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
         globals()["globals_cleared"] = bool(st.get("globals_cleared"))
+        globals()["_restart_notice"] = bool(st.get("restart_notice"))
         for k, v in (st.get("call_units") or {}).items():
             if str(k).lstrip("-").isdigit() and isinstance(v, dict):
                 call_units[int(k)] = v
@@ -2852,6 +2854,60 @@ async def state_save_loop():
         await save_state()
 
 
+# Going off the air and coming back are worth saying out loud. A radio that
+# stops answering is indistinguishable from a radio nobody is listening to, and
+# units were left wondering which it was every time a deploy landed.
+OFFLINE_LINE = os.environ.get(
+    "DISPATCH_OFFLINE_LINE",
+    "All units, dispatch is going offline for a quick update. Stand by.")
+ONLINE_LINE = os.environ.get(
+    "DISPATCH_ONLINE_LINE",
+    "All units, dispatch is back online and taking calls.")
+# How long the going-off line may take before the shutdown moves on without it.
+# Whatever happens, the channel is left properly and the memory is saved: a
+# courtesy must never cost the thing it is being courteous about.
+OFFLINE_NOTICE_SECONDS = float(os.environ.get("DISPATCH_OFFLINE_NOTICE", "7"))
+_restart_notice = False   # we went down on purpose, so say so on the way back
+
+
+async def say_now(text):
+    """Speak one line and wait for it to finish.
+
+    The shutdown notice cannot go on the play queue: the queue is served by a
+    worker that may be part way through something else, and the process is
+    about to end. This plays it directly and waits, so the words are actually
+    heard rather than queued into a container that is closing."""
+    if voice_client is None or not voice_client.is_connected():
+        return False
+    path = await synthesize(text)
+    if not path:
+        return False
+    done = asyncio.Event()
+    try:
+        if voice_client.is_playing():
+            stopper = getattr(voice_client, "stop_playing", voice_client.stop)
+            stopper()
+        source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=voice_filter())
+        voice_client.play(source, after=lambda _e: client.loop.call_soon_threadsafe(done.set))
+        await done.wait()
+        return True
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def announce_back_on_air():
+    """Say we are back, but only when we said we were going."""
+    global _restart_notice
+    if not _restart_notice:
+        return
+    _restart_notice = False
+    await save_state(force=True, reason="back on air")
+    await announce(ONLINE_LINE, title="Dispatch Online")
+
+
 async def _graceful_shutdown():
     """Railway sends SIGTERM before a redeploy: leave the channel properly,
     save, then go.
@@ -2864,6 +2920,15 @@ async def _graceful_shutdown():
     process joins once and stays.
 
     Voice goes first because it takes a moment and the save can take eight."""
+    global _restart_notice
+    _restart_notice = True
+    try:
+        await asyncio.wait_for(say_now(OFFLINE_LINE), OFFLINE_NOTICE_SECONDS)
+        print("shutdown: told the channel we are going off the air", flush=True)
+    except asyncio.TimeoutError:
+        print("shutdown: no time to say we are going, carrying on", flush=True)
+    except Exception as exc:
+        print(f"shutdown: could not say we are going ({exc}), carrying on", flush=True)
     print("shutdown: leaving voice before the redeploy", flush=True)
     try:
         if voice_client is not None and voice_client.is_connected():
@@ -5916,6 +5981,11 @@ async def on_ready():
         print(f"voice: {XI_MODEL} | stability {XI_STABILITY} style {XI_STYLE} | "
               f"radio filter {'on' if RADIO_FX else 'off'} | roger beep "
               f"{'on' if roger_path else 'off'} | speed {SPEED}", flush=True)
+        # Said once the voice is up and the tones exist, so it sounds like every
+        # other transmission rather than a bare line with no radio on it. Only
+        # when we actually announced going off; a first boot has nothing to be
+        # back from.
+        await announce_back_on_air()
         # Slowest and least urgent: a guild that rejects it can block for a minute.
         await sync_commands()
         print(f"startup complete {time.time() - _BOOT_T0:.1f}s after start", flush=True)
