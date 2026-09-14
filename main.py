@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-5"
+BUILD = "pm-6"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1921,6 +1921,13 @@ def strip_callsign_echo(body):
         return s[comma + 1:].lstrip()
     return body
 
+
+# Statuses that mean a unit is on its way and not there yet. "attach" reports
+# as "on a call", and a unit attaching to something is going to it: both of
+# these put the unit down as en route on the board, and both are a unit
+# answering. Kept in one place so the board and the messages sent to players
+# cannot disagree about what counts as answering.
+GOING_STATUSES = ("en route", "on a call")
 
 STATUS_MAP = [
     ("out of service", "10-7, out of service"),
@@ -5335,8 +5342,8 @@ async def process_transmission(member, text, followup_only=False):
                 mark = "on scene" if status == "on scene" else "en route"
                 attach_to_call(number, callsign, mark)
                 # A unit already standing there does not need to tell the
-                # caller it is coming, so only the en route side sends.
-                if mark == "en route":
+                # caller it is coming, so only the on-the-way side sends.
+                if status in GOING_STATUSES:
                     await tell_caller_en_route(number, callsign)
             else:
                 if status.startswith("10-8") or "available" in status or "clear" in status:
@@ -5351,7 +5358,7 @@ async def process_transmission(member, text, followup_only=False):
                     note = f" (not attached, {len(live)} call(s) open)"
                     # No call does not mean nobody is waiting. A unit that asked
                     # for a supervisor is waiting on exactly this.
-                    if status == "en route":
+                    if status in GOING_STATUSES:
                         await tell_requester_en_route(callsign)
                 print(f"status board: {callsign} -> {status}{note}", flush=True)
         if "traffic stop" in status and not clearing:
