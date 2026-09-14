@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-4"
+BUILD = "pm-5"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1003,6 +1003,55 @@ async def erlc_get(path):
         return None
 
 
+_egress_ip = ""
+_said_not_trusted = False
+
+
+async def outbound_ip():
+    """The address this bot reaches the internet from, or "".
+
+    ER:LC will not run a command for a source the server owner has not
+    trusted, and trusting one means knowing which address to trust. Nothing
+    reports it, so it is asked for and cached."""
+    global _egress_ip
+    if _egress_ip:
+        return _egress_ip
+    for url in ("https://api.ipify.org", "https://checkip.amazonaws.com"):
+        try:
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    found = (await resp.text()).strip()
+                    if found and len(found) < 64:
+                        _egress_ip = found
+                        return _egress_ip
+        except Exception:
+            continue
+    return ""
+
+
+async def explain_not_trusted():
+    """Say what a 4000 actually means, once, in words that name the fix.
+
+    The API returns this for every command until the server owner trusts the
+    source, and the raw reply says nothing about which address to trust. A
+    reader who has to work that out from a JSON blob usually concludes the
+    feature is broken."""
+    global _said_not_trusted
+    if _said_not_trusted:
+        return
+    _said_not_trusted = True
+    ip = await outbound_ip()
+    print("erlc REFUSED the command: this bot is not a trusted source on that "
+          "private server, so ER:LC will not run commands for it. Reading the "
+          "server is unaffected and keeps working.\n"
+          f"    Fix: sign in at https://api.erlc.gg/server-owners, open your "
+          f"server's Settings tab, and add this address to the trusted list:\n"
+          f"        {ip or 'could not determine this bot outbound address'}\n"
+          "    Note this address can change when the bot redeploys. The lasting "
+          "fix is a registered public application, which customers authorize by "
+          "link instead.", flush=True)
+
+
 async def erlc_command(command):
     try:
         async with http.post(f"{ERLC_V2_BASE}/server/command",
@@ -1012,6 +1061,8 @@ async def erlc_command(command):
                 return True
             body = await resp.text()
             print(f"erlc command '{command[:40]}' -> {resp.status}: {body[:200]}", flush=True)
+            if '"code":4000' in body.replace(" ", ""):
+                await explain_not_trusted()
             return False
     except Exception as exc:
         print(f"erlc command failed: {exc}", flush=True)
@@ -6701,6 +6752,14 @@ async def start_webhook_server():
         print("PM_ALLOW_SELF is ON: a unit can answer its own request for help. "
               "This exists for testing with nobody else in the server. Turn it off "
               "before anybody uses this for real.", flush=True)
+    # Said at boot rather than only after a command is refused, because the
+    # address is what the server owner needs and hunting for it is the part
+    # that makes this look broken.
+    ip = await outbound_ip()
+    print(f"outbound address: {ip or 'unknown'}. ER:LC only runs commands such as "
+          f":pm for a source the server owner has trusted. Add this under Settings "
+          f"for the server at https://api.erlc.gg/server-owners if messages to "
+          f"players are coming back refused.", flush=True)
 
 
 async def _supervise(name, factory):
