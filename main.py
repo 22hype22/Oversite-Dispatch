@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "notice-1"
+BUILD = "notice-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -6272,6 +6272,59 @@ async def handle_game_command(player, text):
     await announce(f"{callsign or who}, {body}. Dispatch copies.", title="In-Game Request")
 
 
+_own_server = {}   # the server this bot's own API key belongs to
+
+
+async def own_server_identity():
+    """Who we are, according to the key this bot was given."""
+    if _own_server.get("at", 0) > time.time() - 900:
+        return _own_server
+    try:
+        data = await erlc_get("/server")
+    except Exception:
+        return _own_server
+    if isinstance(data, dict) and (data.get("Name") or data.get("JoinKey")):
+        _own_server.clear()
+        _own_server.update({
+            "name": str(data.get("Name") or "").strip(),
+            "owner": str(data.get("OwnerId") or "").strip(),
+            "join": str(data.get("JoinKey") or "").strip(),
+            "at": time.time(),
+        })
+    return _own_server
+
+
+async def delivery_is_ours(payload):
+    """Whether this delivery came from the server this bot actually serves.
+
+    ER:LC signs with one key for the whole platform, so a good signature proves
+    the game sent it, not that OUR game did. The address is otherwise the only
+    thing tying a server to a bot, and anyone who learned somebody's address
+    could aim their own server at it and drive that customer's dispatcher.
+
+    A delivery names its server, so that is checked. Only a definite mismatch
+    is refused: when there is nothing comparable on either side, the delivery is
+    taken, because turning the feature off for everyone is worse than the thing
+    being guarded against."""
+    block = payload.get("server") if isinstance(payload, dict) else None
+    if not isinstance(block, dict) or not block:
+        return True
+    mine = await own_server_identity()
+    if not mine:
+        return True
+    for theirs_key, ours_key in (("JoinKey", "join"), ("Id", "join"),
+                                 ("Name", "name"), ("OwnerId", "owner")):
+        theirs = str(block.get(theirs_key) or "").strip()
+        ours = str(mine.get(ours_key) or "").strip()
+        if theirs and ours:
+            if theirs.casefold() == ours.casefold():
+                return True
+            print(f"webhook REFUSED: this came from a different ER:LC server "
+                  f"(theirs {theirs_key} does not match ours)", flush=True)
+            return False
+    return True
+
+
 def iter_events(payload):
     """Every event in one delivery.
 
@@ -6291,12 +6344,17 @@ def iter_events(payload):
 async def handle_webhook_payload(payload):
     """One delivery from the game, carrying any number of events."""
     global _shape_logged
+    if not await delivery_is_ours(payload):
+        return
     events = list(iter_events(payload))
     if not _shape_logged:
         # ER:LC does not document the payload, so record its shape once. Keys
         # only, never the values, which carry what people typed.
+        block = payload.get("server") if isinstance(payload, dict) else None
         print(f"webhook shape: outer {sorted(payload)[:10]}, {len(events)} event(s), "
-              f"first event keys {sorted(events[0])[:14] if events else '-'}", flush=True)
+              f"first event keys {sorted(events[0])[:14] if events else '-'}, "
+              f"server fields {sorted(block)[:10] if isinstance(block, dict) else '-'}",
+              flush=True)
         _shape_logged = True
     for event in events:
         await handle_webhook_event(event)
