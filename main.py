@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "cmds-1"
+BUILD = "calls-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -204,6 +204,11 @@ _KEEP_AUDIO = set()   # generated once at boot and reused, never deleted after p
 status_board = {}
 open_calls = {}
 cleared_calls = set()
+# Which units are working which call: number -> {callsign: {"status", "at"}}.
+# A unit saying it is responding is attached to the call until it clears, and
+# "how many units are attached" is answered from here rather than from a count
+# of everyone in game on a police team.
+call_units = {}
 callsign_links = {}
 active_stops = {}
 nick_original = {}
@@ -1778,7 +1783,8 @@ STATUS_MAP = [
     ("traffic stop", "on a traffic stop"),
     ("vehicle stop", "on a traffic stop"),
     ("on a stop", "on a traffic stop"),
-    ("attached", "on a call"),
+    # attach / attaching / attached all mean the same thing on the radio.
+    ("attach", "on a call"),
     ("show me clear", "clear"),
     ("clearing", "clear"),
     ("meal break", "10-7, meal break"),
@@ -1980,11 +1986,77 @@ def extract_call_number(text):
     return int(match.group(1)) if match else None
 
 
+CALL_ATTACH_EXPIRE = float(os.environ.get("CALL_ATTACH_EXPIRE", "5400"))  # 90 minutes
+
+
+def attach_to_call(number, callsign, status):
+    """Put a unit on a call and keep it there. Dispatch answers 'how many are
+    attached' from this, and a unit that said it was responding should stay
+    down as en route until it says it is on scene."""
+    if number is None or not callsign:
+        return
+    call_units.setdefault(number, {})[callsign] = {"status": status, "at": time.time()}
+    status_board[callsign] = {"status": f"{status} to call {number}" if status == "en route"
+                              else f"{status} at call {number}", "time": time.time()}
+    print(f"call {number}: {callsign} is {status}", flush=True)
+
+
+def detach_from_call(callsign):
+    """A unit clearing comes off whatever call it was on."""
+    if not callsign:
+        return
+    for number, units in list(call_units.items()):
+        if units.pop(callsign, None) is not None:
+            print(f"call {number}: {callsign} cleared", flush=True)
+        if not units:
+            call_units.pop(number, None)
+
+
+def units_on_call(number):
+    units = call_units.get(number) or {}
+    now = time.time()
+    live = {cs: v for cs, v in units.items()
+            if now - float(v.get("at") or 0) <= CALL_ATTACH_EXPIRE}
+    if live:
+        call_units[number] = live
+    else:
+        call_units.pop(number, None)
+    return live
+
+
+def wants_call_units(text):
+    """'how many units are attached to that call', 'who is on that call'."""
+    low = _flat(text)
+    if "call" not in low:
+        return False
+    asking = any(w in low for w in ("how many", "who is", "whos", "who are", "what unit",
+                                    "which unit", "anyone else", "any units"))
+    about = any(w in low for w in ("attach", "assigned", "responding", "en route",
+                                   "on that call", "on the call", "on it", "working"))
+    return asking and about
+
+
+def read_call_units(callsign="", member=None, number=None):
+    ack = addr(callsign, member)
+    if number is None:
+        number = last_call.get("CallNumber") if isinstance(last_call, dict) else None
+    if number is None:
+        return f"{ack}there is no call to check."
+    live = units_on_call(number)
+    if not live:
+        return f"{ack}no units are attached to call number {number}."
+    word = "unit" if len(live) == 1 else "units"
+    bits = [f"{cs} {v['status']}" for cs, v in live.items()]
+    return (f"{ack}{num_words(len(live))} {word} attached to call number {number}, "
+            + ", ".join(bits[:4]) + ".")
+
+
 def mark_call_cleared(number):
     if number is None:
         return False
     cleared_calls.add(number)
     open_calls.pop(number, None)
+    call_units.pop(number, None)
     return True
 
 
@@ -2217,6 +2289,7 @@ def _state_snapshot():
         "manual_tracks": dict(manual_tracks),
         "air_manual_until": air_manual_until,
         "human_dispatch": dict(human_dispatch),
+        "call_units": {str(k): v for k, v in call_units.items()},
         "code_board": dict(code_board),
         "globals_cleared": globals_cleared,
         "saved_at": time.time(),
@@ -2301,6 +2374,9 @@ async def load_state():
         manual_tracks.update({k: v for k, v in (st.get("manual_tracks") or {}).items() if isinstance(v, dict)})
         air_manual_until = float(st.get("air_manual_until") or 0)
         globals()["globals_cleared"] = bool(st.get("globals_cleared"))
+        for k, v in (st.get("call_units") or {}).items():
+            if str(k).lstrip("-").isdigit() and isinstance(v, dict):
+                call_units[int(k)] = v
         cb = st.get("code_board")
         if isinstance(cb, dict) and cb.get("message_id"):
             code_board.clear()
@@ -4368,6 +4444,13 @@ async def process_transmission(member, text, followup_only=False):
             ack = addr(callsign, member)
             await announce(f"{ack}dispatch has no active calls to repeat at this time.", title="Repeat")
         return
+    # Asked before the roster on purpose: "how many units are attached to that
+    # call" also reads as "how many units", and answering with a headcount of
+    # everyone on patrol is not what was asked.
+    if wants_call_units(text):
+        await announce(read_call_units(callsign, member, extract_call_number(text)),
+                       title="Call Units")
+        return
     if wants_roster(text):
         await announce(await read_roster(callsign, member), title="Roster")
         return
@@ -4434,12 +4517,25 @@ async def process_transmission(member, text, followup_only=False):
     if clearing and member.id in active_stops:
         await clear_traffic_stop(member, callsign)
         if callsign:
+            detach_from_call(callsign)
             status_board[callsign] = {"status": "10-8, in service", "time": time.time()}
         return
     if status:
         if callsign:
-            status_board[callsign] = {"status": status, "time": time.time()}
-            print(f"status board: {callsign} -> {status}", flush=True)
+            # Responding to, attaching to or arriving at a call puts the unit ON
+            # that call, and the board says which one. Anything else is just a
+            # status.
+            number = extract_call_number(text)
+            if number is None and isinstance(last_call, dict):
+                number = last_call.get("CallNumber")
+            on_call = status in ("en route", "on a call", "on scene") and number is not None
+            if on_call:
+                attach_to_call(number, callsign, "on scene" if status == "on scene" else "en route")
+            else:
+                if status.startswith("10-8") or "available" in status or "clear" in status:
+                    detach_from_call(callsign)
+                status_board[callsign] = {"status": status, "time": time.time()}
+                print(f"status board: {callsign} -> {status}", flush=True)
         if "traffic stop" in status and not clearing:
             await start_traffic_stop(member, callsign)
     if not status and not normalize_intent(text, callsign):
