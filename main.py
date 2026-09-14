@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "pm-6"
+BUILD = "pm-7"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -147,11 +147,20 @@ CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sh
 LOG_HEARD = os.environ.get("LOG_HEARD", "0").lower() not in ("0", "false", "no", "off")
 LINK_FILE = os.environ.get("LINK_FILE", "callsign_links.json")
 CALL_CLEARED = os.environ.get("CALL_CLEARED", "1").lower() not in ("0", "false", "no", "off")
-# Tell the player who made a call, in game, when a unit goes en route to it.
-# From the caller's side a call vanishes into nothing: they press the button and
-# stand there with no way of knowing whether anybody took it. One message when
-# somebody actually starts rolling answers that. PM_EN_ROUTE=0 turns it off.
-PM_EN_ROUTE = os.environ.get("PM_EN_ROUTE", "1").lower() not in ("0", "false", "no", "off")
+# Tell the player who made a call, or who asked for a supervisor, in game when a
+# unit goes en route to them.
+#
+# OFF, and not because it does not work. ER:LC runs a command such as ":pm" only
+# for a source the server owner has put on a trusted list, and the address this
+# bot sends from changes every time the service redeploys, so a trusted entry
+# stops being true within the day. Reading the server needs no such thing, which
+# is why every other feature is unaffected.
+#
+# What would let this be turned back on is a registered public application,
+# which customers authorize by link and which does not care what address the bot
+# sends from. Until that exists it stays off rather than failing quietly in the
+# background and making the logs look broken.
+PM_EN_ROUTE = os.environ.get("PM_EN_ROUTE", "0").lower() not in ("0", "false", "no", "off")
 # Normally a unit does not answer its own request for help: telling 1S-032 that
 # 1S-032 is on the way to it is nonsense, and on a real shift it is always
 # somebody else going. PM_ALLOW_SELF=1 lets it through anyway, which is the only
@@ -1005,6 +1014,11 @@ async def erlc_get(path):
 
 _egress_ip = ""
 _said_not_trusted = False
+# Set once ER:LC has refused a command as untrusted. Everything that sends one
+# checks it first. Without this the traffic-stop status check re-sends every
+# minute for the life of the shift, burning rate limit and filling the log with
+# the same refusal, which is what it has been doing.
+commands_refused = False
 
 
 async def outbound_ip():
@@ -1036,23 +1050,31 @@ async def explain_not_trusted():
     source, and the raw reply says nothing about which address to trust. A
     reader who has to work that out from a JSON blob usually concludes the
     feature is broken."""
-    global _said_not_trusted
+    global _said_not_trusted, commands_refused
+    commands_refused = True
     if _said_not_trusted:
         return
     _said_not_trusted = True
     ip = await outbound_ip()
     print("erlc REFUSED the command: this bot is not a trusted source on that "
           "private server, so ER:LC will not run commands for it. Reading the "
-          "server is unaffected and keeps working.\n"
-          f"    Fix: sign in at https://api.erlc.gg/server-owners, open your "
-          f"server's Settings tab, and add this address to the trusted list:\n"
-          f"        {ip or 'could not determine this bot outbound address'}\n"
-          "    Note this address can change when the bot redeploys. The lasting "
-          "fix is a registered public application, which customers authorize by "
-          "link instead.", flush=True)
+          "server is unaffected and every other feature keeps working. No "
+          "further commands will be attempted this run.\n"
+          f"    This bot is currently sending from {ip or 'an address it could not determine'}, "
+          f"which a server owner can trust under Settings at "
+          f"https://api.erlc.gg/server-owners. Note that address changes every "
+          f"time the service redeploys, so trusting it does not hold for long.\n"
+          "    The lasting fix is a registered public application, which "
+          "customers authorize by link and which does not depend on an address.",
+          flush=True)
 
 
 async def erlc_command(command):
+    # Asking again after being told this bot is not trusted gets the same answer
+    # every time. The answer does not change until a server owner changes it,
+    # and this process will not find out mid-run.
+    if commands_refused:
+        return False
     try:
         async with http.post(f"{ERLC_V2_BASE}/server/command",
                              headers={"Server-Key": ERLC_KEY},
@@ -6755,18 +6777,15 @@ async def start_webhook_server():
               f"service has NO PUBLIC URL, so the game cannot reach it and nothing will "
               f"ever arrive. Generate a domain for this service, then paste it with "
               f"{WEBHOOK_PATH} on the end into the Event Webhook box.", flush=True)
+    if PM_EN_ROUTE:
+        print("in-game messages to players: ON. These need this bot to be a "
+              "trusted source on the private server, and the address it sends "
+              "from changes on every redeploy, so expect them to be refused "
+              "until a public application is registered.", flush=True)
     if PM_ALLOW_SELF:
         print("PM_ALLOW_SELF is ON: a unit can answer its own request for help. "
               "This exists for testing with nobody else in the server. Turn it off "
               "before anybody uses this for real.", flush=True)
-    # Said at boot rather than only after a command is refused, because the
-    # address is what the server owner needs and hunting for it is the part
-    # that makes this look broken.
-    ip = await outbound_ip()
-    print(f"outbound address: {ip or 'unknown'}. ER:LC only runs commands such as "
-          f":pm for a source the server owner has trusted. Add this under Settings "
-          f"for the server at https://api.erlc.gg/server-owners if messages to "
-          f"players are coming back refused.", flush=True)
 
 
 async def _supervise(name, factory):
