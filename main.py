@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "info-1"
+BUILD = "agency-1"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -140,7 +140,94 @@ SUSPECT_RADIUS = float(os.environ.get("SUSPECT_RADIUS", "60"))
 PURSUIT_END_SPEED = float(os.environ.get("PURSUIT_END_SPEED", "10"))
 PURSUIT_END_SECONDS = float(os.environ.get("PURSUIT_END_SECONDS", "8"))
 PURSUIT_CALLOUT_SECONDS = float(os.environ.get("PURSUIT_CALLOUT_SECONDS", "25"))
-CALL_TEAMS = [t.strip().lower() for t in os.environ.get("CALL_TEAMS", "police,sheriff").split(",") if t.strip()]
+# ------------------------------------------------------------------ agencies
+#
+# One codebase, three desks. A fire dispatcher is not a police dispatcher with
+# different words: it takes different calls, sends different units, and has no
+# business running a plate. AGENCY picks which desk this process is, and every
+# difference between them lives in the table below rather than scattered
+# through the file.
+#
+# They are separate bots on purpose. Discord allows one voice connection per
+# server per bot, so a single process could not sit in a police channel and a
+# fire channel at the same time.
+AGENCY = (os.environ.get("AGENCY", "pd").strip().lower() or "pd")
+
+AGENCIES = {
+    "pd": {
+        "name": "Dispatch",
+        "label": "police",
+        "teams": ("police", "sheriff"),
+        # Whether this desk runs plates and names, works traffic stops, and
+        # calls pursuits. All of it is police work.
+        "lookups": True,
+        "stops": True,
+        "pursuits": True,
+    },
+    "fd": {
+        "name": "Fire Dispatch",
+        "label": "fire",
+        "teams": ("fire", "ems", "medic", "medical"),
+        "lookups": False,
+        "stops": False,
+        "pursuits": False,
+    },
+    "dot": {
+        "name": "DOT Dispatch",
+        "label": "DOT",
+        "teams": ("dot", "transport", "transportation", "highway"),
+        "lookups": False,
+        "stops": False,
+        "pursuits": False,
+    },
+}
+if AGENCY not in AGENCIES:
+    print(f"unknown AGENCY {AGENCY!r}, running as police dispatch", flush=True)
+    AGENCY = "pd"
+AGENCY_INFO = AGENCIES[AGENCY]
+AGENCY_NAME = AGENCY_INFO["name"]
+# What a desk will and will not do. A fire dispatcher asked to run a plate says
+# so rather than inventing a return, and never marks anybody out on a stop.
+DOES_LOOKUPS = AGENCY_INFO["lookups"]
+DOES_STOPS = AGENCY_INFO["stops"]
+DOES_PURSUITS = AGENCY_INFO["pursuits"]
+
+# Who sends what. A unit asking for an ambulance is asking the fire desk, not
+# this one, wherever it was said. Anything absent is sent by whoever was asked,
+# which is what "supervisor" has to be: every agency has its own.
+RESOURCE_AGENCY = {
+    "ambulance": "fd", "ems": "fd", "ra": "fd", "medic": "fd", "medics": "fd",
+    "paramedic": "fd", "paramedics": "fd", "rescue": "fd", "engine": "fd",
+    "ladder": "fd", "fire": "fd", "fire truck": "fd", "fire department": "fd",
+    "battalion": "fd", "bus": "fd", "squad": "fd", "life flight": "fd",
+    "airlift": "fd", "air ambulance": "fd", "coroner": "fd", "medical": "fd",
+    "tow": "dot", "tow truck": "dot", "wrecker": "dot", "flatbed": "dot",
+    "recovery": "dot", "road crew": "dot", "plow": "dot", "snow plow": "dot",
+    "barriers": "dot", "cones": "dot", "road closure": "dot", "dot": "dot",
+    "highway": "dot", "traffic control": "dot", "street sweeper": "dot",
+    "police": "pd", "pd": "pd", "police department": "pd", "law enforcement": "pd",
+    "officer": "pd", "k9": "pd", "canine": "pd", "swat": "pd", "detective": "pd",
+    "air unit": "pd", "helicopter": "pd", "chopper": "pd", "traffic unit": "pd",
+}
+
+
+def agency_for_resource(thing):
+    """Which desk sends this, or "" when it is whoever was asked.
+
+    Matched on the longest name first so "air ambulance" is not read as the
+    police air unit, and "fire truck" is not read as a fire."""
+    low = _flat(str(thing or "")).strip()
+    if not low:
+        return ""
+    for name in sorted(RESOURCE_AGENCY, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(name) + r"\b", low):
+            return RESOURCE_AGENCY[name]
+    return ""
+
+
+CALL_TEAMS = [t.strip().lower() for t in
+              os.environ.get("CALL_TEAMS", ",".join(AGENCY_INFO["teams"])).split(",")
+              if t.strip()]
 # Off by default. This prints a transcript of everything said in the voice
 # channel, which is a private conversation ending up in a deploy log that gets
 # copied around. Set LOG_HEARD=1 to turn it on while chasing a problem.
@@ -2267,9 +2354,88 @@ async def ping_supervisors(who, where, thing="a supervisor"):
         print(f"assistance ping failed: {exc}", flush=True)
 
 
+# ------------------------------------------------------------------- relay
+#
+# The three desks are separate bots, so they are separate processes with no way
+# to speak to each other directly. Anything one desk needs another to send goes
+# through the dashboard, which is the one thing all three already share.
+
+RELAY_POLL = float(os.environ.get("RELAY_POLL_SECONDS", "3"))
+
+
+async def relay_call(payload):
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and WORKER_TOKEN and BOT_ORDER_ID and http):
+        return None
+    guild = dispatch_guild()
+    if guild is None:
+        return None
+    body = {"botId": BOT_ORDER_ID, "workerToken": WORKER_TOKEN,
+            "guildId": str(guild.id), **payload}
+    headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+               "Content-Type": "application/json"}
+    try:
+        async with http.post(f"{SUPABASE_URL}/functions/v1/dispatch-relay",
+                             headers=headers, json=body) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                print(f"relay {payload.get('action')} HTTP {resp.status}: {raw[:160]}", flush=True)
+                return None
+            return json.loads(raw)
+    except Exception as exc:
+        print(f"relay {payload.get('action')} failed: {exc}", flush=True)
+        return None
+
+
+async def relay_send(to_agency, body, callsign="", place=""):
+    """Hand a request to another desk. True when there was a desk to hand it to.
+
+    False is not a failure to report as one: most communities run police
+    dispatch alone, and a unit asking them for a tow should hear it go out on
+    their own channel rather than be told a department that does not exist has
+    been notified."""
+    out = await relay_call({"action": "send", "fromAgency": AGENCY,
+                            "toAgency": to_agency, "body": body,
+                            "callsign": callsign, "place": place})
+    if not out:
+        return False
+    return bool(out.get("heard"))
+
+
+async def relay_poll():
+    """Whatever another desk has asked this one to send."""
+    out = await relay_call({"action": "poll", "agency": AGENCY})
+    return (out or {}).get("messages") or []
+
+
+async def relay_loop():
+    """Air whatever the other desks have asked this one to send.
+
+    A plain loop rather than a tasks.loop, because this bot is a discord.Client
+    and the rest of its periodic work is written the same way."""
+    await client.wait_until_ready()
+    print(f"relay: listening for the other desks every {RELAY_POLL:g}s", flush=True)
+    while not client.is_closed():
+        try:
+            for msg in await relay_poll():
+                body = str(msg.get("body") or "").strip()
+                if not body:
+                    continue
+                origin = AGENCIES.get(str(msg.get("from_agency") or ""), {}).get(
+                    "label", "another desk")
+                print(f"relay: {origin} dispatch asked for {body[:70]!r}", flush=True)
+                await announce(body, title="Request From Another Desk", urgent=True)
+        except Exception as exc:
+            print(f"relay loop error (continuing): {exc}", flush=True)
+        await asyncio.sleep(RELAY_POLL)
+
+
 async def request_supervisor(member, callsign, what="", game_name=""):
     """Air it, and ping the role. The same whether it was said on the radio or
-    typed in game."""
+    typed in game.
+
+    When the thing being asked for belongs to another desk, this hands it over
+    instead of putting it on a channel that cannot send it. A police unit
+    asking for an ambulance is asking the fire desk, wherever they said it."""
     cs = callsign or member_callsign(member)
     # "Unit 1S-32" reads right. "Unit 22HYPE22" does not, so the word only goes
     # in front of something shaped like a callsign.
@@ -2279,6 +2445,27 @@ async def request_supervisor(member, callsign, what="", game_name=""):
     thing = what or "a supervisor"
     where, pos = await unit_place(member, cs)
     closest = await nearest_other_unit(pos, cs)
+    # Whose job is this? Absent from the table means whoever was asked, which
+    # is what a supervisor has to be: every agency has its own.
+    sends = agency_for_resource(thing)
+    if sends and sends != AGENCY:
+        other = AGENCIES[sends]["label"]
+        line = (f"{AGENCY_INFO['label'].title()} dispatch is requesting "
+                f"{_with_article(thing)} for {who}{where}.")
+        heard = await relay_send(sends, line, callsign=cs, place=where.strip(" ,"))
+        if heard:
+            await announce(f"{who}, copy your request for {_with_article(thing)}. "
+                           f"{other.title()} dispatch has been notified.",
+                           title="Passed On", urgent=True)
+            print(f"{thing} for {who} handed to the {other} desk", flush=True)
+            if cs:
+                help_requests[norm_callsign(cs)] = {"callsign": cs, "name": game_name,
+                                                    "thing": thing, "at": time.time()}
+            return
+        # Nobody on the other end. Most communities run one desk, so it goes out
+        # here rather than being quietly dropped or answered with a department
+        # that does not exist.
+        print(f"no {other} desk in this server, airing {thing} here", flush=True)
     tail = (f"{closest}, you are the closest unit."
             if closest else f"Any {thing} available, respond.")
     await announce(f"All units, {who} is requesting {_with_article(thing)}{where}. {tail}",
@@ -6434,6 +6621,7 @@ async def on_ready():
                        ("identity_watch_loop", identity_watch_loop),
                        ("state_save_loop", state_save_loop),
                        ("lookup_nudge_loop", lookup_nudge_loop),
+                       ("relay_loop", relay_loop),
                        ("pursuit_track_loop", pursuit_track_loop)):
         client.loop.create_task(_supervise(_name, _fn))
 
