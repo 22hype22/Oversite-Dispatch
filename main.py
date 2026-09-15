@@ -7,6 +7,7 @@ import wave
 import time
 import random
 import asyncio
+import contextvars
 import traceback
 import signal
 from array import array
@@ -256,8 +257,9 @@ PM_ALLOW_SELF = os.environ.get("PM_ALLOW_SELF", "0").lower() not in ("0", "false
 BOLO_EXPIRE = int(os.environ.get("BOLO_EXPIRE", "3600"))
 # How long dispatch waits after a transmission that stopped mid-thought before
 # deciding the unit is done, so a stumble is never answered as if it were the
-# whole message.
-HOLD_SECONDS = float(os.environ.get("DISPATCH_HOLD_SECONDS", "3.0"))
+# whole message. A unit picking up where it left off does so inside two
+# seconds; three was a pause everyone heard on nearly a fifth of transmissions.
+HOLD_SECONDS = float(os.environ.get("DISPATCH_HOLD_SECONDS", "2.0"))
 # After "go ahead with that plate", the next transmission from that unit within
 # this many seconds is the plate (or the name).
 LOOKUP_WINDOW = float(os.environ.get("DISPATCH_LOOKUP_WINDOW", "45"))
@@ -309,6 +311,13 @@ _play_seq = 0         # keeps equal priorities in the order they were spoken
 _tx_seq = 0           # one id per transmission, so its tone and beep stay with it
 _interrupted = set()  # transmissions cut off; whatever is left of them is dead
 _now_playing = {"tx": None, "prio": PRIO_ROUTINE}
+# Where the seconds go between a unit unkeying and dispatch answering. The
+# clock starts when the unit stops talking and rides the task that handles
+# that transmission; each stage stamps it, and the playback worker reports the
+# whole thing once the reply is actually on the air. One line per reply, on by
+# default, because "it waits a good bit" is only fixable with the number.
+_reply_clock = contextvars.ContextVar("_reply_clock", default=None)
+_tx_timing = {}       # transmission id -> its clock, handed from announce to playback
 seen_keys = set()
 boot_time = time.time()
 commands_synced = False
@@ -1265,11 +1274,48 @@ async def queue_audio(path, tone=False, urgent=False):
     parts.append(path)
     if ROGER_BEEP and roger_path:
         parts.append(roger_path)
+    clock = _reply_clock.get()
+    if clock is not None and "ready" not in clock:
+        clock["ready"] = time.monotonic()
+        _tx_timing[tx] = clock
+        if len(_tx_timing) > 50:
+            for old in sorted(_tx_timing)[:25]:
+                _tx_timing.pop(old, None)
     for part in parts:
         _play_seq += 1
         await play_queue.put((prio, _play_seq, part, tx))
     if urgent:
         cut_in()
+
+
+def _stamp(stage):
+    """Mark a stage on the clock of the transmission being handled, if any."""
+    clock = _reply_clock.get()
+    if clock is not None and stage not in clock:
+        clock[stage] = time.monotonic()
+
+
+def _report_latency(tx):
+    clock = _tx_timing.pop(tx, None)
+    if not clock or "stop" not in clock:
+        return
+    now = time.monotonic()
+    stop = clock["stop"]
+    heard = clock.get("heard")
+    asked = clock.get("asked")
+    ready = clock.get("ready")
+    parts = []
+    if heard:
+        parts.append(f"transcript {heard - stop:.1f}s")
+    if heard and asked:
+        parts.append(f"reply {asked - heard:.1f}s")
+    if asked and ready:
+        parts.append(f"voice {ready - asked:.1f}s")
+    if ready:
+        parts.append(f"queue and air {now - ready:.1f}s")
+    if clock.get("held"):
+        parts.append(f"held {clock['held']:.1f}s as unfinished")
+    print(f"[Latency] on air {now - stop:.1f}s after the unit stopped talking: {', '.join(parts)}", flush=True)
 
 
 def cut_in():
@@ -1313,8 +1359,13 @@ async def announce(text, title="911 Call", tone=False, urgent=None, force=False)
     if muted:
         await _log()
         return
-    # The text log and the voice are produced at the same time.
-    path, _ = await asyncio.gather(synthesize(text), _log())
+    _stamp("asked")
+    # The text log is written in the background. Discord allows a channel five
+    # messages in five seconds, and past that the send quietly sleeps until the
+    # window resets; awaited alongside the voice, that sleep held the reply off
+    # the air. The voice never waits for the log now.
+    asyncio.ensure_future(_log())
+    path = await synthesize(text)
     if path:
         hot = bool(tone) if urgent is None else bool(urgent)
         await queue_audio(path, tone=tone, urgent=hot)
@@ -4425,6 +4476,7 @@ _held = {}            # member id -> {"text", "at", "task"}: a transmission that
 _pending_lookup = {}  # member id -> {"kind", "callsign", "at"}: waiting for the plate or the name
 _lookup_buf = {}      # member id -> letters collected so far while they spell one out
 _speaking_now = set()
+_on_air_names = {}    # member id -> display name, for saying who the air was held for
 # A real person has taken the dispatch seat. While this is set the bot keeps
 # listening and keeps writing the text log, so whoever is dispatching can read
 # the calls, but it does not key up. Empty means the bot has the seat.
@@ -5541,12 +5593,13 @@ async def collect_lookup(member, pend, text):
         return
 
     async def _later():
-        waited = 0.0
-        while True:
-            await asyncio.sleep(LOOKUP_HOLD)
-            waited += LOOKUP_HOLD
-            if uid not in _speaking_now or waited >= 20:
-                break
+        # One full hold, then only as long as the unit is still keyed up,
+        # checked often so the answer follows their last letter closely.
+        await asyncio.sleep(LOOKUP_HOLD)
+        waited = LOOKUP_HOLD
+        while uid in _speaking_now and waited < 20:
+            await asyncio.sleep(0.25)
+            waited += 0.25
         await run_buffered_lookup(member)
 
     buf["task"] = asyncio.ensure_future(_later())
@@ -5556,6 +5609,8 @@ async def collect_lookup(member, pend, text):
 async def handle_utterance(member, pcm):
     uid = getattr(member, "id", 0)
     now = time.time()
+    # The clock starts here: this runs the moment the unit stops talking.
+    _reply_clock.set({"stop": time.monotonic()})
     # Dispatch just asked this unit for a plate or a name, so it is listening
     # for a short answer. A plate read straight back — "LEB011" — is well under
     # the normal minimum and used to be thrown away before it was even
@@ -5571,6 +5626,7 @@ async def handle_utterance(member, pcm):
         except Exception:
             pass
     text = await transcribe(pcm_to_wav(pcm))
+    _stamp("heard")
     if not text or not has_real_words(text):
         return
     text = clean_transcript(text)
@@ -5629,12 +5685,17 @@ async def handle_utterance(member, pcm):
         # or pick up where they were. If they never do, the fragment is used
         # only when dispatch can act on it, otherwise it is dropped quietly.
         async def _later():
-            waited = 0.0
-            while True:
-                await asyncio.sleep(HOLD_SECONDS)
-                waited += HOLD_SECONDS
-                if uid not in _speaking_now or waited >= 15:
-                    break
+            # One full hold, then only while the unit is still keyed up. The
+            # old loop slept another whole hold whenever it found them
+            # talking, so a reply could sit for six seconds.
+            await asyncio.sleep(HOLD_SECONDS)
+            waited = HOLD_SECONDS
+            while uid in _speaking_now and waited < 15:
+                await asyncio.sleep(0.25)
+                waited += 0.25
+            clock = _reply_clock.get()
+            if clock is not None:
+                clock["held"] = waited
             h = _held.pop(uid, None)
             if h and has_intent(h["text"]):
                 await process_transmission(member, h["text"], followup_only=followup)
@@ -6008,6 +6069,7 @@ if VOICE_RECV_AVAILABLE:
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_start(self, member):
             _speaking_now.add(member.id)
+            _on_air_names[member.id] = getattr(member, "display_name", "") or str(member.id)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_stop(self, member):
@@ -6020,6 +6082,10 @@ if VOICE_RECV_AVAILABLE:
         def cleanup(self):
             self.buffers.clear()
             self.decoders.clear()
+            # Whoever was mid-transmission when this sink died never gets a
+            # stop event from it. Left in the set they would keep every reply
+            # waiting for clear air until they happened to speak again.
+            _speaking_now.clear()
 
 
 def start_listening():
@@ -6027,6 +6093,7 @@ def start_listening():
         return
     try:
         if isinstance(voice_client, voice_recv.VoiceRecvClient) and not voice_client.is_listening():
+            _speaking_now.clear()
             voice_client.listen(ListenSink(client.loop))
             print("voice commands active — say 'repeat the last call' in the VC", flush=True)
     except Exception as exc:
@@ -6071,15 +6138,20 @@ def voice_filter():
 
 
 async def wait_for_clear_air(limit=None):
-    """Hold while any unit is transmitting, then leave a beat before keying up."""
+    """Hold while any unit is transmitting, then leave a beat before keying up.
+    Returns how long it held and who it held for, so the log can say whether
+    the air was really busy or the set was stale."""
     limit = AIR_WAIT if limit is None else limit
     waited = 0.0
+    seen = set()
     while _speaking_now and waited < limit:
-        await asyncio.sleep(0.15)
-        waited += 0.15
+        seen.update(_speaking_now)
+        await asyncio.sleep(0.05)
+        waited += 0.05
     if waited:
-        await asyncio.sleep(0.25)
-    return waited
+        await asyncio.sleep(0.15)
+    who = ", ".join(_on_air_names.get(u, str(u)) for u in seen)
+    return waited, who
 
 
 async def playback_worker():
@@ -6093,9 +6165,9 @@ async def playback_worker():
                 # The courtesy beep is the tail of a transmission already on
                 # the air, so it never waits. Urgent traffic barely waits.
                 if path != roger_path:
-                    held = await wait_for_clear_air(1.5 if prio == PRIO_URGENT else None)
+                    held, who = await wait_for_clear_air(1.5 if prio == PRIO_URGENT else None)
                     if held:
-                        print(f"held transmission {held:.1f}s for a unit on the air", flush=True)
+                        print(f"held transmission {held:.1f}s for a unit on the air ({who})", flush=True)
                 _now_playing.update({"tx": tx, "prio": prio})
                 if voice_client.is_playing():
                     stopper = getattr(voice_client, "stop_playing", voice_client.stop)
@@ -6109,6 +6181,7 @@ async def playback_worker():
                 source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
+                _report_latency(tx)
                 await done.wait()
                 print("finished playing", flush=True)
                 # Dead air after the end of a transmission, not between the
