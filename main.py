@@ -7318,7 +7318,7 @@ def info_version():
     return f"{BUILD} {sha[:7]}" if sha else BUILD
 
 
-def info_embed(me=None):
+def info_card_embed(me=None):
     embed = discord.Embed(title=INFO_NAME, description=INFO_WHAT, color=INFO_COLOR)
     # Concatenated rather than an f-string: the newline would be a backslash
     # inside one, which the Python one of these bots runs on rejects.
@@ -7347,7 +7347,7 @@ def info_embed(me=None):
 async def info_command(interaction):
     try:
         await interaction.response.send_message(
-            embed=info_embed(getattr(interaction.client, "user", None)))
+            embed=info_card_embed(getattr(interaction.client, "user", None)))
     except Exception as exc:
         print(f"/info failed: {exc}", flush=True)
 
