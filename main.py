@@ -2205,6 +2205,53 @@ def _addressing_dispatch(low):
     return False
 
 
+# Dispatch answers a transmission that opens the way radio traffic does:
+# "Dispatch, 471, ..." or "471 to dispatch, ...". The wake word first and a unit
+# named. Anything else on the channel is units talking to each other, and
+# the older rule, which answered any mention of the word that did not read as
+# talking about dispatch, had the bot cutting into conversations. Off puts
+# that older rule back.
+STRICT_ADDRESS = os.environ.get("DISPATCH_STRICT_ADDRESS", "1").lower() not in ("0", "false", "no", "off")
+# What a unit says before it gets to the point: skipped, up to two of them.
+_LEAD_FILLERS = frozenset((
+    "uh", "um", "uhh", "umm", "er", "ah", "oh", "hey", "hi", "hello", "okay", "ok",
+    "yeah", "yes", "yep", "alright", "so", "and", "well",
+))
+# What sits between the wake word and the unit: "dispatch from 471",
+# "dispatch, this is 471", "dispatch, unit 471".
+_AFTER_DISPATCH = ("from", "this", "is", "its", "unit", "units", "here")
+
+
+def opens_with_dispatch(text):
+    """Whether the transmission opens with the wake word and names a unit.
+
+    "Dispatch, 471, ..." and "471 to dispatch, ..." both do, with a filler or
+    two allowed in front. A mention of dispatch anywhere else in a sentence is
+    a unit talking about dispatch, not to it."""
+    low = _flat(text)
+    words = re.findall(r"[a-z0-9'-]+", low)
+    skipped = 0
+    while words and skipped < 2 and words[0] in _LEAD_FILLERS:
+        words.pop(0)
+        skipped += 1
+    if not words:
+        return False
+    if words[0].startswith("dispatch"):
+        return bool(extract_callsign(text))
+    # "471 to dispatch": only unit tokens and a connector may come first.
+    for j in range(1, min(len(words), 8)):
+        if not words[j].startswith("dispatch"):
+            continue
+        head = words[:j]
+        while head and head[-1] in _TO_DISPATCH:
+            head.pop()
+        if not head or not all(is_callsign_token(w) for w in head):
+            return False
+        before = " ".join(words[:j])
+        return bool(callsign_before(before, len(before)))
+    return False
+
+
 def is_for_dispatch(text):
     """Whether this transmission is talking to dispatch.
 
@@ -2212,12 +2259,14 @@ def is_for_dispatch(text):
     already cleared us" and "I will let dispatch know" to each other all shift,
     and dispatch answering those is the bot butting into a conversation.
 
-    Leans towards answering when it is unsure. Missing a unit that genuinely
-    called is far worse on the air than one reply nobody wanted, so only the
-    unmistakable mentions are passed over."""
+    Strict, the transmission has to open with the wake word and a unit. The
+    older rule leaned towards answering whenever it was unsure, and units
+    trying to hold a conversation were being interrupted for it."""
     low = _flat(text)
     if "dispatch" not in low:
         return False
+    if STRICT_ADDRESS:
+        return opens_with_dispatch(text)
     return _addressing_dispatch(low)
 
 
@@ -2313,6 +2362,9 @@ def extract_callsign(text):
         return ""
     rest = text[match.end():].strip(" ,.-")
     tokens = re.split(r"\s+", rest)
+    # "dispatch from 471", "dispatch, this is 471", "dispatch, unit 471".
+    while tokens and tokens[0].lower().strip(",.-") in _AFTER_DISPATCH:
+        tokens.pop(0)
     parts = []
     for tok in tokens:
         low = tok.lower().strip(",.-")
@@ -2473,6 +2525,35 @@ def detect_status(text):
         if phrase in low:
             return label
     return None
+
+
+# A call has just gone out and a unit is taking it. That is an answer to
+# dispatch, not a conversation, so it does not need the wake word: for this
+# long after the call is put out, a transmission that says the unit is going
+# is taken as is.
+CALL_RESPONSE_WINDOW = float(os.environ.get("CALL_RESPONSE_WINDOW_SECONDS", "45"))
+_TAKING_CALL = re.compile(
+    r"\b(?:responding|en ?route|10-?76|ten seventy ?six"
+    r"|(?:i|we)(?:ll| will) take (?:that|this|it|the call)"
+    r"|(?:i|we) got (?:that|this|it)"
+    r"|show (?:me|us) (?:responding|en ?route|attached|10-?76|on (?:that|this|the) call)"
+    r"|attach(?:ing)? (?:me|us)"
+    r"|copy (?:that|this|the) call"
+    r"|tak(?:e|ing) (?:that|this|the) call)\b")
+
+
+def answering_a_call(text):
+    """Whether this is a unit taking the call dispatch just put out.
+
+    Only while the call is fresh, and only a transmission that says the unit
+    is going. A question about who is going, or anything that reads as one,
+    is somebody else's conversation."""
+    if not last_call_at or time.time() - last_call_at > CALL_RESPONSE_WINDOW:
+        return False
+    low = _flat(text)
+    if _NOT_MY_STATUS.search(low) or low.strip().endswith("?"):
+        return False
+    return bool(_TAKING_CALL.search(low))
 
 
 def wants_status_board(text):
@@ -5159,13 +5240,17 @@ def bolo_matches(needle):
 
 
 SUBJECT_WINDOW = float(os.environ.get("SUBJECT_WINDOW", "420"))  # 7 minutes
-# Dispatch has just read somebody back to this unit. For a short while after
-# that, a question about them is obviously still aimed at dispatch, so it does
-# not have to be prefixed with the wake word all over again.
-OPEN_MIC = float(os.environ.get("OPEN_MIC_SECONDS", "60"))
+# Dispatch has just read somebody back to this unit. For a while after that a
+# question about them used to be taken without the wake word. Off by default
+# now: a minute of every question about a plate being answered is a minute of
+# dispatch cutting into the conversation the unit was actually having. A
+# number of seconds here turns it back on.
+OPEN_MIC = float(os.environ.get("OPEN_MIC_SECONDS", "0"))
 # Dispatch has told a unit to go ahead, or to stand by. Whatever that unit says
-# next is the traffic dispatch is waiting for, wake word or not.
-HAIL_WINDOW = float(os.environ.get("HAIL_WINDOW_SECONDS", "45"))
+# next is the traffic dispatch is waiting for, wake word or not. Kept short:
+# a unit that hailed and then got talking to somebody else should not have
+# dispatch answer the second thing it said.
+HAIL_WINDOW = float(os.environ.get("HAIL_WINDOW_SECONDS", "20"))
 
 
 def just_hailing(text):
@@ -5179,7 +5264,8 @@ def just_hailing(text):
         return False
     words = re.findall(r"[a-z0-9'-]+", low)
     rest = [w for w in words
-            if w != "dispatch" and w not in _TO_DISPATCH and not is_callsign_token(w)]
+            if w != "dispatch" and w not in _TO_DISPATCH and w not in _AFTER_DISPATCH
+            and not is_callsign_token(w)]
     return not rest
 
 
@@ -5210,6 +5296,8 @@ def open_mic_for(member):
 
 
 def mic_is_open(uid):
+    if OPEN_MIC <= 0:
+        return False
     if _open_mic.get(uid, 0) > time.time():
         return True
     _open_mic.pop(uid, None)
@@ -5904,11 +5992,19 @@ async def handle_utterance(member, pcm, live=None):
             _hailed.pop(uid, None)
             if LOG_HEARD:
                 print(f"taking {who}'s traffic, dispatch told them to go ahead", flush=True)
+        elif answering_a_call(text):
+            # A call just went out and this unit is taking it. That is an
+            # answer to dispatch, wake word or not.
+            print(f"taking {who}'s response to the call that just went out: {text[:80]!r}", flush=True)
         elif mic_is_open(uid) and looks_like_followup(text):
             followup = True
             if LOG_HEARD:
                 print(f"open mic: taking {who}'s follow-up without the wake word", flush=True)
         else:
+            if "dispatch" in _flat(text):
+                # Worth a line: this is exactly the traffic the bot used to
+                # answer, and the log should show it being left alone.
+                print(f"not addressed to dispatch, left alone: {text[:80]!r}", flush=True)
             return
 
     if looks_unfinished(text) and not just_hailing(text) and not says_stand_by(text):
