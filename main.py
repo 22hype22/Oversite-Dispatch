@@ -67,7 +67,7 @@ for _cand in ("libopus.so.0", os.path.join(_HERE, "libopus.so.0"), "./libopus.so
 if not OPUS_OK:
     print("opus not loaded — voice commands will stay off", flush=True)
 
-BUILD = "agency-1"
+BUILD = "agency-2"
 _BOOT_T0 = time.time()
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1452,10 +1452,31 @@ def code_reference_for(region):
     return " ".join(lines)
 
 
+# What each desk is for, in the words the model needs to stay in its lane. The
+# police one reads as it always did; the others have to be told plainly what is
+# not theirs, or the model answers police traffic in a fire dispatcher's voice.
+AGENCY_BRIEF = {
+    "pd": "handling police and sheriff radio traffic",
+    "fd": ("handling fire and EMS radio traffic. You dispatch engines, ladders, "
+           "rescues and ambulances to fires, medical calls and crashes. You do "
+           "NOT run plates, names, warrants or records, you do not work traffic "
+           "stops, and you do not run pursuits: that is the police desk, and if "
+           "a unit asks for any of it, say it is a police matter and to raise "
+           "police dispatch"),
+    "dot": ("handling Department of Transportation radio traffic. You dispatch "
+            "tow trucks, wreckers, road crews and traffic control to disabled "
+            "vehicles, debris, hazards, crashes and road closures. You do NOT "
+            "run plates, names, warrants or records, you do not work traffic "
+            "stops, and you do not run pursuits: that is the police desk, and "
+            "if a unit asks for any of it, say it is a police matter and to "
+            "raise police dispatch"),
+}
+
+
 def build_dispatch_system(region):
     return (
-        f"You are Oversite Dispatch, a professional emergency dispatcher working in "
-        f"{region}, handling police and sheriff radio traffic. Talk exactly the way a "
+        f"You are {AGENCY_NAME}, a professional emergency dispatcher working in "
+        f"{region}, {AGENCY_BRIEF[AGENCY]}. Talk exactly the way a "
         f"real dispatcher in {region} talks: use the real radio codes, signals, "
         f"phonetic alphabet, and calm, clipped cadence that agencies there actually "
         f"use. Answer with exactly one short radio transmission.\n"
@@ -3625,7 +3646,10 @@ async def move_member(member, channel_id):
 
 async def start_traffic_stop(member, spoken_callsign=""):
     who = getattr(member, "display_name", "?")
-    if not TRAFFIC_STOP_RETURN:
+    # Traffic stops are police work. A fire or DOT unit saying it is out with a
+    # vehicle is not making one, and tracking it as one would put a stop on a
+    # board that has no business showing it.
+    if not DOES_STOPS or not TRAFFIC_STOP_RETURN:
         return
     link = callsign_links.get(member.id) or {}
     positions = await player_positions()
@@ -4486,7 +4510,22 @@ _PROMISE = re.compile(
 
 
 def lookup_request_kind(text):
-    """'run a plate' / 'have a name for you' / 'records check' -> which check."""
+    """Which check a unit is asking for, or "" when this desk does not run them.
+
+    Plates, names and records are police work. A fire or DOT dispatcher has no
+    access to any of it, and answering as though it did would mean inventing a
+    return, so the whole path is closed here rather than guarded at each of the
+    four places it is used."""
+    if not DOES_LOOKUPS:
+        return ""
+    return asked_for_lookup(text)
+
+
+def asked_for_lookup(text):
+    """'run a plate' / 'have a name for you' / 'records check' -> which check.
+
+    Ungated, so a desk that does not run them can still tell a unit that,
+    rather than going quiet or handing it to the model."""
     low = _flat(text)
     if _PLATE_REQ.search(low):
         return "plate"
@@ -5200,6 +5239,12 @@ async def pursuit_track_loop():
     unit asked dispatch to track someone, the suspect's road is checked every
     couple of seconds and every change of road is put out the moment it happens."""
     await client.wait_until_ready()
+    # Pursuits are police work. A fire or DOT desk has nobody chasing anyone,
+    # and a tracker running for it would be reporting on traffic that is not
+    # theirs to follow.
+    if not DOES_PURSUITS:
+        print("live suspect tracking: off, not police work at this desk", flush=True)
+        return
     print("live suspect tracking: ready (air unit up, or 'dispatch, track NAME')", flush=True)
     while not client.is_closed():
         pursuits = [(uid, st) for uid, st in active_stops.items() if st.get("pursuit")]
@@ -5817,6 +5862,13 @@ async def process_transmission(member, text, followup_only=False):
     if not status and not normalize_intent(text, callsign):
         ack = addr(callsign, member)
         await announce(f"{ack}you are unreadable, say again.", title="Say Again")
+        return
+    # A plate or a records check asked of a desk that cannot run one. Answered
+    # here rather than by the model, so it is the same sentence every time and
+    # never an invented return.
+    if not DOES_LOOKUPS and asked_for_lookup(text):
+        await announce(f"{addr(callsign, member)}that is a police check, "
+                       f"raise police dispatch for it.", title="Not This Desk")
         return
     body = await dispatch_reply_body(text, callsign)
     if body is IGNORE:
