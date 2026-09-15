@@ -3,6 +3,7 @@ import io
 import re
 import json
 import hashlib
+import base64
 import wave
 import time
 import random
@@ -1234,7 +1235,54 @@ async def erlc_command(command):
         return False
 
 
-async def synthesize(text):
+class StreamedAudio:
+    """A reply's audio on its way from ElevenLabs, playable before it has all
+    arrived.
+
+    The voice used to be downloaded whole, written to a file, and only then
+    handed to ffmpeg. The words now flow through a pipe: ffmpeg starts on the
+    first chunk while the rest is still being generated, which is most of a
+    second saved on a long read-out and a few tenths on a short one. The
+    writer end is fed from a thread so a transmission waiting for clear air
+    can fill the pipe without stalling the event loop."""
+
+    def __init__(self):
+        r, w = os.pipe()
+        self.reader = os.fdopen(r, "rb", buffering=0)
+        self._w = w
+        self.size = 0
+        self.ok = False
+        self.first = asyncio.Event()
+        self.pump = None
+
+    def write(self, chunk):
+        if self._w is None:
+            raise BrokenPipeError("audio closed before the words all arrived")
+        os.write(self._w, chunk)
+
+    def close_writer(self):
+        if self._w is not None:
+            try:
+                os.close(self._w)
+            except OSError:
+                pass
+            self._w = None
+
+    def close(self):
+        self.close_writer()
+        try:
+            self.reader.close()
+        except OSError:
+            pass
+
+    def source(self, options=None):
+        """The ffmpeg source for the play queue. The format is named so ffmpeg
+        does not sit on the first bytes working out what they are."""
+        return discord.FFmpegOpusAudio(self.reader, pipe=True, executable=FFMPEG_EXE,
+                                       before_options="-f mp3", options=options)
+
+
+async def _pump_tts(sa, text):
     url = (f"{XI_BASE}/text-to-speech/{VOICE_ID}/stream"
            f"?optimize_streaming_latency=3&output_format={XI_FORMAT}")
     payload = {
@@ -1244,21 +1292,52 @@ async def synthesize(text):
                            "style": XI_STYLE, "use_speaker_boost": True},
     }
     headers = {"xi-api-key": XI_KEY, "Content-Type": "application/json"}
+    loop = asyncio.get_running_loop()
     try:
         async with http.post(url, headers=headers, json=payload) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 print(f"elevenlabs error {resp.status}: {body[:200]}", flush=True)
-                return None
-            audio = await resp.read()
+                return
+            async for chunk in resp.content.iter_chunked(8192):
+                if not chunk:
+                    continue
+                await loop.run_in_executor(None, sa.write, chunk)
+                sa.size += len(chunk)
+                if not sa.first.is_set():
+                    sa.ok = True
+                    sa.first.set()
+        print(f"synthesized {sa.size} bytes of audio", flush=True)
+    except BrokenPipeError:
+        pass   # playback was stopped; the rest of the words are not wanted
     except Exception as exc:
         print(f"elevenlabs request failed: {exc}", flush=True)
+    finally:
+        sa.close_writer()
+        sa.first.set()
+
+
+async def synthesize(text):
+    """Start the voice for a line and return it as soon as the first bytes
+    are in hand, or None when ElevenLabs would not produce it."""
+    sa = StreamedAudio()
+    sa.pump = asyncio.ensure_future(_pump_tts(sa, text))
+    await sa.first.wait()
+    if not sa.ok:
+        sa.close()
         return None
-    fd, path = tempfile.mkstemp(suffix=".mp3")
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(audio)
-    print(f"synthesized {len(audio)} bytes of audio", flush=True)
-    return path
+    return sa
+
+
+def discard_audio(item):
+    """Let go of a queued item that will not be played."""
+    if isinstance(item, StreamedAudio):
+        item.close()
+    elif isinstance(item, str) and item not in _KEEP_AUDIO:
+        try:
+            os.remove(item)
+        except OSError:
+            pass
 
 
 async def queue_audio(path, tone=False, urgent=False):
@@ -1372,15 +1451,21 @@ async def announce(text, title="911 Call", tone=False, urgent=None, force=False)
         print(f"audio queued for playback{' (urgent)' if hot else ''}", flush=True)
 
 
-def pcm_to_wav(pcm):
-    """Left channel only: half the bytes to upload, nothing lost from a mono
-    microphone, so the transcript comes back sooner."""
+def pcm_left(pcm):
+    """The left channel of 48 kHz stereo PCM: half the bytes, nothing lost
+    from a mono microphone. None if the bytes do not read as stereo."""
     try:
         samples = array("h")
         samples.frombytes(pcm[: len(pcm) - (len(pcm) % 4)])
-        data, channels = samples[0::2].tobytes(), 1
+        return samples[0::2].tobytes()
     except Exception:
-        data, channels = pcm, 2
+        return None
+
+
+def pcm_to_wav(pcm):
+    """Left channel only, so the transcript comes back sooner."""
+    left = pcm_left(pcm)
+    data, channels = (left, 1) if left is not None else (pcm, 2)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as handle:
         handle.setnchannels(channels)
@@ -1409,6 +1494,138 @@ async def transcribe(wav_bytes):
     except Exception as exc:
         print(f"stt request failed: {exc}", flush=True)
         return None
+
+
+# ── transcribing while the unit is still talking ─────────────────────────────
+# The upload above starts only once the unit unkeys and takes about half a
+# second to come back. A live session is opened a beat into each transmission
+# and fed the audio as it arrives, so when the unit unkeys the transcript is a
+# commit away: about 50ms measured. The left channel at 48 kHz goes as it is;
+# the model takes that rate and resampling would cost more than it saves.
+LIVE_STT = os.environ.get("ELEVENLABS_LIVE_STT", "1").lower() not in ("0", "false", "no", "off")
+LIVE_STT_MODEL = os.environ.get("ELEVENLABS_LIVE_STT_MODEL", "scribe_v2_realtime")
+# How much of a transmission has to arrive before a session is opened for it:
+# enough to rule out a tap of the key, little enough that the session is ready
+# long before the unit is done. 0.2s of 48 kHz stereo.
+LIVE_STT_OPEN_BYTES = int(os.environ.get("LIVE_STT_OPEN_BYTES", "38400"))
+# How long to wait for the transcript after the commit before giving up and
+# uploading the audio the old way.
+LIVE_STT_WAIT = float(os.environ.get("LIVE_STT_WAIT_SECONDS", "2.5"))
+LIVE_STT_RATE = 48000
+_live_stt = {"failures": 0, "paused_until": 0.0}
+
+
+def live_stt_available():
+    return LIVE_STT and bool(XI_KEY) and time.time() >= _live_stt["paused_until"]
+
+
+def live_stt_outcome(worked):
+    """Three failures in a row rest the live path for five minutes, so an
+    outage at ElevenLabs costs one wait per transmission, not two."""
+    if worked:
+        _live_stt["failures"] = 0
+        return
+    _live_stt["failures"] += 1
+    if _live_stt["failures"] >= 3:
+        _live_stt["paused_until"] = time.time() + 300
+        _live_stt["failures"] = 0
+        print("live stt paused for five minutes after three failures; uploading instead", flush=True)
+
+
+class LiveTranscript:
+    """One unit's transmission, transcribed while they are still talking.
+
+    Created and fed from the voice receive thread; the session itself runs on
+    the event loop. finish() commits and text() returns the transcript, or
+    None when anything went wrong so the caller can fall back to the upload.
+    abandon() closes the session without a transcript for audio that turned
+    out to be too short or too quiet to bother with."""
+
+    def __init__(self, loop):
+        self.loop = loop
+        self.q = asyncio.Queue()
+        self.sent = 0
+        self.done = asyncio.run_coroutine_threadsafe(self._run(), loop)
+
+    def feed(self, pcm):
+        self.loop.call_soon_threadsafe(self.q.put_nowait, bytes(pcm))
+
+    def finish(self):
+        self.loop.call_soon_threadsafe(self.q.put_nowait, None)
+
+    def abandon(self):
+        self.loop.call_soon_threadsafe(self.q.put_nowait, False)
+
+    async def text(self):
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(self.done), LIVE_STT_WAIT + 1.0)
+        except Exception as exc:
+            print(f"live stt gave nothing: {exc}", flush=True)
+            return None
+
+    async def _run(self):
+        url = (f"wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id={LIVE_STT_MODEL}"
+               f"&audio_format=pcm_{LIVE_STT_RATE}&commit_strategy=manual")
+        if STT_LANG:
+            url += f"&language_code={STT_LANG}"
+        got = {"text": None}
+        ws = None
+        try:
+            ws = await http.ws_connect(url, headers={"xi-api-key": XI_KEY}, heartbeat=20)
+            heard = asyncio.Event()
+
+            async def reader():
+                try:
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            break
+                        m = json.loads(msg.data)
+                        mt = str(m.get("message_type") or "")
+                        if mt in ("committed_transcript", "committed_transcript_with_timestamps"):
+                            got["text"] = (m.get("text") or "").strip()
+                            break
+                        if "error" in mt:
+                            print(f"live stt {mt}: {str(m)[:200]}", flush=True)
+                            break
+                except Exception as exc:
+                    print(f"live stt read failed: {exc}", flush=True)
+                finally:
+                    heard.set()
+
+            reading = asyncio.ensure_future(reader())
+            ended = None
+            while ended is None:
+                parts = [await self.q.get()]
+                while not self.q.empty():
+                    parts.append(self.q.get_nowait())
+                audio = b"".join(p for p in parts if isinstance(p, bytes))
+                left = pcm_left(audio) if audio else None
+                if left:
+                    await ws.send_json({"message_type": "input_audio_chunk",
+                                        "audio_base_64": base64.b64encode(left).decode(),
+                                        "commit": False, "sample_rate": LIVE_STT_RATE})
+                    self.sent += len(left)
+                if any(p is None for p in parts):
+                    ended = "commit"
+                elif any(p is False for p in parts):
+                    ended = "drop"
+            if ended == "commit":
+                await ws.send_json({"message_type": "input_audio_chunk", "audio_base_64": "",
+                                    "commit": True, "sample_rate": LIVE_STT_RATE})
+                try:
+                    await asyncio.wait_for(heard.wait(), LIVE_STT_WAIT)
+                except asyncio.TimeoutError:
+                    print("live stt: no transcript after the commit", flush=True)
+            reading.cancel()
+            return got["text"] if ended == "commit" else None
+        except Exception as exc:
+            print(f"live stt failed: {exc}", flush=True)
+            return None
+        finally:
+            # The close handshake is the server's business and took longer
+            # than the transcript did; the words are not held for it.
+            if ws is not None and not ws.closed:
+                asyncio.ensure_future(ws.close())
 
 
 # ============================================================================
@@ -3491,21 +3708,21 @@ async def say_now(text):
     heard rather than queued into a container that is closing."""
     if voice_client is None or not voice_client.is_connected():
         return False
-    path = await synthesize(text)
-    if not path:
+    audio = await synthesize(text)
+    if not audio:
         return False
     done = asyncio.Event()
     try:
         if voice_client.is_playing():
             stopper = getattr(voice_client, "stop_playing", voice_client.stop)
             stopper()
-        source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=voice_filter())
+        source = audio.source(voice_filter())
         voice_client.play(source, after=lambda _e: client.loop.call_soon_threadsafe(done.set))
         await done.wait()
         return True
     finally:
         try:
-            os.remove(path)
+            audio.close()
         except OSError:
             pass
 
@@ -5606,7 +5823,7 @@ async def collect_lookup(member, pend, text):
     print(f"collecting {buf['kind']} from {getattr(member, 'display_name', uid)}: {joined!r} -> {got!r}", flush=True)
 
 
-async def handle_utterance(member, pcm):
+async def handle_utterance(member, pcm, live=None):
     uid = getattr(member, "id", 0)
     now = time.time()
     # The clock starts here: this runs the moment the unit stops talking.
@@ -5618,14 +5835,28 @@ async def handle_utterance(member, pcm):
     # again and spoke for longer.
     awaiting = uid in _pending_lookup or uid in _lookup_buf
     if len(pcm) < (MIN_UTTER_BYTES // 5 if awaiting else MIN_UTTER_BYTES):
+        if live is not None:
+            live.abandon()
         return
     if audioop is not None and not awaiting:
         try:
             if audioop.rms(pcm, 2) < SILENCE_RMS:
+                if live is not None:
+                    live.abandon()
                 return
         except Exception:
             pass
-    text = await transcribe(pcm_to_wav(pcm))
+    text = None
+    if live is not None:
+        # The words were transcribed while they were being said. Commit and
+        # collect; if the live session let us down, upload as before.
+        live.finish()
+        text = await live.text()
+        live_stt_outcome(text is not None)
+        if text is None:
+            print("live stt fell back to the upload", flush=True)
+    if text is None:
+        text = await transcribe(pcm_to_wav(pcm))
     _stamp("heard")
     if not text or not has_real_words(text):
         return
@@ -6025,6 +6256,7 @@ if VOICE_RECV_AVAILABLE:
             self.loop = loop
             self.buffers = {}
             self.decoders = {}
+            self.live = {}      # member id -> LiveTranscript for the transmission in progress
 
         def wants_opus(self):
             return True
@@ -6063,8 +6295,19 @@ if VOICE_RECV_AVAILABLE:
                 pcm = dec.decode(bytes(opus), fec=False)
             except Exception:
                 return
-            if pcm:
-                self.buffers.setdefault(user.id, bytearray()).extend(pcm)
+            if not pcm:
+                return
+            buf = self.buffers.setdefault(user.id, bytearray())
+            buf.extend(pcm)
+            live = self.live.get(user.id)
+            if live is not None:
+                live.feed(pcm)
+            elif live_stt_available() and len(buf) >= LIVE_STT_OPEN_BYTES:
+                # Enough has come in to be a transmission: open the session and
+                # send it what it missed, then keep it fed as the unit talks.
+                live = LiveTranscript(self.loop)
+                self.live[user.id] = live
+                live.feed(buf)
 
         @voice_recv.AudioSink.listener()
         def on_voice_member_speaking_start(self, member):
@@ -6075,13 +6318,19 @@ if VOICE_RECV_AVAILABLE:
         def on_voice_member_speaking_stop(self, member):
             _speaking_now.discard(member.id)
             pcm = self.buffers.pop(member.id, None)
+            live = self.live.pop(member.id, None)
             self.decoders.pop(member.id, None)
             if pcm:
-                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm)), self.loop)
+                asyncio.run_coroutine_threadsafe(handle_utterance(member, bytes(pcm), live), self.loop)
+            elif live is not None:
+                live.abandon()
 
         def cleanup(self):
             self.buffers.clear()
             self.decoders.clear()
+            for live in self.live.values():
+                live.abandon()
+            self.live.clear()
             # Whoever was mid-transmission when this sink died never gets a
             # stop event from it. Left in the set they would keep every reply
             # waiting for clear air until they happened to speak again.
@@ -6159,6 +6408,7 @@ async def playback_worker():
         prio, _seq, path, tx = await play_queue.get()
         try:
             if tx in _interrupted:
+                discard_audio(path)
                 continue   # this transmission was keyed over; its tail is dead
             connected = await wait_for_voice()
             if connected and voice_client is not None:
@@ -6178,7 +6428,10 @@ async def playback_worker():
                     client.loop.call_soon_threadsafe(done.set)
 
                 options = None if path in _KEEP_AUDIO else voice_filter()
-                source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
+                if isinstance(path, StreamedAudio):
+                    source = path.source(options)
+                else:
+                    source = discord.FFmpegOpusAudio(path, executable=FFMPEG_EXE, options=options)
                 voice_client.play(source, after=after)
                 print("playing audio in voice channel", flush=True)
                 _report_latency(tx)
@@ -6196,11 +6449,7 @@ async def playback_worker():
         finally:
             if _now_playing.get("tx") == tx:
                 _now_playing.update({"tx": None, "prio": PRIO_ROUTINE})
-            if path not in _KEEP_AUDIO:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            discard_audio(path)
             play_queue.task_done()
 
 
