@@ -996,18 +996,64 @@ async def apply_about_me(bio):
         print(f"about-me update error: {exc}", flush=True)
 
 
+MIN_ROTATE_SECONDS = 15
+
+
+def status_lines_from(activity_text, rotation, default_type):
+    """The dashboard's status fields as the ordered list to cycle through.
+    A single status message is simply a list of one."""
+    out = []
+    if isinstance(rotation, list):
+        for entry in rotation:
+            if isinstance(entry, dict):
+                text = str(entry.get("text") or "").strip()
+                atype = str(entry.get("activity_type") or default_type or "playing").lower()
+            else:
+                text, atype = str(entry or "").strip(), str(default_type or "playing").lower()
+            if text:
+                out.append((atype, text))
+    if not out and activity_text and str(activity_text).strip():
+        out.append((str(default_type or "playing").lower(), str(activity_text).strip()))
+    return out
+
+
 async def identity_watch_loop():
     """Live-sync the dashboard's status / status message / About Me onto the
     bot. Applies each only when it actually changes, so we never spam the
-    gateway or the /applications/@me endpoint."""
+    gateway or the /applications/@me endpoint.
+
+    More than one status message rotates. The interval has a floor because
+    Discord rate-limits presence updates."""
     global _last_presence, _last_bio
     await client.wait_until_ready()
     print("identity watcher: ON (syncs status & About Me from the dashboard)", flush=True)
+    lines, seconds, index, last_switch = [], 0, 0, 0.0
     while not client.is_closed():
         try:
             data = await fetch_dispatch_presence()
             if data:
-                pres = (data.get("presence"), data.get("activity_type"), data.get("activity_text"))
+                presence = data.get("presence")
+                default_type = data.get("activity_type")
+                next_lines = status_lines_from(
+                    data.get("activity_text"), data.get("rotation"), default_type)
+                try:
+                    raw = int(data.get("rotation_seconds") or 0)
+                except (TypeError, ValueError):
+                    raw = 0
+                seconds = max(MIN_ROTATE_SECONDS, raw) if raw else 0
+                if next_lines != lines:
+                    lines, index, last_switch = next_lines, 0, time.time()
+
+                now = time.time()
+                if len(lines) > 1 and seconds and now - last_switch >= seconds:
+                    index = (index + 1) % len(lines)
+                    last_switch = now
+
+                if lines:
+                    atype, text = lines[index % len(lines)]
+                    pres = (presence, atype, text)
+                else:
+                    pres = (presence, default_type, data.get("activity_text"))
                 if pres != _last_presence:
                     _last_presence = pres
                     await apply_presence(*pres)
@@ -1018,7 +1064,8 @@ async def identity_watch_loop():
                     await apply_about_me(bio)
         except Exception as exc:
             print(f"identity watcher error (continuing): {exc}", flush=True)
-        await asyncio.sleep(15)
+        # Poll faster while rotating so a switch lands near its interval.
+        await asyncio.sleep(5 if (len(lines) > 1 and seconds) else 15)
 
 
 _config_said = {}   # what the last refresh reported, so a quiet one stays quiet
